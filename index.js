@@ -1,0 +1,1171 @@
+/**
+ * ai-credits · 宿主半边
+ * ============================================================================
+ * 干三件事：
+ *   1. 内置一份「能领 AI 免费额度 / 积分」的官方入口清单（种子）
+ *   2. 每天（默认 9 点）把每个入口实际请求一遍，记下能不能打开、什么时候查的
+ *   3. 再通过宿主已有的联网搜索服务找一批新的候选页，塞进「每日新发现」
+ *
+ * 数据存在 $DSH_HOME/ai-credits/catalog.json，只在本机，不上传。
+ * 页面（Client 半边）通过 /ai-credits/list 读、/ai-credits/refresh 触发刷新。
+ * ============================================================================
+ */
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
+import { PRICE_PROVIDERS, PRICE_SNAPSHOT_AT } from './prices.js'
+import { CODING_PLANS, PLAN_SNAPSHOT_AT } from './plans.js'
+import { collectDshApi } from './dsh-api.js'
+import { collectUsage } from './usage.js'
+import { fetchOfficialPricing } from './pricing-sync.js'
+import { collectOfficialUsage, resolveKeyMap, importOfficialFiles } from './official-usage.js'
+
+export const inject = ['webServer', 'timer']
+
+const CFG_DIR = process.env.DSH_HOME || join(homedir(), '.dsh')
+const DATA_DIR = join(CFG_DIR, 'ai-credits')
+const STORE_FILE = join(DATA_DIR, 'catalog.json')
+
+const CATEGORY_ORDER = ['国内 API', '海外 API', '消费级应用', '学生与开发者', '每日新发现']
+/** 价格页的核对节奏（小时）。数字快照不自动抓，只有官网价格页的可访问性按这个节奏探 */
+const PRICE_CHECK_HOURS = 20
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 DSH-AI-Credits/1.0'
+
+/**
+ * 种子清单。
+ * ⚠ 只写「大概怎么领」，不写死金额 / 次数 —— 活动随时会变，
+ *   写死了就会过期，反而误导。每天巡检会把它标成「能打开 / 打不开」。
+ */
+const SEEDS = [
+  // ---------- 国内 API ----------
+  {
+    id: 'siliconflow',
+    title: '硅基流动 SiliconFlow',
+    category: '国内 API',
+    url: 'https://cloud.siliconflow.cn',
+    claim: '注册后在控制台领体验金；一批小模型常年免费调用。',
+    tags: ['注册送', 'API'],
+  },
+  {
+    id: 'bailian',
+    title: '阿里云百炼',
+    category: '国内 API',
+    url: 'https://bailian.console.aliyun.com',
+    claim: '新用户每个通义模型有一批免费 token，开通后直接到账。',
+    tags: ['免费额度', '通义'],
+  },
+  {
+    id: 'bigmodel',
+    title: '智谱 BigModel',
+    category: '国内 API',
+    url: 'https://bigmodel.cn',
+    claim: '注册送资源包，GLM 系列里有免费档模型可以一直调。',
+    tags: ['注册送', 'GLM'],
+  },
+  {
+    id: 'moonshot',
+    title: 'Kimi 开放平台',
+    category: '国内 API',
+    url: 'https://platform.kimi.com',
+    claim: '新用户有体验金，去控制台「费用中心」看余额和领取入口。',
+    tags: ['体验金', 'Kimi'],
+  },
+  {
+    id: 'ark',
+    title: '火山引擎 · 方舟',
+    category: '国内 API',
+    url: 'https://console.volcengine.com/ark',
+    claim: '豆包系列有赠送 token / 新用户免费额度，开通模型即送。',
+    tags: ['赠送令牌', '豆包'],
+  },
+  {
+    id: 'qianfan',
+    title: '百度千帆',
+    category: '国内 API',
+    url: 'https://qianfan.cloud.baidu.com',
+    claim: '新用户代金券 + 文心模型免费额度，开通后按控制台提示领。',
+    tags: ['代金券', '文心'],
+  },
+  {
+    id: 'hunyuan',
+    title: '腾讯混元',
+    category: '国内 API',
+    url: 'https://cloud.tencent.com/product/hunyuan',
+    claim: '新用户免费体验额度，控制台开通混元后领取。',
+    tags: ['免费额度', '混元'],
+  },
+  {
+    id: 'xinghuo',
+    title: '讯飞星火',
+    category: '国内 API',
+    url: 'https://xinghuo.xfyun.cn',
+    claim: '注册送 API 免费额度，Lite 档长期免费。',
+    tags: ['免费额度', '星火'],
+  },
+  {
+    id: 'minimax',
+    title: 'MiniMax 开放平台',
+    category: '国内 API',
+    url: 'https://platform.minimaxi.com',
+    claim: '新用户注册有赠送额度，文本 / 语音 / 视频模型都在里面。',
+    tags: ['注册送', '语音'],
+  },
+  {
+    id: 'stepfun',
+    title: '阶跃星辰 StepFun',
+    category: '国内 API',
+    url: 'https://platform.stepfun.com',
+    claim: '注册后控制台领取体验金，多模态模型可用。',
+    tags: ['体验金'],
+  },
+  {
+    id: 'sensenova',
+    title: '商汤日日新',
+    category: '国内 API',
+    url: 'https://platform.sensenova.cn',
+    claim: '新用户有免费调用额度，控制台申请即可。',
+    tags: ['免费额度'],
+  },
+  {
+    id: 'modelscope',
+    title: '魔搭 ModelScope',
+    category: '国内 API',
+    url: 'https://modelscope.cn',
+    claim: '每日免费推理额度，API-Inference 可直接调开源模型。',
+    tags: ['每日免费', '开源模型'],
+  },
+
+  // ---------- 海外 API ----------
+  {
+    id: 'aistudio',
+    title: 'Google AI Studio',
+    category: '海外 API',
+    url: 'https://aistudio.google.com',
+    claim: 'Gemini 有免费层，按分钟 / 每天限速，不绑卡也能调。',
+    tags: ['免费层', 'Gemini'],
+  },
+  {
+    id: 'groq',
+    title: 'Groq Console',
+    category: '海外 API',
+    url: 'https://console.groq.com',
+    claim: '免费层跑开源模型，速度很快，限速内不额外收费。',
+    tags: ['免费层', '高速'],
+  },
+  {
+    id: 'mistral',
+    title: 'Mistral Console',
+    category: '海外 API',
+    url: 'https://console.mistral.ai',
+    claim: '免费实验层（Experiment），个人开发基本够用。',
+    tags: ['免费层'],
+  },
+  {
+    id: 'cohere',
+    title: 'Cohere Dashboard',
+    category: '海外 API',
+    url: 'https://dashboard.cohere.com',
+    claim: '注册拿试用 key，Chat / Embed 都有一定额度。',
+    tags: ['试用 key'],
+  },
+  {
+    id: 'openrouter',
+    title: 'OpenRouter',
+    category: '海外 API',
+    url: 'https://openrouter.ai/models?max_price=0',
+    claim: '一批带 :free 后缀的模型，注册就能用，按天限次。',
+    tags: ['免费模型', '聚合'],
+  },
+  {
+    id: 'githubmodels',
+    title: 'GitHub Models',
+    category: '海外 API',
+    url: 'https://github.com/marketplace?type=models',
+    claim: 'GitHub 账号直接调各家模型，免费速率限制。',
+    tags: ['免费限速', 'GitHub'],
+  },
+  {
+    id: 'cloudflare',
+    title: 'Cloudflare Workers AI',
+    category: '海外 API',
+    url: 'https://developers.cloudflare.com/workers-ai/platform/pricing/',
+    claim: '每天免费 neurons 额度，绑卡也不会自动扣费。',
+    tags: ['每日免费', '边缘'],
+  },
+  {
+    id: 'nvidia',
+    title: 'NVIDIA NIM',
+    category: '海外 API',
+    url: 'https://build.nvidia.com',
+    claim: '注册送 API credits，试模型和托管推理都能用。',
+    tags: ['credits'],
+  },
+  {
+    id: 'cerebras',
+    title: 'Cerebras Cloud',
+    category: '海外 API',
+    url: 'https://cloud.cerebras.ai',
+    claim: '免费层，推理极快，注册即用。',
+    tags: ['免费层'],
+  },
+  {
+    id: 'sambanova',
+    title: 'SambaNova Cloud',
+    category: '海外 API',
+    url: 'https://cloud.sambanova.ai',
+    claim: '免费层额度，可以跑开源大模型。',
+    tags: ['免费层'],
+  },
+  {
+    id: 'together',
+    title: 'Together AI',
+    category: '海外 API',
+    url: 'https://api.together.ai',
+    claim: '注册送少量额度，适合跑开源模型。',
+    tags: ['注册送'],
+  },
+  {
+    id: 'fireworks',
+    title: 'Fireworks AI',
+    category: '海外 API',
+    url: 'https://fireworks.ai',
+    claim: '注册送试用额度，微调 / 推理都能抵。',
+    tags: ['试用额度'],
+  },
+  {
+    id: 'huggingface',
+    title: 'Hugging Face',
+    category: '海外 API',
+    url: 'https://huggingface.co/pricing',
+    claim: '免费账号每月有 Inference credits，社区模型随便试。',
+    tags: ['每月额度'],
+  },
+  {
+    id: 'vercel',
+    title: 'Vercel AI Gateway',
+    category: '海外 API',
+    url: 'https://vercel.com/ai-gateway',
+    claim: '新账号有免费额度，一个 key 转发多家模型。',
+    tags: ['免费额度', '网关'],
+  },
+
+  // ---------- 消费级应用 ----------
+  {
+    id: 'jimeng',
+    title: '即梦 AI',
+    category: '消费级应用',
+    url: 'https://jimeng.jianying.com',
+    claim: '每天签到 / 做任务送积分，出图出视频都能抵。',
+    tags: ['每日签到', '积分'],
+  },
+  {
+    id: 'doubao',
+    title: '豆包',
+    category: '消费级应用',
+    url: 'https://www.doubao.com',
+    claim: '日常免费用，活动页经常发体验积分。',
+    tags: ['免费', '活动'],
+  },
+  {
+    id: 'tongyi',
+    title: '通义千问',
+    category: '消费级应用',
+    url: 'https://tongyi.aliyun.com',
+    claim: '免费额度，万相出图也有赠送次数。',
+    tags: ['免费额度'],
+  },
+  {
+    id: 'yuanbao',
+    title: '腾讯元宝',
+    category: '消费级应用',
+    url: 'https://yuanbao.tencent.com',
+    claim: '免费使用混元 / DeepSeek，活动送额度。',
+    tags: ['免费'],
+  },
+  {
+    id: 'chatglm',
+    title: '智谱清言',
+    category: '消费级应用',
+    url: 'https://chatglm.cn',
+    claim: '免费档模型随便用，活动送体验次数。',
+    tags: ['免费档'],
+  },
+  {
+    id: 'yiyan',
+    title: '文心一言',
+    category: '消费级应用',
+    url: 'https://wenxin.baidu.com',
+    claim: '免费档 + 活动积分。',
+    tags: ['免费', '活动'],
+  },
+
+  // ---------- 学生与开发者 ----------
+  {
+    id: 'ghstudent',
+    title: 'GitHub Student Pack',
+    category: '学生与开发者',
+    url: 'https://education.github.com/pack',
+    claim: '学生认证后白拿 Copilot、云额度、一堆 API 试用。',
+    tags: ['学生认证', '大礼包'],
+  },
+  {
+    id: 'azurestudent',
+    title: 'Azure for Students',
+    category: '学生与开发者',
+    url: 'https://azure.microsoft.com/free/students',
+    claim: '学生认证送 $100 额度，Azure OpenAI 也能用。',
+    tags: ['学生认证', '$100'],
+  },
+  {
+    id: 'gcloudfree',
+    title: 'Google Cloud Free',
+    category: '学生与开发者',
+    url: 'https://cloud.google.com/free',
+    claim: '新账号 $300 试用金，Gemini API 可以抵。',
+    tags: ['$300', '试用'],
+  },
+  {
+    id: 'copilotfree',
+    title: 'GitHub Copilot Free',
+    category: '学生与开发者',
+    url: 'https://github.com/features/copilot',
+    claim: '免费版每月给补全和对话次数，写代码够用。',
+    tags: ['免费版', '补全'],
+  },
+  {
+    id: 'colab',
+    title: 'Google Colab',
+    category: '学生与开发者',
+    url: 'https://colab.research.google.com',
+    claim: '免费 GPU 时长，跑开源模型 / 微调够用。',
+    tags: ['免费 GPU'],
+  },
+  {
+    id: 'kaggle',
+    title: 'Kaggle',
+    category: '学生与开发者',
+    url: 'https://www.kaggle.com',
+    claim: '每周免费 GPU / TPU 时长，跑 notebook 不花钱。',
+    tags: ['免费 GPU'],
+  },
+]
+
+/** 每天拿这几句去搜新入口。搜不到 / 搜索源没配好都不影响已有清单。 */
+const SEARCH_QUERIES = [
+  '免费 AI API 额度 领取 新用户',
+  'free AI credits free tier API',
+  '大模型 免费额度 赠送 活动',
+  'free LLM API trial credits',
+]
+
+// ---------------------------------------------------------------- 小工具
+
+const nowIso = () => new Date().toISOString()
+
+const clampInt = (value, min, max, fallback) => {
+  const n = Number(value)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(min, Math.min(max, Math.trunc(n)))
+}
+
+const dayKey = (date) => {
+  const d = date instanceof Date ? date : new Date(date)
+  if (Number.isNaN(d.getTime())) return ''
+  return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate()
+}
+
+const normalizeUrl = (raw) => {
+  try {
+    const u = new URL(String(raw || '').trim())
+    u.hash = ''
+    let out = u.toString()
+    if (out.endsWith('/')) out = out.slice(0, -1)
+    return out
+  } catch {
+    return String(raw || '').trim()
+  }
+}
+
+const hostOf = (raw) => {
+  try {
+    return new URL(raw).hostname.replace(/^www\./, '')
+  } catch {
+    return ''
+  }
+}
+
+const shortHash = (text) => {
+  let h = 2166136261
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0).toString(36)
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length)
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(Math.max(1, limit), items.length) }, async () => {
+    for (;;) {
+      const index = cursor
+      cursor += 1
+      if (index >= items.length) return
+      out[index] = await fn(items[index], index)
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+// ---------------------------------------------------------------- 存取
+
+function loadState() {
+  try {
+    if (!existsSync(STORE_FILE)) return null
+    const raw = JSON.parse(readFileSync(STORE_FILE, 'utf8'))
+    if (!raw || !Array.isArray(raw.sources)) return null
+    return raw
+  } catch (error) {
+    return null
+  }
+}
+
+function saveState(state) {
+  mkdirSync(DATA_DIR, { recursive: true })
+  const tmp = STORE_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
+  writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8')
+  renameSync(tmp, STORE_FILE)
+}
+
+function blankState() {
+  return {
+    version: 1,
+    createdAt: nowIso(),
+    updatedAt: null,
+    checkedAt: null,
+    lastReason: null,
+    search: null,
+    sources: [],
+    pricesCheckedAt: null,
+    priceChecks: {},
+    plansCheckedAt: null,
+    planChecks: {},
+  }
+}
+
+/**
+ * 把内置种子并进已有数据。
+ * ⚠ 按 id 合并（不是按 URL）：种子的链接以后改了，同一条要跟着换地址，
+ *   而不是多出一条旧的。巡检结果（checkedAt / httpStatus / reachable）一定保留。
+ */
+function mergeSeeds(state) {
+  if (!Array.isArray(state.sources)) state.sources = []
+  const byId = new Map()
+  const byUrl = new Map()
+  for (const item of state.sources) {
+    if (item && item.origin !== 'web' && item.id) byId.set(item.id, item)
+    if (item && item.url) byUrl.set(normalizeUrl(item.url), item)
+  }
+  for (const seed of SEEDS) {
+    let current = byId.get(seed.id)
+    if (current === undefined) {
+      const hit = byUrl.get(normalizeUrl(seed.url))
+      current = hit && hit.origin !== 'web' ? hit : undefined
+    }
+    if (current === undefined) {
+      const fresh = {
+        ...seed,
+        origin: 'seed',
+        checkedAt: null,
+        httpStatus: null,
+        reachable: null,
+      }
+      state.sources.push(fresh)
+      byId.set(seed.id, fresh)
+      byUrl.set(normalizeUrl(seed.url), fresh)
+    } else {
+      current.id = seed.id
+      current.title = seed.title
+      current.category = seed.category
+      current.url = seed.url
+      current.claim = seed.claim
+      current.tags = seed.tags
+      current.origin = 'seed'
+      byUrl.set(normalizeUrl(seed.url), current)
+    }
+  }
+  return state
+}
+
+function sortSources(list) {
+  const rank = (item) => {
+    if (item.origin === 'web') return CATEGORY_ORDER.length
+    const index = CATEGORY_ORDER.indexOf(item.category)
+    return index >= 0 ? index : CATEGORY_ORDER.length - 1
+  }
+  return list.slice().sort((a, b) => {
+    const byRank = rank(a) - rank(b)
+    if (byRank !== 0) return byRank
+    return String(a.title || '').localeCompare(String(b.title || ''), 'zh-Hans-CN')
+  })
+}
+
+function publicSources(state) {
+  return sortSources(state.sources).map((item) => ({
+    id: item.id,
+    title: item.title,
+    category: item.category,
+    url: item.url,
+    claim: item.claim || '',
+    tags: Array.isArray(item.tags) ? item.tags : [],
+    origin: item.origin || 'seed',
+    checkedAt: item.checkedAt || null,
+    httpStatus: typeof item.httpStatus === 'number' ? item.httpStatus : null,
+    reachable: typeof item.reachable === 'boolean' ? item.reachable : null,
+    discoveredAt: item.discoveredAt || null,
+  }))
+}
+
+/**
+ * 价格表要发出去的样子。
+ * 价格数字（input/output）来自 prices.js 的快照；checkedAt / reachable 是每天巡检
+ * 各官网价格页的结果 —— 只代表「页面今天能不能打开」，不代表价格数字是今天抓的。
+ */
+function publicPrices(state) {
+  const checks = state.priceChecks && typeof state.priceChecks === 'object' ? state.priceChecks : {}
+  return PRICE_PROVIDERS.map((provider) => {
+    const check = checks[provider.id] || {}
+    return {
+      id: provider.id,
+      title: provider.title,
+      region: provider.region,
+      currency: provider.currency,
+      pricingUrl: provider.pricingUrl,
+      sourceDate: provider.sourceDate || null,
+      source: provider.source || 'official',
+      note: provider.note || '',
+      models: provider.models.map((model) => ({
+        id: model.id,
+        name: model.name,
+        contextK: typeof model.contextK === 'number' ? model.contextK : null,
+        input: typeof model.input === 'number' ? model.input : null,
+        output: typeof model.output === 'number' ? model.output : null,
+        note: model.note || '',
+      })),
+      checkedAt: check.checkedAt || null,
+      httpStatus: typeof check.httpStatus === 'number' ? check.httpStatus : null,
+      reachable: typeof check.reachable === 'boolean' ? check.reachable : null,
+    }
+  })
+}
+
+/**
+ * 编程订阅（coding plan）发出去的样子。
+ * 价格 / 权益来自 plans.js 的快照；checkedAt / reachable 是每天探订阅页的结果。
+ */
+function publicPlans(state) {
+  const checks = state.planChecks && typeof state.planChecks === 'object' ? state.planChecks : {}
+  return CODING_PLANS.map((plan) => {
+    const check = checks[plan.id] || {}
+    return {
+      id: plan.id,
+      title: plan.title,
+      provider: plan.provider,
+      region: plan.region,
+      currency: plan.currency,
+      category: ['general', 'coding'].includes(plan.category) ? plan.category : 'coding',
+      kind: plan.kind === 'agent' ? 'agent' : 'plan',
+      checkUrl: plan.checkUrl || plan.url,
+      price: typeof plan.price === 'number' ? plan.price : null,
+      period: plan.period || 'monthly',
+      priceNote: plan.priceNote || '',
+      quota: plan.quota || '',
+      benefits: Array.isArray(plan.benefits) ? plan.benefits : [],
+      url: plan.url,
+      sourceDate: plan.sourceDate || null,
+      source: plan.source || 'official',
+      note: plan.note || '',
+      checkedAt: check.checkedAt || null,
+      httpStatus: typeof check.httpStatus === 'number' ? check.httpStatus : null,
+      reachable: typeof check.reachable === 'boolean' ? check.reachable : null,
+    }
+  })
+}
+
+// ---------------------------------------------------------------- 巡检
+
+async function probe(url, timeoutMs) {
+  const attempt = async (method) => {
+    const response = await fetch(url, {
+      method,
+      redirect: 'follow',
+      headers: {
+        'user-agent': UA,
+        accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        ...(method === 'GET' ? { range: 'bytes=0-0' } : {}),
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (response.body !== null && method === 'GET') {
+      try {
+        await response.body.cancel()
+      } catch (error) {}
+    }
+    return response
+  }
+
+  try {
+    let response
+    try {
+      response = await attempt('HEAD')
+    } catch (error) {
+      response = await attempt('GET')
+    }
+    // HEAD 不靠谱：不少站点对 HEAD 回 404 / 403 / 405，换 GET 再问一次再下结论
+    if (response.status >= 400) {
+      try {
+        response = await attempt('GET')
+      } catch (error) {}
+    }
+    const status = response.status
+    return {
+      httpStatus: status,
+      reachable: status > 0 && status < 400,
+      checkedAt: nowIso(),
+      note: null,
+    }
+  } catch (error) {
+    return {
+      httpStatus: 0,
+      reachable: false,
+      checkedAt: nowIso(),
+      note: '请求失败：' + String((error && error.message) || error).slice(0, 120),
+    }
+  }
+}
+
+const LOOKS_LIKE_OFFER = /(免费|白嫖|额度|赠送|积分|体验金|试用|领取|free|credit|trial|quota|grant|giveaway)/i
+
+/** 每天把各家官网的价格页也探一遍：不需要抓数字，只要知道页面今天还能不能打开 */
+async function runPriceCheck(state, timeoutMs) {
+  const checks = state.priceChecks && typeof state.priceChecks === 'object' ? state.priceChecks : {}
+  await mapLimit(PRICE_PROVIDERS, 4, async (provider) => {
+    const result = await probe(provider.pricingUrl, timeoutMs)
+    checks[provider.id] = {
+      checkedAt: result.checkedAt,
+      httpStatus: result.httpStatus,
+      reachable: result.reachable,
+      note: result.note,
+    }
+  })
+  state.priceChecks = checks
+  state.pricesCheckedAt = nowIso()
+}
+
+/** 编程订阅页同理：只确认「今天还能不能打开」，价格 / 权益是 plans.js 里人工核对的快照 */
+async function runPlanCheck(state, timeoutMs) {
+  if (CODING_PLANS.length === 0) return
+  const checks = state.planChecks && typeof state.planChecks === 'object' ? state.planChecks : {}
+  await mapLimit(CODING_PLANS, 4, async (plan) => {
+    const result = await probe(plan.checkUrl || plan.url, timeoutMs)
+    checks[plan.id] = {
+      checkedAt: result.checkedAt,
+      httpStatus: result.httpStatus,
+      reachable: result.reachable,
+      note: result.note,
+    }
+  })
+  state.planChecks = checks
+  state.plansCheckedAt = nowIso()
+}
+
+/** 这些站搜出来多半是「攻略 / 汇总」而不是官方领取页 —— 留着，但标成攻略页，别让人以为是入口 */
+const GUIDE_HOSTS = [
+  'csdn.net',
+  'juejin.cn',
+  'zhihu.com',
+  'developer.aliyun.com',
+  'cloud.tencent.com',
+  'cloud.tencent.cn',
+  'cnblogs.com',
+  'segmentfault.com',
+  'bilibili.com',
+  'weixin.qq.com',
+  'sohu.com',
+]
+
+/** 这些站基本不会有领取入口，搜到了也别塞进来 */
+const SKIP_HOSTS = ['pypi.org', 'npmjs.com', 'youtube.com', 'apps.apple.com']
+
+function looksLikeOffer(source) {
+  const haystack = [source.title, source.snippet, source.summary, source.url].filter(Boolean).join(' ')
+  return LOOKS_LIKE_OFFER.test(haystack)
+}
+
+function isGuideHost(host) {
+  return GUIDE_HOSTS.some((name) => host === name || host.endsWith('.' + name))
+}
+
+function isSkipHost(host) {
+  return SKIP_HOSTS.some((name) => host === name || host.endsWith('.' + name))
+}
+
+const titleKey = (text) =>
+  String(text || '')
+    .toLowerCase()
+    .replace(/[\s\p{P}]/gu, '')
+    .slice(0, 80)
+
+function webErrorText(error) {
+  const raw = String((error && (error.code || error.message)) || error || '')
+  if (/AMBIGUOUS/i.test(raw)) {
+    const match = raw.match(/\(([^)]+)\)/)
+    const names = match ? match[1] : 'deepseek-official / deepseek-search-api'
+    return (
+      '宿主上注册了不止一个联网搜索源（' +
+      names +
+      '），还没选定默认的 —— 二选一（或者直接跟我说，我帮你定），这里就会每天自动找新的'
+    )
+  }
+  if (/UNAVAILABLE/i.test(raw)) return '当前没有可用的联网搜索源'
+  if (/CONFIGURED_MISSING/i.test(raw)) return '设置里指定的搜索源没装上'
+  if (/auth|401|403|key/i.test(raw)) return '搜索源的密钥无效 / 过期'
+  return '联网搜索失败：' + raw.slice(0, 160)
+}
+
+async function discover(ctx, state, queries, maxCandidates) {
+  const web = ctx.get('web')
+  if (!web || typeof web.search !== 'function') {
+    return { at: nowIso(), added: 0, queries, error: '没有可用的联网搜索服务' }
+  }
+  const known = new Set(state.sources.map((item) => normalizeUrl(item.url)))
+  const seenTitles = new Set(
+    state.sources.filter((item) => item.origin === 'web').map((item) => titleKey(item.title)),
+  )
+  let added = 0
+  let lastError = null
+  for (const query of queries) {
+    let result
+    try {
+      result = await web.search({ query, maxResults: 8 })
+    } catch (error) {
+      lastError = webErrorText(error)
+      continue
+    }
+    const sources = Array.isArray(result && result.sources) ? result.sources : []
+    for (const source of sources) {
+      if (!source || !source.url) continue
+      if (!looksLikeOffer(source)) continue
+      const url = normalizeUrl(source.url)
+      if (known.has(url)) continue
+      const host = hostOf(url)
+      if (!host || isSkipHost(host)) continue
+      // 标题重了就是同一篇文章换个链接 —— 别重复占位
+      const key = titleKey(source.title)
+      if (key && seenTitles.has(key)) continue
+      // 攻略站最多 1 条、别的站最多 2 条，免得一个聚合站刷满整页
+      const sameHost = state.sources.filter((item) => item.origin === 'web' && hostOf(item.url) === host).length
+      if (sameHost >= (isGuideHost(host) ? 1 : 2)) continue
+      if (state.sources.length >= SEEDS.length + maxCandidates) break
+      known.add(url)
+      if (key) seenTitles.add(key)
+      added += 1
+      state.sources.push({
+        id: 'web-' + shortHash(url),
+        title: source.title || host,
+        category: '每日新发现',
+        url: source.url,
+        claim: source.snippet || source.summary || '搜索发现的页面，点开确认能不能领。',
+        tags: [isGuideHost(host) ? '攻略页' : '联网发现'],
+        origin: 'web',
+        discoveredAt: nowIso(),
+        checkedAt: null,
+        httpStatus: null,
+        reachable: null,
+      })
+    }
+  }
+  return { at: nowIso(), added, queries, error: lastError }
+}
+
+// ---------------------------------------------------------------- 插件
+
+/**
+ * 配置项（都可选，不填就用默认值）。
+ *
+ * 刻意**不导出 `Config`**：那需要一个由宿主注入的 schema 构造器，拿不到时会让
+ * 整个插件不激活（本机实测过：`Cannot read properties of undefined (reading 'validate')`）。
+ * 这个插件的每一项都有合理默认值，为了校验多引一层依赖不值得 ——
+ * 直接在这里校验并给出默认值，配错了也只是退回默认，不会让插件挂掉。
+ *
+ * | 键 | 默认 | 说明 |
+ * |:--|:--|:--|
+ * | `refreshHour` | 9 | 每天几点后自动巡检（0-23） |
+ * | `dailySearch` | true | 自动巡检时要不要顺带联网发现 |
+ * | `checkTimeoutMs` | 10000 | 单个入口 / 价格页 / 订阅页的超时 |
+ * | `maxCandidates` | 80 | 「每日新发现」最多保留多少条 |
+ * | `officialKeyMap` | 自动猜 | 官方账单 api_key_name → 线路 id，形如 `{"deepseek-official":"4"}` |
+ */
+export function apply(ctx, config) {
+  const cfg = config || {}
+  const refreshHour = clampInt(cfg.refreshHour, 0, 23, 9)
+  const dailySearch = cfg.dailySearch !== false
+  const timeoutMs = clampInt(cfg.checkTimeoutMs, 3000, 60000, 10000)
+  const maxCandidates = clampInt(cfg.maxCandidates, 0, 300, 80)
+  // 官方账单里哪个 key 对应哪条线路。没配就让 official-usage.js 按名字猜
+  const configuredKeyMap =
+    cfg.officialKeyMap && typeof cfg.officialKeyMap === 'object' ? cfg.officialKeyMap : null
+
+  let inFlight = null
+
+  function pruneCandidates(state) {
+    const cutoff = Date.now() - 45 * 24 * 60 * 60 * 1000
+    const keep = []
+    const web = []
+    for (const item of state.sources) {
+      if (!item) continue
+      if (item.origin !== 'web') {
+        keep.push(item)
+        continue
+      }
+      const at = Date.parse(item.discoveredAt || '')
+      if (Number.isFinite(at) && at < cutoff) continue
+      web.push(item)
+    }
+    web.sort((a, b) => Date.parse(a.discoveredAt || 0) - Date.parse(b.discoveredAt || 0))
+    const overflow = web.length - maxCandidates
+    const dropped = new Set(overflow > 0 ? web.slice(0, overflow) : [])
+    state.sources = keep.concat(web.filter((item) => !dropped.has(item)))
+    return state
+  }
+
+  function nextRefreshAt(from = new Date()) {
+    const at = new Date(from)
+    at.setMinutes(0, 0, 0)
+    at.setHours(refreshHour)
+    if (at.getTime() <= from.getTime()) at.setDate(at.getDate() + 1)
+    return at.toISOString()
+  }
+
+  function dueForDaily(state) {
+    if (state === null) return true
+    const now = new Date()
+    if (now.getHours() < refreshHour) return false
+    const today = dayKey(now)
+    if (!state.checkedAt || dayKey(state.checkedAt) !== today) return true
+    // 今天只手动巡检过、还没跑联网发现 → 也补一次（失败也记时间，不会每 10 分钟重跑）
+    if (dailySearch && (!state.search || !state.search.at || dayKey(state.search.at) !== today)) return true
+    return false
+  }
+
+  /** 价格页 / 订阅页单独按 20 小时节奏核对，不跟 9 点那趟绑死 —— 白天重开也会补一次 */
+  function catalogDue(state) {
+    if (!state) return true
+    const stale = (iso) => {
+      if (!iso) return true
+      const at = Date.parse(iso)
+      return !Number.isFinite(at) || Date.now() - at > PRICE_CHECK_HOURS * 60 * 60 * 1000
+    }
+    if (stale(state.pricesCheckedAt)) return true
+    if (CODING_PLANS.length > 0 && stale(state.plansCheckedAt)) return true
+    return false
+  }
+
+  async function refresh(reason, options) {
+    if (inFlight !== null) return inFlight
+    const wantSearch = options && options.search === true
+    const pricesOnly = options && options.pricesOnly === true
+    inFlight = (async () => {
+      const state = pruneCandidates(mergeSeeds(loadState() || blankState()))
+      if (!pricesOnly) {
+        const sourceList = state.sources.filter((item) => item && item.url)
+        const probed = await mapLimit(sourceList, 6, async (item) => {
+          const result = await probe(item.url, timeoutMs)
+          item.checkedAt = result.checkedAt
+          item.httpStatus = result.httpStatus
+          item.reachable = result.reachable
+          item.note = result.note
+          return item
+        })
+        state.sources = probed
+        state.checkedAt = nowIso()
+      }
+      try {
+        await Promise.all([
+          runPriceCheck(state, timeoutMs).catch(() => {}),
+          runPlanCheck(state, timeoutMs).catch(() => {}),
+        ])
+      } catch (error) {}
+      state.updatedAt = nowIso()
+      state.lastReason = reason || '手动'
+      if (wantSearch) {
+        try {
+          state.search = await discover(ctx, state, SEARCH_QUERIES, maxCandidates)
+        } catch (error) {
+          state.search = {
+            at: nowIso(),
+            added: 0,
+            queries: SEARCH_QUERIES,
+            error: webErrorText(error),
+          }
+        }
+      }
+      saveState(state)
+      return state
+    })().finally(() => {
+      inFlight = null
+    })
+    return inFlight
+  }
+
+  function kick(reason, options) {
+    refresh(reason, options).catch((error) => {
+      try {
+        console.error('[ai-credits] 刷新失败：', error && error.message)
+      } catch (e2) {}
+    })
+  }
+
+  function currentPayload(dshApi, usage, official, officialUsage) {
+    const state = mergeSeeds(loadState() || blankState())
+    const sources = publicSources(state)
+    const prices = publicPrices(state)
+    const plans = publicPlans(state)
+    return {
+      ok: true,
+      now: nowIso(),
+      running: inFlight !== null,
+      updatedAt: state.updatedAt,
+      checkedAt: state.checkedAt,
+      lastReason: state.lastReason || null,
+      nextRefreshAt: nextRefreshAt(),
+      refreshHour,
+      dailySearch,
+      search: state.search || null,
+      dshApi: dshApi || null,
+      usage: usage || null,
+      // 官网实时价核对结果（拉到 / 拉不到 / 与本地快照有没有差）
+      officialPricing: official || null,
+      // 官方导出的用量账单（CSV）—— 权威口径，用来跟日志折算对账
+      officialUsage: officialUsage || null,
+      counts: {
+        total: sources.length,
+        reachable: sources.filter((item) => item.reachable === true).length,
+        unreachable: sources.filter((item) => item.reachable === false).length,
+        candidates: sources.filter((item) => item.origin === 'web').length,
+      },
+      prices: {
+        snapshotAt: PRICE_SNAPSHOT_AT,
+        checkedAt: state.pricesCheckedAt || null,
+        total: prices.length,
+        reachable: prices.filter((item) => item.reachable === true).length,
+        providers: prices,
+      },
+      plans: {
+        snapshotAt: PLAN_SNAPSHOT_AT,
+        checkedAt: state.plansCheckedAt || null,
+        total: plans.length,
+        reachable: plans.filter((item) => item.reachable === true).length,
+        items: plans,
+      },
+      sources,
+    }
+  }
+
+  function foreignRejection(req) {
+    try {
+      const connection = ctx.get('connection')
+      if (connection && typeof connection.requestRejection === 'function') {
+        const code = connection.requestRejection(req)
+        if (code === 401 || code === 403) return code
+      }
+    } catch (error) {}
+    return 0
+  }
+
+  const sendJson = (res, status, body) => {
+    res.writeHead(status, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+    })
+    res.end(JSON.stringify(body))
+  }
+
+  /** 用量时间窗：?window=day|week|month，认不出来就用默认的 month */
+  const usageWindowOf = (req) => {
+    try {
+      const parsed = new URL(req.url || '/', 'http://127.0.0.1')
+      const value = parsed.searchParams.get('window')
+      return value === 'day' || value === 'week' || value === 'month' ? value : undefined
+    } catch (error) {
+      return undefined
+    }
+  }
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/ai-credits/list',
+      handler: async (req, res) => {
+        try {
+          // 本机接入情况和用量各自收，出任何错都只让那一栏空着，不拖垮整页
+          const dshApi = await collectDshApi(ctx).catch(() => null)
+          const official = await fetchOfficialPricing().catch(() => null)
+          const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
+          const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
+          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+        }
+      },
+    }),
+  )
+
+  // 本机接入单独一个口：点「重新读」时绕开 30 秒缓存，立刻问一遍宿主
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/ai-credits/dsh',
+      handler: async (req, res) => {
+        try {
+          const dshApi = await collectDshApi(ctx, { force: true })
+          const official = await fetchOfficialPricing({ force: true }).catch(() => null)
+          const officialUsage = await collectOfficialUsage(CFG_DIR, { force: true }).catch(() => null)
+          const usage = await collectUsage(ctx, { force: true, window: usageWindowOf(req), official, officialUsage, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
+          sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage })
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+        }
+      },
+    }),
+  )
+
+  /**
+   * 导入官方用量账单。
+   *
+   * 页面选文件 → base64 传上来 → 宿主写进 `$DSH_HOME/ai-credits/official-usage/`。
+   * 之所以走宿主：浏览器沙箱写不了那个目录，宿主进程可以。
+   * 支持 .zip（官方导出的原包，宿主自己解）和 .csv（已解压的单文件）。
+   */
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/ai-credits/official-import',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '只接受 POST' })
+          return
+        }
+        const rejected = foreignRejection(req)
+        if (rejected !== 0) {
+          sendJson(res, rejected, { ok: false, error: rejected === 401 ? 'authentication_required' : 'forbidden' })
+          return
+        }
+        let body = ''
+        try {
+          for await (const chunk of req) body += chunk
+        } catch (error) {}
+        let parsed = {}
+        try {
+          parsed = JSON.parse(body || '{}')
+        } catch (error) {
+          sendJson(res, 400, { ok: false, error: '请求不是合法 JSON' })
+          return
+        }
+        if (typeof parsed.name !== 'string' || typeof parsed.data !== 'string') {
+          sendJson(res, 400, { ok: false, error: '缺少 name / data' })
+          return
+        }
+        let buffer
+        try {
+          buffer = Buffer.from(parsed.data, 'base64')
+        } catch (error) {
+          sendJson(res, 400, { ok: false, error: 'base64 解码失败' })
+          return
+        }
+        try {
+          const result = await importOfficialFiles(CFG_DIR, parsed.name, buffer)
+          // 导入成功后顺手把最新状态回给页面，省一次往返
+          let officialUsage = null
+          if (result.ok) {
+            officialUsage = await collectOfficialUsage(CFG_DIR, { force: true }).catch(() => null)
+          }
+          sendJson(res, result.ok ? 200 : 400, { ...result, officialUsage })
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+        }
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/ai-credits/refresh',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '只接受 POST' })
+          return
+        }
+        const rejected = foreignRejection(req)
+        if (rejected !== 0) {
+          sendJson(res, rejected, { ok: false, error: rejected === 401 ? 'authentication_required' : 'forbidden' })
+          return
+        }
+        let body = ''
+        try {
+          for await (const chunk of req) body += chunk
+        } catch (error) {}
+        let parsed = {}
+        try {
+          parsed = JSON.parse(body || '{}')
+        } catch (error) {}
+        // 不在请求里等巡检跑完：38 个站最慢要一分多钟，HTTP 等那么久容易断。
+        // 立刻回当前状态（running: true），页面靠 /list 轮询 running，跑完自然会上新。
+        // pricesOnly：只探各官网价格页 / 订阅页（价格栏和订阅栏的按钮用），不动领取入口的检查结果。
+        try {
+          kick('手动', {
+            search: parsed.search === true,
+            pricesOnly: parsed.pricesOnly === true && parsed.search !== true,
+          })
+          const dshApi = await collectDshApi(ctx).catch(() => null)
+          const official = await fetchOfficialPricing().catch(() => null)
+          const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
+          const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
+          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+        }
+      },
+    }),
+  )
+
+  // 启动后如果错过了今天的巡检，补一遍（带联网发现）；否则只要价格 / 订阅页过期就先核对
+  ctx.effect(() =>
+    ctx.timeout(() => {
+      const state = loadState()
+      if (dueForDaily(state)) kick('启动补检', { search: dailySearch })
+      else if (catalogDue(state)) kick('价格补检', { pricesOnly: true })
+    }, 4000),
+  )
+
+  // 每 10 分钟看一眼是不是到了今天的点；没到就什么都不做
+  ctx.effect(() =>
+    ctx.interval(() => {
+      const state = loadState()
+      if (dueForDaily(state)) kick('每日巡检', { search: dailySearch })
+      else if (catalogDue(state)) kick('价格补检', { pricesOnly: true })
+    }, 10 * 60 * 1000),
+  )
+
+  // 兜底：万一 timer 服务没有，至少别让页面空着 —— 首次打开时读到的还是种子清单
+  try {
+    if (!existsSync(STORE_FILE)) {
+      const seeded = mergeSeeds(blankState())
+      saveState(seeded)
+    }
+  } catch (error) {}
+}

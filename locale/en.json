@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Cyber egg pickup",
+    "description": "One page for free AI credit offers, API list prices, subscription tiers, which model routes this machine has wired up, and how many tokens those routes used and what they cost. Prices track the vendor page, cost uses each vendor's peak/off-peak and cache-hit rates, and any route expands into a per-session token timeline.",
+    "detail": "docs/DETAIL.md"
+  }
+}

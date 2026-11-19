@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Cyber egg pickup">
+  <g fill="none" stroke="#8a8f98" stroke-width="4.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M32 8c9.3 0 16.8 12.5 16.8 23.5 0 10.4-7.5 18.4-16.8 18.4s-16.8-8-16.8-18.4C15.2 20.5 22.7 8 32 8Z"/>
+    <path d="M32 21.5v6.2M28.9 24.6h6.2" stroke-width="3.8"/>
+  </g>
+  <path d="M51 8.5l1.4 3.2 3.2 1.4-3.2 1.4-1.4 3.2-1.4-3.2-3.2-1.4 3.2-1.4L51 8.5Z" fill="#8a8f98"/>
+</svg>

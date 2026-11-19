@@ -1,0 +1,71 @@
+{
+  "name": "dsh-ai-credits",
+  "version": "2.4.2",
+  "type": "module",
+  "description": "AI 免费额度 / 积分聚合页 + 各家 API 价格表 + 订阅对比 + 本机接入与用量花费：官方价实时核对、按分时价与缓存命中计价、fork 会话自动去重、一键导入官方用量 CSV 对账，并可按会话分段查看 token 消耗时间轴。",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "usage",
+    "billing",
+    "credits",
+    "pricing",
+    "token"
+  ],
+  "license": "MIT",
+  "author": "TheGoast",
+  "homepage": "https://github.com/TheGoast/dsh-ai-credits",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheGoast/dsh-ai-credits.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TheGoast/dsh-ai-credits/issues"
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.1"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./prices": "./prices.js",
+    "./plans": "./plans.js",
+    "./dsh-api": "./dsh-api.js",
+    "./usage": "./usage.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./pricing-sync": "./pricing-sync.js",
+    "./official-usage": "./official-usage.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "prices.js",
+    "plans.js",
+    "dsh-api.js",
+    "usage.js",
+    "pricing-sync.js",
+    "official-usage.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "docs",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
