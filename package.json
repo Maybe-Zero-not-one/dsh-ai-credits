@@ -14,14 +14,14 @@
     "token"
   ],
   "license": "MIT",
-  "author": "TheGoast",
-  "homepage": "https://github.com/TheGoast/dsh-ai-credits",
+  "author": "Maybe-Zero-not-one",
+  "homepage": "https://github.com/Maybe-Zero-not-one/dsh-ai-credits",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TheGoast/dsh-ai-credits.git"
+    "url": "git+https://github.com/Maybe-Zero-not-one/dsh-ai-credits.git"
   },
   "bugs": {
-    "url": "https://github.com/TheGoast/dsh-ai-credits/issues"
+    "url": "https://github.com/Maybe-Zero-not-one/dsh-ai-credits/issues"
   },
   "engines": {
     "dsh": ">=0.2.2-rc.1"
