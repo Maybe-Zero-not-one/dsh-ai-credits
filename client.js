@@ -196,6 +196,26 @@ window.__ModuleLoader__.load({
 
     const currencySymbol = (currency) => (currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : '')
 
+    /**
+     * 领取入口按「三种状态」分栏显示：绿点能打开 / 黄红点打不开或被拦 / 灰点待检查。
+     * 顺序固定，空的栏不显示 —— 旧版是混在一起按名字排，一堆死链夹在中间很难看。
+     */
+    const BUCKETS = [
+      { key: 'ok', label: '能打开', note: '' },
+      {
+        key: 'dead',
+        label: '打不开 / 被拦',
+        note: '点不开的可以删掉；删了会留档，之后联网再搜到同一条只标「存疑」，不会自己回来',
+      },
+      { key: 'idle', label: '待检查', note: '这一条还没巡检过' },
+    ]
+
+    const bucketOfSource = (item) => {
+      if (item.reachable === true) return 'ok'
+      if (item.reachable === false) return 'dead'
+      return 'idle'
+    }
+
     const fmtPrice = (value, currency) => {
       if (typeof value !== 'number' || !Number.isFinite(value)) return '—'
       const text = Number.isInteger(value) ? String(value) : String(Math.round(value * 1000) / 1000)
@@ -301,6 +321,30 @@ window.__ModuleLoader__.load({
 .ac-group-title { font-size: 13px; font-weight: 600; }
 .ac-group-count { font-size: 11px; color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-group-note { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bucket { margin-top: 14px; }
+.ac-bucket-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.ac-bucket-title { font-size: 11.5px; font-weight: 600; letter-spacing: .01em; }
+.ac-bucket-title[data-bucket="ok"] { color: var(--dsw-alias-state-success-primary, #22c55e); }
+.ac-bucket-title[data-bucket="dead"] { color: var(--dsw-alias-state-warn-primary, #f59e0b); }
+.ac-bucket-title[data-bucket="idle"] { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bucket-count { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-del { flex: none; margin-left: auto; padding: 1px 5px; border-radius: 5px; cursor: pointer;
+  font-size: 11px; line-height: 1.5; border: 1px solid transparent; background: transparent;
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-del:hover { color: var(--dsw-alias-state-error-primary, #ef4444);
+  border-color: var(--dsw-alias-state-error-primary, #ef4444); }
+.ac-del:disabled { opacity: .45; cursor: default; }
+.ac-removed { margin-top: 22px; padding-top: 14px; border-top: 1px dashed var(--dsw-alias-border-l1, rgba(128,128,128,.22)); }
+.ac-removed-head { display: flex; align-items: baseline; gap: 8px; cursor: pointer; background: none;
+  border: none; padding: 0; font: inherit; color: var(--dsw-alias-label-primary, inherit); }
+.ac-removed-title { font-size: 11.5px; font-weight: 600; }
+.ac-removed-row { display: flex; align-items: baseline; gap: 8px; padding: 5px 0;
+  border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.12)); }
+.ac-removed-row:last-child { border-bottom: none; }
+.ac-removed-name { flex: 1; min-width: 0; font-size: 11.5px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.ac-removed-meta { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); white-space: nowrap; }
+.ac-suspect { color: var(--dsw-alias-state-warn-primary, #f59e0b); }
 .ac-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
 .ac-card { display: flex; flex-direction: column; gap: 8px; padding: 13px 14px; border-radius: 10px;
   border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.20));
@@ -675,6 +719,64 @@ window.__ModuleLoader__.load({
       }, [usageWindow])
 
       /**
+       * 删掉一条入口。宿主会留档：种子不会被补回来，联网再搜到同一条只记「存疑」。
+       * 不弹确认框 —— 删错了下面「已删除」面板里一点就能恢复。
+       */
+      const removeEntry = React.useCallback(
+        async (item) => {
+          const key = item.url || item.id
+          setMutating(key)
+          setMutateError(null)
+          try {
+            const response = await fetch(API + '/remove', {
+              method: 'POST',
+              cache: 'no-store',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ id: item.id, url: item.url }),
+            })
+            const payload = await response.json().catch(() => null)
+            if (!response.ok || !payload || payload.ok === false) {
+              throw new Error((payload && payload.error) || 'HTTP ' + response.status)
+            }
+            await load()
+          } catch (failure) {
+            setMutateError('删不掉：' + String((failure && failure.message) || failure))
+          } finally {
+            setMutating(null)
+          }
+        },
+        [load],
+      )
+
+      const restoreEntry = React.useCallback(
+        async (entry) => {
+          const key = entry.url
+          setMutating(key)
+          setMutateError(null)
+          try {
+            const response = await fetch(API + '/restore', {
+              method: 'POST',
+              cache: 'no-store',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ url: entry.url }),
+            })
+            const payload = await response.json().catch(() => null)
+            if (!response.ok || !payload || payload.ok === false) {
+              throw new Error((payload && payload.error) || 'HTTP ' + response.status)
+            }
+            await load()
+          } catch (failure) {
+            setMutateError('恢复不了：' + String((failure && failure.message) || failure))
+          } finally {
+            setMutating(null)
+          }
+        },
+        [load],
+      )
+
+      /**
        * 把选中的文件传给宿主，由它写进 $DSH_HOME/ai-credits/official-usage/。
        *
        * 浏览器沙箱写不了那个目录，宿主进程可以 —— 所以走一次 base64 上传。
@@ -819,6 +921,12 @@ window.__ModuleLoader__.load({
       // 导入官方账单的进度：null | { busy, name } | { ok, written } | { error }
       const [importState, setImportState] = React.useState(null)
       const importInputRef = React.useRef(null)
+      // 正在删 / 恢复的那一条（按 url 记，卡片上按钮显示 … 并禁用）
+      const [mutating, setMutating] = React.useState(null)
+      // 删除 / 恢复失败时的提示，点别的就清掉
+      const [mutateError, setMutateError] = React.useState(null)
+      // 「已删除」面板展开状态
+      const [removedOpen, setRemovedOpen] = React.useState(false)
       const isSnapshot = data !== null && !fresh
 
       // 宿主在巡检 → 每 2.2 秒问一次，跑完自己就停
@@ -1139,6 +1247,134 @@ window.__ModuleLoader__.load({
         ),
       )
 
+      const removedData = (data && data.removed) || { count: 0, items: [] }
+      const removedItems = Array.isArray(removedData.items) ? removedData.items : []
+      const suspectCount = removedItems.filter((entry) => entry.hits > 0).length
+
+      const sourceCard = (item) => {
+        const status = statusOf(item)
+        const key = item.url || item.id
+        const busy = mutating === key
+        return h(
+          'article',
+          { className: 'ac-card', key: item.id },
+          h(
+            'div',
+            { className: 'ac-card-head' },
+            h('span', { className: 'ac-dot', 'data-state': status.key }),
+            h('span', { className: 'ac-card-title', title: item.title }, item.title),
+            h('span', { className: 'ac-status' }, status.text),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'ac-del',
+                disabled: busy,
+                title: '删掉这条入口。会留档：种子不会补回来，之后联网再搜到只标「存疑」',
+                onClick: () => removeEntry(item),
+              },
+              busy ? '…' : '✕',
+            ),
+          ),
+          h('div', { className: 'ac-claim' }, item.claim),
+          h(
+            'div',
+            { className: 'ac-card-foot' },
+            (item.tags || []).slice(0, 2).map((tag) =>
+              h(
+                'span',
+                { className: item.origin === 'web' ? 'ac-tag ac-tag-new' : 'ac-tag', key: tag },
+                tag,
+              ),
+            ),
+            h('span', { className: 'ac-host' }, hostOf(item.url)),
+            h(
+              'a',
+              {
+                className: 'ac-go',
+                href: item.url,
+                title: '打开 ' + item.url,
+                target: '_blank',
+                rel: 'noreferrer noopener',
+              },
+              '去领 →',
+            ),
+          ),
+        )
+      }
+
+      const removedPanel =
+        removedItems.length === 0
+          ? null
+          : h(
+              'div',
+              { className: 'ac-removed' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-removed-head',
+                  onClick: () => setRemovedOpen((value) => !value),
+                },
+                h('span', { className: 'ac-removed-title' }, '已删除的入口'),
+                h(
+                  'span',
+                  { className: 'ac-removed-meta' },
+                  String(removedItems.length) + ' 条 · ' + (removedOpen ? '收起' : '展开'),
+                ),
+                suspectCount > 0
+                  ? h(
+                      'span',
+                      { className: 'ac-removed-meta ac-suspect' },
+                      '其中 ' + String(suspectCount) + ' 条后来又搜到过（存疑）',
+                    )
+                  : null,
+              ),
+              removedOpen
+                ? h(
+                    'div',
+                    null,
+                    removedItems.map((entry) =>
+                      h(
+                        'div',
+                        { className: 'ac-removed-row', key: entry.url },
+                        h('span', { className: 'ac-removed-name', title: entry.url }, entry.title),
+                        h('span', { className: 'ac-removed-meta' }, entry.host),
+                        entry.httpStatus !== null && entry.httpStatus !== undefined
+                          ? h(
+                              'span',
+                              { className: 'ac-removed-meta' },
+                              entry.httpStatus === 0 ? '连不上' : 'HTTP ' + String(entry.httpStatus),
+                            )
+                          : null,
+                        entry.hits > 0
+                          ? h(
+                              'span',
+                              {
+                                className: 'ac-removed-meta ac-suspect',
+                                title: '删掉之后联网又搜到过 ' + String(entry.hits) + ' 次，最后 ' + (fmtTime(entry.reseenAt) || ''),
+                              },
+                              '存疑 ×' + String(entry.hits),
+                            )
+                          : null,
+                        h('span', { className: 'ac-removed-meta' }, fmtTime(entry.at) || ''),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'ac-del',
+                            disabled: mutating === entry.url,
+                            title: '把这条放回清单',
+                            onClick: () => restoreEntry(entry),
+                          },
+                          mutating === entry.url ? '…' : '恢复',
+                        ),
+                      ),
+                    ),
+                  )
+                : null,
+            )
+
       const creditsBody = [
         data === null
           ? null
@@ -1194,8 +1430,12 @@ window.__ModuleLoader__.load({
             )
           : null,
 
-        groups.map((group) =>
-          h(
+        groups.map((group) => {
+          const buckets = BUCKETS.map((bucket) => ({
+            ...bucket,
+            rows: group.rows.filter((item) => bucketOfSource(item) === bucket.key),
+          })).filter((bucket) => bucket.rows.length > 0)
+          return h(
             'section',
             { className: 'ac-group', key: group.name },
             h(
@@ -1207,57 +1447,34 @@ window.__ModuleLoader__.load({
                 ? h('div', { className: 'ac-group-note' }, '联网搜到的候选页，点开确认过再领')
                 : null,
             ),
-            h(
-              'div',
-              { className: 'ac-grid' },
-              group.rows.map((item) => {
-                const status = statusOf(item)
-                return h(
-                  'article',
-                  { className: 'ac-card', key: item.id },
+            buckets.map((bucket) =>
+              h(
+                'div',
+                { className: 'ac-bucket', key: bucket.key },
+                h(
+                  'div',
+                  { className: 'ac-bucket-head' },
                   h(
-                    'div',
-                    { className: 'ac-card-head' },
-                    h('span', { className: 'ac-dot', 'data-state': status.key }),
-                    h('span', { className: 'ac-card-title', title: item.title }, item.title),
-                    h('span', { className: 'ac-status' }, status.text),
+                    'span',
+                    { className: 'ac-bucket-title', 'data-bucket': bucket.key },
+                    bucket.label,
                   ),
-                  h('div', { className: 'ac-claim' }, item.claim),
-                  h(
-                    'div',
-                    { className: 'ac-card-foot' },
-                    (item.tags || []).slice(0, 2).map((tag) =>
-                      h(
-                        'span',
-                        {
-                          className: item.origin === 'web' ? 'ac-tag ac-tag-new' : 'ac-tag',
-                          key: tag,
-                        },
-                        tag,
-                      ),
-                    ),
-                    h('span', { className: 'ac-host' }, hostOf(item.url)),
-                    h(
-                      'a',
-                      {
-                        className: 'ac-go',
-                        href: item.url,
-                        title: '打开 ' + item.url,
-                        target: '_blank',
-                        rel: 'noreferrer noopener',
-                      },
-                      '去领 →',
-                    ),
-                  ),
-                )
-              }),
+                  h('span', { className: 'ac-bucket-count' }, String(bucket.rows.length) + ' 个'),
+                  bucket.note ? h('span', { className: 'ac-bucket-count' }, bucket.note) : null,
+                ),
+                h('div', { className: 'ac-grid' }, bucket.rows.map(sourceCard)),
+              ),
             ),
-          ),
-        ),
+          )
+        }),
 
         data !== null && groups.length === 0
           ? h('div', { className: 'ac-state' }, '没找到匹配的入口，换个关键词，或者把筛选切回「全部」。')
           : null,
+
+        mutateError ? h('div', { className: 'ac-note' }, mutateError) : null,
+
+        data !== null ? removedPanel : null,
 
         error !== null && data === null
           ? h(

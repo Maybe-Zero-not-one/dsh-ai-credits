@@ -461,16 +461,30 @@ function blankState() {
     plansCheckedAt: null,
     planChecks: {},
     aggregatorChecks: [],
+    // 手动删掉的入口：留档，种子不会因为 mergeSeeds 复活，联网再搜到也只记「存疑」
+    removed: [],
   }
+}
+
+/** 已删除链接的索引：归一化 URL → 记录。删过的东西靠它挡住种子复活和搜索结果复现。 */
+function removedMap(state) {
+  if (!Array.isArray(state.removed)) state.removed = []
+  const map = new Map()
+  for (const item of state.removed) {
+    if (item && typeof item.url === 'string') map.set(normalizeUrl(item.url), item)
+  }
+  return map
 }
 
 /**
  * 把内置种子并进已有数据。
  * ⚠ 按 id 合并（不是按 URL）：种子的链接以后改了，同一条要跟着换地址，
  *   而不是多出一条旧的。巡检结果（checkedAt / httpStatus / reachable）一定保留。
+ * ⚠ 用户手动删掉的（state.removed）不再补回来 —— 否则每读一次状态就复活一次。
  */
 function mergeSeeds(state) {
   if (!Array.isArray(state.sources)) state.sources = []
+  const removed = removedMap(state)
   const byId = new Map()
   const byUrl = new Map()
   for (const item of state.sources) {
@@ -478,6 +492,7 @@ function mergeSeeds(state) {
     if (item && item.url) byUrl.set(normalizeUrl(item.url), item)
   }
   for (const seed of SEEDS) {
+    if (removed.has(normalizeUrl(seed.url))) continue
     let current = byId.get(seed.id)
     if (current === undefined) {
       const hit = byUrl.get(normalizeUrl(seed.url))
@@ -535,6 +550,107 @@ function publicSources(state) {
     reachable: typeof item.reachable === 'boolean' ? item.reachable : null,
     discoveredAt: item.discoveredAt || null,
   }))
+}
+
+/** 已删除链接发出去的样子（最近删的排前面） */
+function publicRemoved(state) {
+  const list = Array.isArray(state.removed) ? state.removed : []
+  return list
+    .filter((item) => item && item.url)
+    .slice()
+    .sort((a, b) => String(b.at || '').localeCompare(String(a.at || '')))
+    .map((item) => ({
+      url: item.url,
+      host: item.host || hostOf(item.url),
+      title: item.title || hostOf(item.url),
+      category: item.category || '',
+      at: item.at || null,
+      httpStatus: typeof item.httpStatus === 'number' ? item.httpStatus : null,
+      reachable: typeof item.reachable === 'boolean' ? item.reachable : null,
+      hits: typeof item.hits === 'number' ? item.hits : 0,
+      suspect: item.suspect === true,
+      reseenAt: item.reseenAt || null,
+    }))
+}
+
+/**
+ * 删掉一条入口，并留档。
+ * 留档是为了两件事：种子不会再被 mergeSeeds 补回来；联网发现再撞上同一条链接时
+ * 只把记录标成「存疑」而不是重新加回清单。
+ */
+function removeSource(state, input) {
+  if (!Array.isArray(state.sources)) state.sources = []
+  const id = input && typeof input.id === 'string' ? input.id : null
+  const rawUrl = input && typeof input.url === 'string' ? input.url : null
+  if (id === null && rawUrl === null) return { ok: false, error: '要删哪一条？' }
+
+  const index = state.sources.findIndex((item) => {
+    if (!item) return false
+    if (id !== null && item.id === id) return true
+    if (rawUrl !== null && item.url && normalizeUrl(item.url) === normalizeUrl(rawUrl)) return true
+    return false
+  })
+  if (index < 0) return { ok: false, error: '清单里已经没有这条了' }
+
+  const item = state.sources[index]
+  state.sources.splice(index, 1)
+
+  const key = normalizeUrl(item.url)
+  const removed = removedMap(state)
+  const existing = removed.get(key)
+  if (existing) {
+    existing.at = nowIso()
+    existing.httpStatus = typeof item.httpStatus === 'number' ? item.httpStatus : existing.httpStatus
+    existing.reachable = typeof item.reachable === 'boolean' ? item.reachable : existing.reachable
+    return { ok: true, url: item.url, title: item.title || hostOf(item.url) }
+  }
+
+  state.removed.push({
+    url: item.url,
+    host: hostOf(item.url),
+    title: item.title || hostOf(item.url),
+    category: item.category || '',
+    origin: item.origin || 'seed',
+    httpStatus: typeof item.httpStatus === 'number' ? item.httpStatus : null,
+    reachable: typeof item.reachable === 'boolean' ? item.reachable : null,
+    at: nowIso(),
+    hits: 0,
+    suspect: false,
+    reseenAt: null,
+  })
+  return { ok: true, url: item.url, title: item.title || hostOf(item.url) }
+}
+
+/** 从已删除档里恢复一条：种子交给 mergeSeeds 补，联网发现的当场放回去 */
+function restoreSource(state, url) {
+  const key = normalizeUrl(url || '')
+  const removed = removedMap(state)
+  const record = removed.get(key)
+  if (!record) return { ok: false, error: '这条不在已删除列表里' }
+
+  state.removed = state.removed.filter((item) => !(item && normalizeUrl(item.url) === key))
+
+  if (SEEDS.some((seed) => normalizeUrl(seed.url) === key)) {
+    mergeSeeds(state)
+    return { ok: true, url, restored: true }
+  }
+  if (!Array.isArray(state.sources)) state.sources = []
+  if (!state.sources.some((item) => item && normalizeUrl(item.url) === key)) {
+    state.sources.push({
+      id: 'web-' + shortHash(record.url),
+      title: record.title || hostOf(record.url),
+      category: record.category || '每日新发现',
+      url: record.url,
+      claim: '从已删除里恢复的页面，点开再确认一次。',
+      tags: ['联网发现'],
+      origin: 'web',
+      discoveredAt: nowIso(),
+      checkedAt: null,
+      httpStatus: null,
+      reachable: null,
+    })
+  }
+  return { ok: true, url, restored: true }
 }
 
 /**
@@ -834,10 +950,12 @@ async function discover(ctx, state, queries, maxCandidates) {
     return { at: nowIso(), added: 0, queries, error: '没有可用的联网搜索服务' }
   }
   const known = new Set(state.sources.map((item) => normalizeUrl(item.url)))
+  const removed = removedMap(state)
   const seenTitles = new Set(
     state.sources.filter((item) => item.origin === 'web').map((item) => titleKey(item.title)),
   )
   let added = 0
+  let suspects = 0
   let lastError = null
   for (const query of queries) {
     let result
@@ -853,6 +971,16 @@ async function discover(ctx, state, queries, maxCandidates) {
       if (!looksLikeOffer(source)) continue
       const url = normalizeUrl(source.url)
       if (known.has(url)) continue
+      // 这条以前被手动删掉过 —— 不加回来，只把「又搜到了」这件事记到存疑档上
+      const struck = removed.get(url)
+      if (struck) {
+        struck.hits = (struck.hits || 0) + 1
+        struck.reseenAt = nowIso()
+        struck.suspect = true
+        suspects += 1
+        known.add(url)
+        continue
+      }
       const host = hostOf(url)
       if (!host || isSkipHost(host)) continue
       // 标题重了就是同一篇文章换个链接 —— 别重复占位
@@ -880,7 +1008,7 @@ async function discover(ctx, state, queries, maxCandidates) {
       })
     }
   }
-  return { at: nowIso(), added, queries, error: lastError }
+  return { at: nowIso(), added, suspects, queries, error: lastError }
 }
 
 // ---------------------------------------------------------------- 插件
@@ -1031,6 +1159,7 @@ export function apply(ctx, config) {
     const sources = publicSources(state)
     const prices = publicPrices(state)
     const plans = publicPlans(state)
+    const removedList = publicRemoved(state)
     return {
       ok: true,
       now: nowIso(),
@@ -1053,6 +1182,7 @@ export function apply(ctx, config) {
         reachable: sources.filter((item) => item.reachable === true).length,
         unreachable: sources.filter((item) => item.reachable === false).length,
         candidates: sources.filter((item) => item.origin === 'web').length,
+        removed: publicRemoved(state).length,
       },
       prices: {
         snapshotAt: PRICE_SNAPSHOT_AT,
@@ -1070,6 +1200,11 @@ export function apply(ctx, config) {
         items: plans.items,
       },
       sources,
+      // 手动删掉的入口留档：怎么删的、什么时候、联网又搜到过几次（存疑）
+      removed: {
+        count: removedList.length,
+        items: removedList,
+      },
     }
   }
 
@@ -1234,6 +1369,90 @@ export function apply(ctx, config) {
           const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
           const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
           sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+        }
+      },
+    }),
+  )
+
+  // 删掉一条入口（留档，种子不会复活）。回包只报结果，页面自己重读 /list
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/ai-credits/remove',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '只接受 POST' })
+          return
+        }
+        const rejected = foreignRejection(req)
+        if (rejected !== 0) {
+          sendJson(res, rejected, { ok: false, error: rejected === 401 ? 'authentication_required' : 'forbidden' })
+          return
+        }
+        let body = ''
+        try {
+          for await (const chunk of req) body += chunk
+        } catch (error) {}
+        let parsed = {}
+        try {
+          parsed = JSON.parse(body || '{}')
+        } catch (error) {}
+        try {
+          const state = mergeSeeds(loadState() || blankState())
+          const result = removeSource(state, parsed)
+          if (result.ok !== true) {
+            sendJson(res, 400, { ok: false, error: result.error || '删除失败' })
+            return
+          }
+          saveState(state)
+          sendJson(res, 200, {
+            ok: true,
+            url: result.url,
+            title: result.title,
+            remaining: state.sources.length,
+            removed: publicRemoved(state).length,
+          })
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+        }
+      },
+    }),
+  )
+
+  // 从已删除里恢复
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/ai-credits/restore',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '只接受 POST' })
+          return
+        }
+        const rejected = foreignRejection(req)
+        if (rejected !== 0) {
+          sendJson(res, rejected, { ok: false, error: rejected === 401 ? 'authentication_required' : 'forbidden' })
+          return
+        }
+        let body = ''
+        try {
+          for await (const chunk of req) body += chunk
+        } catch (error) {}
+        let parsed = {}
+        try {
+          parsed = JSON.parse(body || '{}')
+        } catch (error) {}
+        try {
+          const state = mergeSeeds(loadState() || blankState())
+          const result = restoreSource(state, parsed.url)
+          if (result.ok !== true) {
+            sendJson(res, 400, { ok: false, error: result.error || '恢复失败' })
+            return
+          }
+          saveState(state)
+          sendJson(res, 200, { ok: true, url: parsed.url, total: state.sources.length })
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
