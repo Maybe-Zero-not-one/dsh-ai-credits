@@ -15,6 +15,14 @@ import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { PRICE_PROVIDERS, PRICE_SNAPSHOT_AT } from './prices.js'
 import { CODING_PLANS, PLAN_SNAPSHOT_AT } from './plans.js'
+import {
+  AGGREGATOR_ENDPOINTS,
+  AGGREGATOR_LABEL,
+  AGGREGATOR_TTL_MS,
+  cachedAggregator,
+  collectAggregatorPlans,
+  probeAggregator,
+} from './codingplan.js'
 import { collectDshApi } from './dsh-api.js'
 import { collectUsage } from './usage.js'
 import { fetchOfficialPricing } from './pricing-sync.js'
@@ -452,6 +460,7 @@ function blankState() {
     priceChecks: {},
     plansCheckedAt: null,
     planChecks: {},
+    aggregatorChecks: [],
   }
 }
 
@@ -563,35 +572,85 @@ function publicPrices(state) {
 
 /**
  * 编程订阅（coding plan）发出去的样子。
- * 价格 / 权益来自 plans.js 的快照；checkedAt / reachable 是每天探订阅页的结果。
+ *
+ * 数据源两级：
+ *   1. codingplan.fyi 聚合（145 条 / 40 个平台）—— 主源，6 小时缓存
+ *   2. plans.js 本地快照（65 条）—— 聚合站拿不到时的备用，界面会标「快照」
+ * checkedAt / reachable 仍然是每天探页面得来的，跟数字来源无关。
  */
 function publicPlans(state) {
   const checks = state.planChecks && typeof state.planChecks === 'object' ? state.planChecks : {}
-  return CODING_PLANS.map((plan) => {
-    const check = checks[plan.id] || {}
+  const aggregated = cachedAggregator(CFG_DIR)
+  const useAggregator = Boolean(aggregated && aggregated.ok === true && Array.isArray(aggregated.plans) && aggregated.plans.length > 0)
+
+  // 聚合模式下，145 条套餐共用同一次端点巡检结果 —— 它们同源，健康状态就是端点的健康状态
+  // （早期版本存成对象、现在存成数组，两种都认，免得旧 catalog.json 读不出来）
+  const rawChecks = state.aggregatorChecks
+  const endpointList = Array.isArray(rawChecks)
+    ? rawChecks
+    : rawChecks && typeof rawChecks === 'object'
+      ? Object.values(rawChecks)
+      : []
+  const endpointChecks = endpointList.filter((item) => item && item.checkedAt)
+  const aggHealth = (() => {
+    if (endpointChecks.length === 0) return null
+    const reachable = endpointChecks.filter((item) => item.reachable === true).length
     return {
-      id: plan.id,
-      title: plan.title,
-      provider: plan.provider,
-      region: plan.region,
-      currency: plan.currency,
-      category: ['general', 'coding'].includes(plan.category) ? plan.category : 'coding',
-      kind: plan.kind === 'agent' ? 'agent' : 'plan',
-      checkUrl: plan.checkUrl || plan.url,
-      price: typeof plan.price === 'number' ? plan.price : null,
-      period: plan.period || 'monthly',
-      priceNote: plan.priceNote || '',
-      quota: plan.quota || '',
-      benefits: Array.isArray(plan.benefits) ? plan.benefits : [],
-      url: plan.url,
-      sourceDate: plan.sourceDate || null,
-      source: plan.source || 'official',
-      note: plan.note || '',
+      checkedAt: endpointChecks.map((item) => item.checkedAt).sort()[0] || null,
+      httpStatus: reachable === endpointChecks.length ? 200 : endpointChecks.find((item) => item.httpStatus)?.httpStatus ?? 0,
+      reachable: reachable === endpointChecks.length,
+    }
+  })()
+
+  const sourceOf = (item, mode) => {
+    const check = mode === 'aggregator' ? aggHealth || {} : checks[item.id] || {}
+    return {
+      id: item.id,
+      title: item.title,
+      provider: item.provider,
+      region: item.region,
+      currency: item.currency,
+      category: ['general', 'coding'].includes(item.category) ? item.category : 'coding',
+      kind: item.kind === 'agent' ? 'agent' : 'plan',
+      checkUrl: item.checkUrl || item.url,
+      price: typeof item.price === 'number' ? item.price : null,
+      period: item.period || 'monthly',
+      priceNote: item.priceNote || '',
+      quota: item.quota || '',
+      benefits: Array.isArray(item.benefits) ? item.benefits : [],
+      url: item.url,
+      sourceDate: item.sourceDate || null,
+      source: item.source || 'official',
+      sourceLabel: item.sourceLabel || null,
+      planStatus: item.planStatus || 'open',
+      note: item.note || '',
+      origin: mode,
       checkedAt: check.checkedAt || null,
       httpStatus: typeof check.httpStatus === 'number' ? check.httpStatus : null,
       reachable: typeof check.reachable === 'boolean' ? check.reachable : null,
     }
-  })
+  }
+
+  const items = useAggregator
+    ? aggregated.plans.map((item) => sourceOf(item, 'aggregator'))
+    : CODING_PLANS.map((item) => sourceOf(item, 'snapshot'))
+
+  const source = {
+    mode: useAggregator ? 'aggregator' : 'snapshot',
+    label: useAggregator ? AGGREGATOR_LABEL : '本地快照',
+    home: useAggregator ? aggregated.home : null,
+    at: useAggregator ? aggregated.at : null,
+    dataDate: useAggregator ? aggregated.sourceDate : PLAN_SNAPSHOT_AT,
+    ttlHours: Math.round(AGGREGATOR_TTL_MS / 3600000),
+    error: useAggregator ? null : (aggregated && aggregated.error) || null,
+    stats: useAggregator ? aggregated.stats : null,
+    endpoints:
+      endpointList.length > 0
+        ? endpointList
+        : AGGREGATOR_ENDPOINTS.map((endpoint) => ({ key: endpoint.key, url: endpoint.url })),
+    fallback: useAggregator ? null : 'plans.js',
+  }
+  return { items, source }
 }
 
 // ---------------------------------------------------------------- 巡检
@@ -665,11 +724,43 @@ async function runPriceCheck(state, timeoutMs) {
   state.pricesCheckedAt = nowIso()
 }
 
-/** 编程订阅页同理：只确认「今天还能不能打开」，价格 / 权益是 plans.js 里人工核对的快照 */
+/**
+ * 订阅页巡检，改成两级：
+ *
+ *   主源：只在 codingplan.fyi 的 3 个端点上一问（plans / platforms / config）
+ *   备用：每个厂商留 1 个官网订阅页（约 15 条），聚合站挂了时还能看出「官网今天通不通」
+ *
+ * 以前是把 65 条套餐的官网逐个探一遍 —— 一天 65 次请求换一句「页面能打开」，
+ * 换成聚合源后请求数从 65 降到 18，而且主源拿到的是真数据不是心跳。
+ */
 async function runPlanCheck(state, timeoutMs) {
-  if (CODING_PLANS.length === 0) return
   const checks = state.planChecks && typeof state.planChecks === 'object' ? state.planChecks : {}
-  await mapLimit(CODING_PLANS, 4, async (plan) => {
+
+  // 主源：3 个端点
+  try {
+    state.aggregatorChecks = await probeAggregator(probe, timeoutMs)
+  } catch (error) {
+    state.aggregatorChecks = AGGREGATOR_ENDPOINTS.map((endpoint) => ({
+      key: endpoint.key,
+      url: endpoint.url,
+      checkedAt: nowIso(),
+      httpStatus: 0,
+      reachable: false,
+      note: String((error && error.message) || error).slice(0, 120),
+    }))
+  }
+
+  // 备用：每个厂商只留一条代表页面
+  const representatives = []
+  const seenProvider = new Set()
+  for (const plan of CODING_PLANS) {
+    const key = plan.provider || plan.id
+    if (seenProvider.has(key)) continue
+    seenProvider.add(key)
+    representatives.push(plan)
+  }
+
+  await mapLimit(representatives, 4, async (plan) => {
     const result = await probe(plan.checkUrl || plan.url, timeoutMs)
     checks[plan.id] = {
       checkedAt: result.checkedAt,
@@ -678,6 +769,7 @@ async function runPlanCheck(state, timeoutMs) {
       note: result.note,
     }
   })
+
   state.planChecks = checks
   state.plansCheckedAt = nowIso()
 }
@@ -871,6 +963,9 @@ export function apply(ctx, config) {
     }
     if (stale(state.pricesCheckedAt)) return true
     if (CODING_PLANS.length > 0 && stale(state.plansCheckedAt)) return true
+    // 聚合源自己有 6 小时缓存，主表过期也算「该刷了」
+    const aggregated = cachedAggregator(CFG_DIR)
+    if (!aggregated || Date.now() - Date.parse(aggregated.at || 0) > AGGREGATOR_TTL_MS) return true
     return false
   }
 
@@ -896,6 +991,8 @@ export function apply(ctx, config) {
       try {
         await Promise.all([
           runPriceCheck(state, timeoutMs).catch(() => {}),
+          // 聚合源先拉数据（主源），runPlanCheck 里的端点巡检只是心跳
+          collectAggregatorPlans(CFG_DIR, { timeoutMs: Math.max(timeoutMs, 20000) }).catch(() => {}),
           runPlanCheck(state, timeoutMs).catch(() => {}),
         ])
       } catch (error) {}
@@ -967,9 +1064,10 @@ export function apply(ctx, config) {
       plans: {
         snapshotAt: PLAN_SNAPSHOT_AT,
         checkedAt: state.plansCheckedAt || null,
-        total: plans.length,
-        reachable: plans.filter((item) => item.reachable === true).length,
-        items: plans,
+        total: plans.items.length,
+        reachable: plans.items.filter((item) => item.reachable === true).length,
+        source: plans.source,
+        items: plans.items,
       },
       sources,
     }

@@ -46,13 +46,29 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 
 两个栏目共用一套卡片，只是数据不同：`category: 'general'` 进「通用订阅」，`category: 'coding'` 进「编程工具订阅」。编程工具订阅里只放**限定本家编程软件使用**的套餐（WorkBuddy / CodeBuddy / Qoder / Trae / Cursor / Copilot / Windsurf / Devin）；能跨工具用的 coding plan（火山方舟 Coding Plan、Kimi Code）放在通用订阅。
 
+### 数据源：以聚合站为主，本地快照兜底
+
+从 2.4.3 起，订阅数字的主数据源是聚合站 **codingplan.fyi**（`codingplan.js`）：
+
+| 项 | 说明 |
+|:--|:--|
+| 端点 | `plans.json` / `platforms.json` / `config.json`，三个静态 JSON |
+| 规模 | 197 个套餐 / 52 个平台 → 剔除 50 个已下架 = **145 个在售**（国内 104 / 国际 41） |
+| 缓存 | 6 小时 |
+| 回退 | 取不到就用 `plans.js` 的 65 条本地快照，顶部会写明「这次没取到，显示本地快照」 |
+| 卡片标记 | 聚合来的标「聚合」，限购的标「限购」，已下架的不收 |
+
+**为什么换**：以前 65 条靠人工抄，每天还得把 65 个官网页面挨个探一遍才知道有没有变。现在主源一次请求拿全，官网只留 15 条代表页当备用 —— 一天的网络请求从 65 降到 18，数字还更全。
+
+**没有照搬的地方**：聚合站的 `action` 字段是它的推广跳转链接，不采用；卡片一律链到 `codingplan.fyi` 首页，自己看详情再决定去哪家买。地区不按聚合站的 `supportsDomestic` 猜，按**币种**分：人民币算国内，美元算国际。
+
 - **排序固定**：国内按 腾讯 → 阿里 → 字节 → 智谱 → 小米 → MiniMax → Kimi 从上而下；国外按厂商名首字母排序。同一家的套餐放在同一个厂商栏里横向排开，不同厂商竖向排列。
-- **编程工具订阅只放限定本家软件使用的套餐**：腾讯 WorkBuddy（Pro / Team）、CodeBuddy（标准 / 高级）、阿里 Qoder（Lite / Pro / Pro+ / Ultra）、字节 Trae（Lite / Pro / Pro+ / Ultra），海外 Cursor（Plus / Premium / Super / Ultra）、Copilot（Pro / Pro+ / Max）、Devin（Pro / Max；Windsurf 已并入 Devin）；能跨工具用的 coding plan（火山方舟 Coding Plan、Kimi Code）归到通用订阅。
-- 每个套餐一张卡：月付价、`额度：` 一行、3–5 条权益、核对日期、`去订阅 →`；本质是 Agent 套餐的（Devin、Manus、火山 Token Plan）会标「编程 Agent」/「通用 Agent」。
+- **编程工具订阅只放限定本家软件使用的套餐**：Codex / Claude / Cursor / GitHub / Qoder / TRAE / WorkBuddy / Command Code / OpenCode 这些只在自己客户端里用的，归到编程工具订阅；能跨工具用的 token plan 归通用订阅。
+- 每个套餐一张卡：月付价、`额度：` 一行、权益、核对日期、`去订阅 →`；本质是 Agent 套餐的会标「编程 Agent」/「通用 Agent」。
 - 价格按月付展示；年付折扣、按席位、税费另计，额度与权益以「去订阅」页面为准。
 - 标「汇总价」的几家（ChatGPT / Google）官网页拦自动访问，数字按 BenchLM 的 coding plans 汇总核对；其余直接读自官网 / 官方文档。
-- 顶部 **订阅价快照** 是人工核对日期；**最近核对** 是订阅页可访问性的检查时间。超过 45 天也会提醒。
-- 订阅数据在 `plans.js` 里（`PLAN_SNAPSHOT_AT` + `CODING_PLANS`，`category` 区分 `general` / `coding`，`kind: 'agent'` 标 Agent 套餐），加一个套餐、改一个价，保存后热重载就生效。
+- 顶部一行写清当前用的是哪个源、数据日期、聚合缓存时长；聚合挂了会明确提示已回退。
+- 想改本地兜底快照就改 `plans.js`（`PLAN_SNAPSHOT_AT` + `CODING_PLANS`）；想改聚合映射规则就改 `codingplan.js` 里的 `mapPlan`。两者保存后热重载生效。
 
 ## 本机接入
 

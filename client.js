@@ -992,6 +992,7 @@ window.__ModuleLoader__.load({
 
       const planData = data && data.plans ? data.plans : null
       const planItems = planData && Array.isArray(planData.items) ? planData.items : []
+      const planSource = planData && planData.source ? planData.source : null
       const planCategory = view === 'coding' ? 'coding' : 'general'
       const visiblePlans = planItems.filter((item) => planCategoryOf(item) === planCategory)
 
@@ -1533,6 +1534,23 @@ window.__ModuleLoader__.load({
                   '汇总价',
                 )
               : null,
+            plan.source === 'aggregator'
+              ? h(
+                  'span',
+                  {
+                    className: 'ac-tag ac-tag-new',
+                    title: '数字取自 codingplan.fyi 聚合（该站逐条引用官方公告核对），以「去订阅」页面为准',
+                  },
+                  '聚合',
+                )
+              : null,
+            plan.planStatus === 'restricted'
+              ? h(
+                  'span',
+                  { className: 'ac-tag', title: '该套餐目前限购 / 需申请资格' },
+                  '限购',
+                )
+              : null,
             plan.sourceDate ? h('span', { className: 'ac-host' }, '核对于 ' + plan.sourceDate) : null,
             h(
               'a',
@@ -1557,7 +1575,18 @@ window.__ModuleLoader__.load({
           : h(
               'div',
               { className: 'ac-meta' },
-              h('span', null, '订阅价快照 ', h('b', null, planData.snapshotAt || '未标注')),
+              planSource !== null && planSource.mode === 'aggregator'
+                ? h(
+                    'span',
+                    null,
+                    '订阅价来自 ',
+                    h('b', null, planSource.label),
+                    ' 聚合（数据 ',
+                    h('b', null, planSource.dataDate || '未标注'),
+                    '）· ',
+                    String(planData.total) + ' 个套餐 / ' + String(planRegions.length) + ' 个地区',
+                  )
+                : h('span', null, '订阅价快照 ', h('b', null, planData.snapshotAt || '未标注')),
               h(
                 'span',
                 null,
@@ -1567,11 +1596,33 @@ window.__ModuleLoader__.load({
               h(
                 'span',
                 null,
-                '订阅页可访问 ',
+                planSource !== null && planSource.mode === 'aggregator' ? '聚合源可访问 ' : '订阅页可访问 ',
                 h('b', null, String(planReachable) + ' / ' + String(visiblePlans.length)),
               ),
-              h('span', null, '每 ', h('b', null, '20 小时'), ' 自动核对一次'),
+              h(
+                'span',
+                null,
+                '每 ',
+                h('b', null, '20 小时'),
+                ' 自动核对；聚合数据缓存 ',
+                h('b', null, String(planSource && planSource.ttlHours ? planSource.ttlHours : 6) + ' 小时'),
+              ),
             ),
+
+        // 聚合源挂了 → 明确说清现在看的是本地快照，别让人以为数字是新的
+        planSource !== null && planSource.mode !== 'aggregator'
+          ? h(
+              'div',
+              { className: 'ac-note' },
+              '聚合源 ',
+              h('b', null, 'codingplan.fyi'),
+              ' 这次没取到',
+              planSource.error ? '（' + planSource.error + '）' : '',
+              '，下面显示的是本地快照 ',
+              h('b', null, planData.snapshotAt || '未标注'),
+              '，可能已经改价 —— 以「去订阅」页面为准。',
+            )
+          : null,
 
         planData !== null && planStaleDays !== null && planStaleDays > 45
           ? h(
