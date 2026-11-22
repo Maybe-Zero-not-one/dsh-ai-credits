@@ -187,7 +187,12 @@ window.__ModuleLoader__.load({
     const statusOf = (source) => {
       if (source.reachable === true) return { key: 'ok', text: '能打开' }
       if (source.reachable === false) {
-        if (source.httpStatus === 0) return { key: 'warn', text: '本机连不上' }
+        // 海外入口连不上多数是本机出不去的网，不是链接坏了 —— 说清楚，别让人误删
+        if (source.httpStatus === 0) {
+          return source.overseas === true
+            ? { key: 'warn', text: '需代理' }
+            : { key: 'warn', text: '本机连不上' }
+        }
         if (source.httpStatus === 403 || source.httpStatus === 401) return { key: 'warn', text: '拦了自动检查' }
         return { key: 'bad', text: 'HTTP ' + source.httpStatus }
       }
@@ -205,7 +210,7 @@ window.__ModuleLoader__.load({
       {
         key: 'dead',
         label: '打不开 / 被拦',
-        note: '点不开的可以删掉；删了会留档，之后联网再搜到同一条只标「存疑」，不会自己回来',
+        note: '点不开的可以删掉；删了会留档，之后联网再搜到同一条只标「存疑」，不会自己回来。标「需代理」的是海外入口，本机出不去而已，链接本身没问题',
       },
       { key: 'idle', label: '待检查', note: '这一条还没巡检过' },
     ]
@@ -1287,6 +1292,13 @@ window.__ModuleLoader__.load({
                 tag,
               ),
             ),
+            item.overseas === true
+              ? h(
+                  'span',
+                  { className: 'ac-tag', title: '海外入口，本机需要能访问外网才能打开' },
+                  '海外',
+                )
+              : null,
             h('span', { className: 'ac-host' }, hostOf(item.url)),
             h(
               'a',
@@ -2831,11 +2843,15 @@ window.__ModuleLoader__.load({
                     '官方账单',
                     fmtMoney(officialUsage.totals.cost, 'CNY'),
                     '',
-                    (officialUsage.range ? officialUsage.range.from.slice(5) + '~' + officialUsage.range.to.slice(5) : '') +
-                      ' · ' +
-                      officialUsage.byKey.length +
-                      ' 个 key · 含搜索 ¥' +
-                      (officialUsage.totals.fnCost || 0).toFixed(2),
+                    (officialUsage.range
+                      ? officialUsage.range.from.slice(5) + '~' + officialUsage.range.to.slice(5) +
+                        ' · ' + officialUsage.range.days + ' 天有数据'
+                      : '') +
+                      ' · ' + officialUsage.byKey.length + ' 个 key · 含搜索 ¥' +
+                      (officialUsage.totals.fnCost || 0).toFixed(2) +
+                      (officialUsage.totals.overcount > 0.01
+                        ? ' · 已去重（不去重会算 ¥' + officialUsage.totals.rawCost.toFixed(2) + '）'
+                        : ''),
                     true,
                   )
                 : null,
@@ -2930,6 +2946,47 @@ window.__ModuleLoader__.load({
                   ? '（注意：两个 CSV 的金额对不上，导出可能不完整）'
                   : '',
               ),
+              // 重复导入的说明：多次导出必然有交集，这里把去重的账算清楚
+              officialUsage.dedupe && officialUsage.dedupe.overwritten > 0
+                ? h(
+                    'div',
+                    { className: 'ac-caveat', style: { marginTop: '8px' } },
+                    '导入过 ',
+                    h('b', null, String(officialUsage.dedupe.files)),
+                    ' 份 CSV，其中 ',
+                    h('b', null, String(officialUsage.dedupe.overwritten)),
+                    ' 行落在多份文件的交集里，已按「后导入的覆盖先导入的」去重 —— ',
+                    '直接累加会算成 ',
+                    h('b', null, '¥' + (officialUsage.totals.rawCost || 0).toFixed(2)),
+                    '，实际 ',
+                    h('b', null, '¥' + officialUsage.totals.cost.toFixed(2)),
+                    '。',
+                    officialUsage.dedupe.conflicts > 0
+                      ? '其中 ' + officialUsage.dedupe.conflicts + ' 行两次数值不同（导出时那天还没过完），取的是较新的那份。'
+                      : '',
+                    officialUsage.overlaps && officialUsage.overlaps.length > 0
+                      ? h(
+                          'div',
+                          { style: { marginTop: '4px' } },
+                          '重叠区间：',
+                          officialUsage.overlaps
+                            .map((o) => o.from.slice(5) + '~' + o.to.slice(5) + '（' + o.days + ' 天）')
+                            .join('、'),
+                        )
+                      : null,
+                    officialUsage.range && officialUsage.range.missing && officialUsage.range.missing.length > 0
+                      ? h(
+                          'div',
+                          { style: { marginTop: '4px' } },
+                          '区间内 ' + officialUsage.range.missing.length + ' 天没有用量记录（不是缺数据）：',
+                          officialUsage.range.missing.slice(0, 8).map((d) => d.slice(5)).join('、'),
+                          officialUsage.range.missing.length > 8
+                            ? ' 等'
+                            : '',
+                        )
+                      : null,
+                  )
+                : null,
               importPanel(true),
               h(
                 'div',

@@ -151,6 +151,7 @@ const SEEDS = [
     category: '海外 API',
     url: 'https://aistudio.google.com',
     claim: 'Gemini 有免费层，按分钟 / 每天限速，不绑卡也能调。',
+    overseas: true,
     tags: ['免费层', 'Gemini'],
   },
   {
@@ -159,6 +160,7 @@ const SEEDS = [
     category: '海外 API',
     url: 'https://console.groq.com',
     claim: '免费层跑开源模型，速度很快，限速内不额外收费。',
+    overseas: true,
     tags: ['免费层', '高速'],
   },
   {
@@ -167,6 +169,7 @@ const SEEDS = [
     category: '海外 API',
     url: 'https://console.mistral.ai',
     claim: '免费实验层（Experiment），个人开发基本够用。',
+    overseas: true,
     tags: ['免费层'],
   },
   {
@@ -215,6 +218,7 @@ const SEEDS = [
     category: '海外 API',
     url: 'https://cloud.cerebras.ai',
     claim: '免费层，推理极快，注册即用。',
+    overseas: true,
     tags: ['免费层'],
   },
   {
@@ -231,6 +235,7 @@ const SEEDS = [
     category: '海外 API',
     url: 'https://api.together.ai',
     claim: '注册送少量额度，适合跑开源模型。',
+    overseas: true,
     tags: ['注册送'],
   },
   {
@@ -239,6 +244,7 @@ const SEEDS = [
     category: '海外 API',
     url: 'https://fireworks.ai',
     claim: '注册送试用额度，微调 / 推理都能抵。',
+    overseas: true,
     tags: ['试用额度'],
   },
   {
@@ -247,6 +253,7 @@ const SEEDS = [
     category: '海外 API',
     url: 'https://huggingface.co/pricing',
     claim: '免费账号每月有 Inference credits，社区模型随便试。',
+    overseas: true,
     tags: ['每月额度'],
   },
   {
@@ -323,6 +330,7 @@ const SEEDS = [
     category: '学生与开发者',
     url: 'https://azure.microsoft.com/free/students',
     claim: '学生认证送 $100 额度，Azure OpenAI 也能用。',
+    overseas: true,
     tags: ['学生认证', '$100'],
   },
   {
@@ -331,6 +339,7 @@ const SEEDS = [
     category: '学生与开发者',
     url: 'https://cloud.google.com/free',
     claim: '新账号 $300 试用金，Gemini API 可以抵。',
+    overseas: true,
     tags: ['$300', '试用'],
   },
   {
@@ -347,6 +356,7 @@ const SEEDS = [
     category: '学生与开发者',
     url: 'https://colab.research.google.com',
     claim: '免费 GPU 时长，跑开源模型 / 微调够用。',
+    overseas: true,
     tags: ['免费 GPU'],
   },
   {
@@ -516,6 +526,7 @@ function mergeSeeds(state) {
       current.url = seed.url
       current.claim = seed.claim
       current.tags = seed.tags
+      current.overseas = seed.overseas === true
       current.origin = 'seed'
       byUrl.set(normalizeUrl(seed.url), current)
     }
@@ -545,6 +556,7 @@ function publicSources(state) {
     claim: item.claim || '',
     tags: Array.isArray(item.tags) ? item.tags : [],
     origin: item.origin || 'seed',
+    overseas: item.overseas === true,
     checkedAt: item.checkedAt || null,
     httpStatus: typeof item.httpStatus === 'number' ? item.httpStatus : null,
     reachable: typeof item.reachable === 'boolean' ? item.reachable : null,

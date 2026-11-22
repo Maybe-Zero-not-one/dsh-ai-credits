@@ -23,7 +23,7 @@
  * 两条路都落到同一个目录，读的时候没区别。
  */
 
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import { inflateRawSync } from 'node:zlib'
 
@@ -293,8 +293,26 @@ const num = (v) => {
 
 /**
  * 读官方用量目录并聚合。
+ *
+ * ⚠ 多次导出必然重叠（这次的「近 30 天」和上次的「近 30 天」大半是一样的），
+ *   直接逐行累加会重复计数。本机实测：三份 CSV 共 458 行，去重后只有 247 行，
+ *   金额从 308.86 虚高到实际 156.62 —— 整整多算一倍。
+ *
+ * 去重键（必须带 price，否则同一个峰谷价会被当成重复行砍掉一半）：
+ *
+ *   amount：start_time_iso | end_time_iso | model | api_key_name | type | price
+ *   cost  ：start_time_iso | end_time_iso | model | wallet_type | currency
+ *
+ * 优先级按**文件修改时间**：后导入的覆盖先导入的。为什么按这个而不是按文件名：
+ * 导出时间段还没结束时导出的那份，最后一天是残缺的。本机实测 2026-11-17 那份
+ * （11-17 21:59 导出）比 11-21 导出的同日数据少了 25092 miss / 3466 output ——
+ * 当时那天还没过完。所以「更晚的文件」在这类数据上就是「更准的文件」。
+ *
+ * 两种去重键算出来的金额必须一致（amount 按行算 vs cost 按日算），
+ * 对不上就说明有一边解析错了，界面会标出来。
+ *
  * @param home - $DSH_HOME
- * @returns { ok, at, error?, files, byDay[], byKey[], totals }
+ * @returns { ok, at, error?, files[], overlaps[], dedupe, range, byDay[], byKey[], totals }
  */
 export async function collectOfficialUsage(home, options) {
   const force = options && options.force === true
@@ -308,6 +326,9 @@ export async function collectOfficialUsage(home, options) {
     error: '还没导入官方账单',
     dir,
     files: [],
+    overlaps: [],
+    dedupe: null,
+    range: null,
     byDay: [],
     byKey: [],
     totals: null,
@@ -320,22 +341,47 @@ export async function collectOfficialUsage(home, options) {
     return empty
   }
 
-  const csvFiles = names.filter((n) => n.toLowerCase().endsWith('.csv'))
-  if (csvFiles.length === 0) {
+  const csvNames = names.filter((n) => n.toLowerCase().endsWith('.csv'))
+  if (csvNames.length === 0) {
     return { ...empty, error: '目录里没有 CSV' }
   }
 
-  const byDayMap = new Map()
-  const byKeyMap = new Map()
-  const totals = { cost: 0, hit: 0, miss: 0, out: 0, requests: 0, fnCalls: 0, fnCost: 0 }
+  // 按 mtime 升序：后面的一定覆盖前面的
+  const entries = []
+  for (const name of csvNames) {
+    let mtime = 0
+    try {
+      mtime = (await stat(join(dir, name))).mtimeMs
+    } catch (error) {
+      continue
+    }
+    entries.push({ name, mtime })
+  }
+  entries.sort((a, b) => a.mtime - b.mtime || String(a.name).localeCompare(String(b.name)))
+
+  // amount 行的唯一表：键 → { 行数据, 来自哪个文件 }
+  const amountRows = new Map()
+  // cost 行的唯一表
+  const costRows = new Map()
+  // 每个文件的统计
+  const fileStats = []
+  // 每一天被哪些文件覆盖（用来算重叠区间）
+  const daySources = new Map()
+
+  let rawAmountRows = 0
+  let rawCostRows = 0
   let parsedAmount = 0
   let parsedCost = 0
-  let costCsvTotal = 0
+  let overwritten = 0
+  let conflicts = 0
+  let conflictCostDelta = 0
+  // 如果逐行累加（不去重）会算出多少 —— 用来告诉用户重复导入虚高了多少
+  let rawCostTotal = 0
 
-  for (const name of csvFiles) {
+  for (const entry of entries) {
     let text
     try {
-      text = await readFile(join(dir, name), 'utf8')
+      text = await readFile(join(dir, entry.name), 'utf8')
     } catch (error) {
       continue
     }
@@ -344,85 +390,213 @@ export async function collectOfficialUsage(home, options) {
     const head = rows[0].map((h) => h.trim())
     const idx = (k) => head.indexOf(k)
     const iStart = idx('start_time_iso')
+    const iEnd = idx('end_time_iso')
+    const iModel = idx('model')
     const iType = idx('type')
     const iAmount = idx('amount')
     const iPrice = idx('price')
     const iKey = idx('api_key_name')
     const iCost = idx('cost')
+    const iWallet = idx('wallet_type')
+    const iCurrency = idx('currency')
 
-    // amount 表：按类型累计
+    const stat0 = {
+      name: entry.name,
+      mtime: new Date(entry.mtime).toISOString(),
+      kind: 'other',
+      rows: 0,
+      days: [],
+    }
+
+    // ---------- amount 表 ----------
     if (iStart >= 0 && iType >= 0 && iAmount >= 0) {
       parsedAmount += 1
+      stat0.kind = 'amount'
+      const days = new Set()
       for (let r = 1; r < rows.length; r++) {
         const cells = rows[r]
         if (cells.length < head.length) continue
         const day = String(cells[iStart] || '').slice(0, 10)
         if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
-        const type = String(cells[iType] || '').trim()
-        const amount = num(cells[iAmount])
-        const price = iPrice >= 0 ? num(cells[iPrice]) : 0
-        const keyName = iKey >= 0 ? String(cells[iKey] || '').trim() || '(未命名)' : '(未命名)'
-        const cost = amount * price
+        rawAmountRows += 1
+        stat0.rows += 1
+        days.add(day)
 
-        let dayRow = byDayMap.get(day)
-        if (dayRow === undefined) {
-          dayRow = { day, cost: 0, hit: 0, miss: 0, out: 0, requests: 0, fnCalls: 0, fnCost: 0 }
-          byDayMap.set(day, dayRow)
-        }
-        let keyRow = byKeyMap.get(keyName)
-        if (keyRow === undefined) {
-          keyRow = { name: keyName, cost: 0, hit: 0, miss: 0, out: 0, requests: 0, fnCalls: 0, days: new Set() }
-          byKeyMap.set(keyName, keyRow)
-        }
-        keyRow.days.add(day)
+        const price = iPrice >= 0 ? String(cells[iPrice] || '').trim() : ''
+        // 键里必须带 price：同一天同一模型在峰谷两个价档各有一行，漏了 price
+        // 就会把它们判成重复、砍掉其中一半的 token
+        const key = [
+          String(cells[iStart] || '').trim(),
+          iEnd >= 0 ? String(cells[iEnd] || '').trim() : '',
+          iModel >= 0 ? String(cells[iModel] || '').trim() : '',
+          iKey >= 0 ? String(cells[iKey] || '').trim() : '',
+          String(cells[iType] || '').trim(),
+          price,
+        ].join('\u0001')
 
-        if (type === 'input_cache_hit_tokens') {
-          dayRow.hit += amount
-          keyRow.hit += amount
-          totals.hit += amount
-        } else if (type === 'input_cache_miss_tokens') {
-          dayRow.miss += amount
-          keyRow.miss += amount
-          totals.miss += amount
-        } else if (type === 'output_tokens') {
-          dayRow.out += amount
-          keyRow.out += amount
-          totals.out += amount
-        } else if (type === 'request_count') {
-          dayRow.requests += amount
-          keyRow.requests += amount
-          totals.requests += amount
-        } else if (type === 'function_call') {
-          dayRow.fnCalls += amount
-          dayRow.fnCost += cost
-          keyRow.fnCalls += amount
-          totals.fnCalls += amount
-          totals.fnCost += cost
-        } else {
-          continue
+        const row = {
+          day,
+          type: String(cells[iType] || '').trim(),
+          amount: num(cells[iAmount]),
+          price: num(price),
+          keyName: iKey >= 0 ? String(cells[iKey] || '').trim() || '(未命名)' : '(未命名)',
+          file: entry.name,
         }
-        if (type !== 'request_count') {
-          dayRow.cost += cost
-          keyRow.cost += cost
-          totals.cost += cost
+        if (row.type !== 'request_count') rawCostTotal += row.amount * row.price
+        const prev = amountRows.get(key)
+        if (prev !== undefined) {
+          overwritten += 1
+          if (prev.amount !== row.amount || prev.price !== row.price) {
+            conflicts += 1
+            const prevCost = prev.type === 'request_count' ? 0 : prev.amount * prev.price
+            const nextCost = row.type === 'request_count' ? 0 : row.amount * row.price
+            conflictCostDelta += nextCost - prevCost
+          }
         }
+        amountRows.set(key, row)
+      }
+      stat0.days = [...days].sort()
+      fileStats.push(stat0)
+      for (const day of days) {
+        if (!daySources.has(day)) daySources.set(day, [])
+        daySources.get(day).push(entry.name)
       }
       continue
     }
 
-    // cost 表：只有金额（拿来做交叉校验）
+    // ---------- cost 表 ----------
     if (iStart >= 0 && iCost >= 0) {
       parsedCost += 1
+      stat0.kind = 'cost'
+      const days = new Set()
       for (let r = 1; r < rows.length; r++) {
         const cells = rows[r]
         if (cells.length < head.length) continue
-        costCsvTotal += num(cells[iCost])
+        const day = String(cells[iStart] || '').slice(0, 10)
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
+        rawCostRows += 1
+        stat0.rows += 1
+        days.add(day)
+        const key = [
+          String(cells[iStart] || '').trim(),
+          iEnd >= 0 ? String(cells[iEnd] || '').trim() : '',
+          iModel >= 0 ? String(cells[iModel] || '').trim() : '',
+          iWallet >= 0 ? String(cells[iWallet] || '').trim() : '',
+          iCurrency >= 0 ? String(cells[iCurrency] || '').trim() : '',
+        ].join('\u0001')
+        costRows.set(key, {
+          day,
+          cost: num(cells[iCost]),
+          file: entry.name,
+        })
       }
+      stat0.days = [...days].sort()
+      fileStats.push(stat0)
+      continue
     }
+
+    fileStats.push(stat0)
   }
 
   if (parsedAmount === 0) {
     return { ...empty, error: 'CSV 里没有可识别的用量表（缺 start_time_iso / type / amount 列）' }
+  }
+
+  // ---------- 从去重后的表聚合 ----------
+  const byDayMap = new Map()
+  const byKeyMap = new Map()
+  const totals = { cost: 0, hit: 0, miss: 0, out: 0, requests: 0, fnCalls: 0, fnCost: 0 }
+
+  for (const row of amountRows.values()) {
+    const { day, type, amount, price, keyName } = row
+    const cost = type === 'request_count' ? 0 : amount * price
+
+    let dayRow = byDayMap.get(day)
+    if (dayRow === undefined) {
+      dayRow = { day, cost: 0, hit: 0, miss: 0, out: 0, requests: 0, fnCalls: 0, fnCost: 0 }
+      byDayMap.set(day, dayRow)
+    }
+    let keyRow = byKeyMap.get(keyName)
+    if (keyRow === undefined) {
+      keyRow = { name: keyName, cost: 0, hit: 0, miss: 0, out: 0, requests: 0, fnCalls: 0, days: new Set() }
+      byKeyMap.set(keyName, keyRow)
+    }
+    keyRow.days.add(day)
+
+    if (type === 'input_cache_hit_tokens') {
+      dayRow.hit += amount
+      keyRow.hit += amount
+      totals.hit += amount
+    } else if (type === 'input_cache_miss_tokens') {
+      dayRow.miss += amount
+      keyRow.miss += amount
+      totals.miss += amount
+    } else if (type === 'output_tokens') {
+      dayRow.out += amount
+      keyRow.out += amount
+      totals.out += amount
+    } else if (type === 'request_count') {
+      dayRow.requests += amount
+      keyRow.requests += amount
+      totals.requests += amount
+    } else if (type === 'function_call') {
+      dayRow.fnCalls += amount
+      dayRow.fnCost += cost
+      keyRow.fnCalls += amount
+      totals.fnCalls += amount
+      totals.fnCost += cost
+    } else {
+      continue
+    }
+    if (type !== 'request_count') {
+      dayRow.cost += cost
+      keyRow.cost += cost
+      totals.cost += cost
+    }
+  }
+
+  // cost 表的去重总额，用来跟 amount 表交叉校验
+  let costTableTotal = 0
+  for (const row of costRows.values()) costTableTotal += row.cost
+
+  // ---------- 时间节点梳理 ----------
+  const daysWithData = [...byDayMap.keys()].sort()
+  const today = new Date()
+  const dayList = daysWithData.map((day) => ({
+    day,
+    sources: (daySources.get(day) || []).slice(),
+    shared: (daySources.get(day) || []).length > 1,
+  }))
+
+  // 重叠区间：把连续的重叠日合并成一段，方便界面直接显示「哪几天被合并过」
+  const overlaps = []
+  let run = null
+  for (const item of dayList) {
+    if (item.shared) {
+      if (run === null) {
+        run = { from: item.day, to: item.day, days: 1, files: new Set(item.sources) }
+      } else {
+        run.to = item.day
+        run.days += 1
+        for (const f of item.sources) run.files.add(f)
+      }
+    } else if (run !== null) {
+      overlaps.push({ ...run, files: [...run.files] })
+      run = null
+    }
+  }
+  if (run !== null) overlaps.push({ ...run, files: [...run.files] })
+
+  // 区间内没有数据的天（导出时间段之间跳过的日子，不是错误，只是那几天没用量）
+  const missing = []
+  if (daysWithData.length > 0) {
+    const from = Date.parse(daysWithData[0] + 'T00:00:00Z')
+    const to = Date.parse(daysWithData[daysWithData.length - 1] + 'T00:00:00Z')
+    const have = new Set(daysWithData)
+    for (let t = from; t <= to; t += 86400000) {
+      const key = new Date(t).toISOString().slice(0, 10)
+      if (!have.has(key)) missing.push(key)
+    }
   }
 
   const byDay = [...byDayMap.values()]
@@ -446,22 +620,44 @@ export async function collectOfficialUsage(home, options) {
       days: row.days.size,
     }))
 
-  const days = [...byDayMap.keys()].sort()
+  const amountTotal = Number(totals.cost.toFixed(4))
+  const costTotal = Number(costTableTotal.toFixed(4))
+
   const value = {
     ok: true,
     at: new Date().toISOString(),
     dir,
-    files: csvFiles,
-    range: { from: days[0] || null, to: days[days.length - 1] || null },
+    files: fileStats,
+    // 每份文件的时间段，界面用来显示「这份覆盖了哪几天」
+    overlaps,
+    dedupe: {
+      amountRows: rawAmountRows,
+      amountUnique: amountRows.size,
+      costRows: rawCostRows,
+      costUnique: costRows.size,
+      overwritten,
+      conflicts,
+      conflictCostDelta: Number(conflictCostDelta.toFixed(4)),
+      files: parsedAmount + parsedCost,
+    },
+    range: {
+      from: daysWithData[0] || null,
+      to: daysWithData[daysWithData.length - 1] || null,
+      days: daysWithData.length,
+      missing,
+    },
     byDay,
     byKey,
     totals: {
       ...totals,
-      cost: Number(totals.cost.toFixed(4)),
+      cost: amountTotal,
       fnCost: Number(totals.fnCost.toFixed(4)),
-      // 两个 CSV 的金额能不能对上（对不上说明导出不完整）
-      costCsvTotal: Number(costCsvTotal.toFixed(4)),
-      agree: Math.abs(totals.cost - costCsvTotal) < 0.01,
+      // cost 表（按日）与 amount 表（按行）去重后必须一致
+      costCsvTotal: costTotal,
+      agree: Math.abs(amountTotal - costTotal) < 0.02,
+      // 不去重会算成多少 / 因此虚高的部分
+      rawCost: Number(rawCostTotal.toFixed(4)),
+      overcount: Number((rawCostTotal - amountTotal).toFixed(4)),
     },
   }
   cache = { atMs: now, value }
