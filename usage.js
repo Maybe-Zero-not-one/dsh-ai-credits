@@ -24,6 +24,7 @@ import { promisify } from 'node:util'
 
 import { PRICE_PROVIDERS } from './prices.js'
 import { PROVIDER_KEY_MAP } from './official-usage.js'
+import { CODING_PLANS, PLAN_SNAPSHOT_AT } from './plans.js'
 
 /** 会话日志里没带模型 id 时的兜底别名：宿主用的 id → prices.js 里的 id */
 const MODEL_ALIASES = {
@@ -780,7 +781,64 @@ const CREDIT_ROUTES = {
   'local-codex-cli': { endpoint: null, label: 'Codex CLI' },
 }
 
-/** 这条线路要不要折钱 */
+/**
+ * 订阅线路 → 订阅表（plans.js 快照）里那几个套餐。
+ *
+ * 用来给「订阅 + 折算」算出来的等价月费找个比较对象：等价月费（这些 token 按
+ * 官方标价买要多少钱）对上你实际付的月费，就知道这个套餐值不值。对不上的线路
+ * （CodeArts / TokenPlus / 自建）界面上留一个手填月费的输入框。
+ */
+const SUBSCRIPTION_PLAN_HINTS = {
+  trae: ['trae-lite', 'trae-pro'],
+  qoder: ['qoder-lite', 'qoder-pro', 'qoder-pro-plus'],
+  'qoder-global': ['qoder-lite', 'qoder-pro', 'qoder-pro-plus'],
+  workbuddy: ['workbuddy-pro', 'workbuddy-team'],
+  'ark-agent-plan-cn': ['volcengine-agent-small', 'volcengine-agent-medium', 'volcengine-agent-large'],
+  'ark-coding-plan-cn': ['volcengine-coding-lite', 'volcengine-coding-pro'],
+  'ark-coding-plan-byteplus': ['volcengine-coding-lite', 'volcengine-coding-pro'],
+  'qwen-token-plan': ['aliyun-token-lite', 'aliyun-token-essential', 'aliyun-token-standard', 'aliyun-token-pro'],
+  'local-claude-code': ['claude-pro', 'claude-max'],
+  'local-codex-cli': ['chatgpt-plus', 'chatgpt-pro-100'],
+}
+
+/**
+ * 美元套餐折人民币的参考汇率。
+ *
+ * 只在「参考月费」这一处用 —— 等价金额自己的币种不动。写死一个近似值而不是
+ * 走实时汇率：这不是账，是拿来做「值不值」的判断，差几个点不影响结论，
+ * 界面上也会把「按 $1≈¥X 折」写出来。
+ */
+const USD_TO_CNY = 7.2
+
+/**
+ * 这条订阅线路在套餐表里的参考月费（人民币，取最低档到最高档）。
+ * 套餐表里没有对得上的 → null，界面退回手填。
+ */
+function subscriptionPlanRef(provider) {
+  const ids = SUBSCRIPTION_PLAN_HINTS[provider]
+  if (!Array.isArray(ids) || ids.length === 0) return null
+  const picked = CODING_PLANS.filter((plan) => ids.includes(plan.id) && typeof plan.price === 'number')
+  if (picked.length === 0) return null
+  let minCNY = Infinity
+  let maxCNY = 0
+  const names = []
+  for (const plan of picked) {
+    const cny = plan.currency === 'USD' ? plan.price * USD_TO_CNY : plan.price
+    if (cny < minCNY) minCNY = cny
+    if (cny > maxCNY) maxCNY = cny
+    names.push({ id: plan.id, title: plan.title, price: plan.price, currency: plan.currency })
+  }
+  return {
+    minCNY: Number(minCNY.toFixed(2)),
+    maxCNY: Number(maxCNY.toFixed(2)),
+    plans: names,
+    snapshotAt: PLAN_SNAPSHOT_AT,
+    usdToCny: USD_TO_CNY,
+  }
+}
+
+
+
 /** 这条线路要不要按「真实花费」折钱 */
 const isTokenBilled = (provider) => TOKEN_BILLED.has(provider)
 
@@ -797,11 +855,47 @@ const isEstimateBilled = (provider) => ESTIMATE_ROUTES.has(provider)
  */
 const BILLING_MODES = ['token', 'estimate', 'credits']
 
+const BILLING_LABELS = {
+  token: '按量计费',
+  estimate: '套餐 · 折算',
+  credits: '订阅 · 不折钱',
+}
+
+/** 订阅线路也打开折算时的那一档 —— 它不是第四种模式，是「订阅 + 折钱」的组合 */
+const BILLING_LABEL_FOLDED = '订阅 · 折算'
+
+/**
+ * 覆盖表一条记录的真身。
+ *
+ * 历史写法是 `{ 线路id: 'token' }`（纯字符串），2.4.8 起允许
+ * `{ 线路id: { mode, estimate, monthlyCNY } }` —— 因为「订阅」和「折算」可以是
+ * 两个独立的开关同时按下（订阅线路也想知道「这些 token 按官方价买要多少钱」，
+ * 好判断这个套餐值不值）。字符串写法继续兼容，读进来就归一成这个结构。
+ */
+function normalizeOverrideEntry(value) {
+  if (typeof value === 'string') {
+    if (!BILLING_MODES.includes(value)) return null
+    // 老的 'estimate' 本身就是「折钱」，但 foldCredit 只对 credits 生效，不受影响
+    return { mode: value, estimate: value === 'estimate', monthlyCNY: null }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const mode = BILLING_MODES.includes(value.mode) ? value.mode : null
+  const estimate = value.estimate === true
+  const monthlyCNY =
+    typeof value.monthlyCNY === 'number' && Number.isFinite(value.monthlyCNY) && value.monthlyCNY > 0
+      ? value.monthlyCNY
+      : null
+  if (mode === null && estimate === false && monthlyCNY === null) return null
+  return { mode, estimate, monthlyCNY }
+}
+
 function billingRules(overrides) {
   const map = new Map()
   if (overrides && typeof overrides === 'object') {
-    for (const [provider, mode] of Object.entries(overrides)) {
-      if (typeof provider === 'string' && BILLING_MODES.includes(mode)) map.set(provider, mode)
+    for (const [provider, value] of Object.entries(overrides)) {
+      if (typeof provider !== 'string' || provider === '') continue
+      const entry = normalizeOverrideEntry(value)
+      if (entry !== null) map.set(provider, entry)
     }
   }
   const auto = (provider) => {
@@ -809,18 +903,47 @@ function billingRules(overrides) {
     if (isEstimateBilled(provider)) return 'estimate'
     return 'credits'
   }
-  const effective = (provider) => map.get(provider) || auto(provider)
+  const entryOf = (provider) => map.get(provider) || null
+  const effective = (provider) => {
+    const entry = entryOf(provider)
+    return (entry && entry.mode) || auto(provider)
+  }
+  const modeOf = effective
+  /** 订阅线路额外打开了折算：这一类要照官方价折一个等价金额，但不改「订阅」这个身份 */
+  const foldCredit = (provider) => modeOf(provider) === 'credits' && entryOf(provider) !== null && entryOf(provider).estimate === true
   return {
-    /** 用户手选的模式，没有就是 null */
-    override: (provider) => map.get(provider) || null,
+    /** 用户手选的模式，没有就是 null（只钉「折算」开关时也是 null） */
+    override: (provider) => {
+      const entry = entryOf(provider)
+      return (entry && entry.mode) || null
+    },
     /** 自动判定出来的模式 */
     auto,
     /** 最终生效的模式：覆盖优先 */
     effective,
     token: (provider) => effective(provider) === 'token',
     estimate: (provider) => effective(provider) === 'estimate',
-    /** 是否由用户手动指定（界面标「手选」用） */
-    manual: (provider) => map.has(provider),
+    /** 订阅身份 + 折算开关同时成立 */
+    foldCredit,
+    /** 折算开关本身是开是关（订阅和套餐两档都算，界面按钮状态用） */
+    estimateFlag: (provider) => {
+      const entry = entryOf(provider)
+      if (effective(provider) === 'estimate') return true
+      return entry !== null && entry.estimate === true
+    },
+    /** 用户填的参考月费（人民币），没有就是 null */
+    monthlyCNY: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.monthlyCNY
+    },
+    /** 要不要查价、要不要算钱（按量 / 套餐折算 / 订阅+折算 三种都算） */
+    priced: (provider) => effective(provider) !== 'credits' || foldCredit(provider),
+    /** 显示文案：订阅+折算 单独一档 */
+    label: (provider) => (foldCredit(provider) ? BILLING_LABEL_FOLDED : BILLING_LABELS[effective(provider)]),
+    /** 是否由用户手动指定模式（界面标「手选」用） */
+    manual: (provider) => map.has(provider) && (entryOf(provider).mode || null) !== null,
+    /** 表里有没有这一条（任何开关都算），界面「自动」按钮用 */
+    touched: (provider) => map.has(provider),
   }
 }
 
@@ -854,13 +977,22 @@ function startOfLocalDay(nowMs, backDays) {
 export function describeBilling(overrides) {
   const rules = billingRules(overrides)
   return {
-    /** 三种模式的显示文案 */
-    labels: { token: '按量计费', estimate: '套餐 · 折算', credits: '订阅 · 不折钱' },
+    /** 三种模式的显示文案（外加「订阅 · 折算」这一档） */
+    labels: { ...BILLING_LABELS },
+    foldedLabel: BILLING_LABEL_FOLDED,
     modes: BILLING_MODES.slice(),
     auto: (provider) => rules.auto(provider),
     effective: (provider) => rules.effective(provider),
     override: (provider) => rules.override(provider),
     manual: (provider) => rules.manual(provider),
+    touched: (provider) => rules.touched(provider),
+    /** 是否「订阅 + 折算」：算等价金额但不改订阅身份 */
+    foldCredit: (provider) => rules.foldCredit(provider),
+    /** 折算开关状态（按钮高亮用） */
+    estimateFlag: (provider) => rules.estimateFlag(provider),
+    /** 用户填的参考月费 */
+    monthlyCNY: (provider) => rules.monthlyCNY(provider),
+    label: (provider) => rules.label(provider),
     /** 这条线路在订阅白名单里有没有积分查询端点 */
     creditEndpoint: (provider) => {
       const meta = CREDIT_ROUTES[provider]
@@ -1012,10 +1144,12 @@ export async function collectUsage(ctx, options) {
       const day = dayOf(row.at)
       const price = withOfficial(lookupPrice(row.model).price, official)
       const isCreditRoute = !billing.token(row.provider)
+      // 订阅线路也把「折算」打开时照样查价算钱 —— 算的是等价金额，用来判断套餐值不值
+      const priced = billing.priced(row.provider)
 
       // 单条按它自己的时间戳判峰谷 —— 跨峰谷的批次不能拿总量套一个价
       const inPeak = price === null ? true : isPeakTime(row.at, price.peak)
-      const rowCost = isCreditRoute ? null : costOfOne(price, row, inPeak)
+      const rowCost = priced ? costOfOne(price, row, inPeak) : null
 
       // 时间轴只统计窗口内的（窗口外的不上图）
       if (inWindow && row.at > 0) {
@@ -1051,6 +1185,9 @@ export async function collectUsage(ctx, options) {
             costUSD: 0,
             unpricedTokens: 0,
             creditTokens: 0,
+            // 订阅线路打开折算后的等价金额（不是账单）
+            worthCNY: 0,
+            worthUSD: 0,
             costCNYPeak: 0,
             costCNYOffPeak: 0,
             tokensPeak: 0,
@@ -1064,6 +1201,11 @@ export async function collectUsage(ctx, options) {
         dayBucket.totalTokens += row.total
         if (isCreditRoute) {
           dayBucket.creditTokens += row.total
+          // 订阅 + 折算：这一天的等价金额，跟「实际花费」分开记
+          if (rowCost !== null) {
+            if (price.currency === 'USD') dayBucket.worthUSD += rowCost
+            else dayBucket.worthCNY += rowCost
+          }
         } else if (rowCost === null) {
           dayBucket.unpricedTokens += row.total
         } else if (price.currency === 'USD') {
@@ -1146,6 +1288,9 @@ export async function collectUsage(ctx, options) {
   // 套餐渠道按官方价折出来的「等价金额」——单独一栏，不混进实际花费
   let estimateCNY = 0
   let estimateUSD = 0
+  // 其中「订阅 + 折算」那一部分（estimateCNY 的子集），单独给「值不值」那张表用
+  let worthCNY = 0
+  let worthUSD = 0
 
   /**
    * 把官方账单里对应那个 key 的数字找出来，挂到渠道行上。
@@ -1176,24 +1321,56 @@ export async function collectUsage(ctx, options) {
       const meta = CREDIT_ROUTES[bucket.provider] || null
       const realBilled = billing.token(bucket.provider)
       const estimate = billing.estimate(bucket.provider)
+      const folded = billing.foldCredit(bucket.provider)
       // 按量的查价；套餐里那几个（通义 Token Plan / opencode-go）也查，用来折算等价金额；
-      // 其余套餐渠道不查 —— 没公开价的硬编会编出错的数
-      const looked = realBilled || estimate
+      // 订阅线路打开了「折算」开关的同样查 —— 算等价金额，给「这个套餐值不值」当尺子；
+      // 其余订阅渠道不查 —— 没公开价的硬编会编出错的数
+      const looked = realBilled || estimate || folded
         ? lookupPrice(bucket.model)
         : { price: null, alias: null }
       const price = withOfficial(looked.price, official)
       const alias = looked.alias
 
       if (!realBilled && !estimate) {
-        // 纯套餐 / 订阅线路：只报 token 和（能拿到的）积分，不折金额
+        // 纯套餐 / 订阅线路：只报 token 和（能拿到的）积分，不折金额。
+        // 打开折算开关的线路照样算一个等价金额，但它仍然是「订阅」这一档。
         creditTokens += bucket.total
         creditCalls += bucket.calls
         const balance = creditBalances[bucket.provider] || null
+        const cost = folded ? costOf(price, bucket) : null
+        if (cost !== null) {
+          if (price.currency === 'USD') {
+            estimateUSD += cost
+            worthUSD += cost
+          } else {
+            estimateCNY += cost
+            worthCNY += cost
+          }
+        }
+        const monthly = (value) =>
+          value === null || !Number.isFinite(value) ? null : Number((value * (30 / windowMeta.days)).toFixed(2))
         return {
           provider: bucket.provider,
           model: bucket.model,
           billing: 'credits',
           billingManual: billing.manual(bucket.provider),
+          // 订阅线路额外打开了折算：带着等价金额和折合月费出来
+          worth:
+            cost === null
+              ? null
+              : {
+                  cost: Number(cost.toFixed(4)),
+                  currency: price.currency,
+                  monthly: monthly(cost),
+                  monthlyCNY: price.currency === 'USD' ? monthly(cost * USD_TO_CNY) : monthly(cost),
+                  priceProvider: price.providerTitle,
+                  priceInput: price.input,
+                  priceOutput: price.output,
+                  priceCacheRead: Number(price.cacheRead.toFixed(4)),
+                  pricingUrl: price.pricingUrl,
+                  priceDate: price.sourceDate,
+                  alias,
+                },
           calls: bucket.calls,
           inputTokens: bucket.input,
           outputTokens: bucket.output,
@@ -1303,6 +1480,78 @@ export async function collectUsage(ctx, options) {
     })
 
   /**
+   * 「订阅划算吗」。
+   *
+   * 订阅线路把折算开关打开以后，会算出「这些 token 按官方标价买要多少钱」（等价金额）。
+   * 这里按线路聚合，再把这个时间窗的等价金额按天折成月：等价月费 ≈ 一个月这么用要花多少钱。
+   * 拿它跟你实际付的月费（套餐表里的参考价，或者你自己填的）比：
+   *
+   *   worth      等价月费 ≥ 最低档月费 —— 继续订是值的
+   *   near       0.6 ~ 1 倍 —— 差不多，看你还用不用得上别的权益
+   *   light      < 0.6 倍 —— 这套餐用得少，可能不如按量买
+   *
+   * 参考价都没有的线路，结论留空，只把等价月费摆出来。
+   */
+  const worthAgg = new Map()
+  for (const row of bySource) {
+    if (row.billing !== 'credits' || !row.worth) continue
+    let agg = worthAgg.get(row.provider)
+    if (agg === undefined) {
+      agg = {
+        provider: row.provider,
+        routeLabel: row.routeLabel || row.provider,
+        calls: 0,
+        totalTokens: 0,
+        costCNY: 0,
+        costUSD: 0,
+        models: 0,
+      }
+      worthAgg.set(row.provider, agg)
+    }
+    agg.calls += row.calls
+    agg.totalTokens += row.totalTokens
+    agg.models += 1
+    if (row.worth.currency === 'USD') agg.costUSD += row.worth.cost
+    else agg.costCNY += row.worth.cost
+  }
+
+  const monthlyScale = 30 / windowMeta.days
+  const subscriptionWorth = [...worthAgg.values()]
+    .map((agg) => {
+      const monthlyCNY = Number(((agg.costCNY + agg.costUSD * USD_TO_CNY) * monthlyScale).toFixed(2))
+      const planRef = subscriptionPlanRef(agg.provider)
+      const manualMonthly = billing.monthlyCNY(agg.provider)
+      const refMin = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.minCNY
+      const refMax = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.maxCNY
+      const refSource = manualMonthly !== null ? 'manual' : planRef === null ? null : 'plan'
+      let verdict = null
+      let ratio = null
+      if (refMin !== null && refMin > 0 && monthlyCNY > 0) {
+        ratio = Number((monthlyCNY / refMin).toFixed(2))
+        verdict = ratio >= 1 ? 'worth' : ratio >= 0.6 ? 'near' : 'light'
+      }
+      return {
+        provider: agg.provider,
+        routeLabel: agg.routeLabel,
+        calls: agg.calls,
+        totalTokens: agg.totalTokens,
+        models: agg.models,
+        // 这个时间窗里按官方价买要多少钱
+        costCNY: Number(agg.costCNY.toFixed(2)),
+        costUSD: Number(agg.costUSD.toFixed(2)),
+        // 折合月（30 天口径）
+        monthlyCNY,
+        refMin,
+        refMax,
+        refSource,
+        ratio,
+        verdict,
+        planRef,
+      }
+    })
+    .sort((a, b) => b.monthlyCNY - a.monthlyCNY)
+
+  /**
    * 组装时间轴（按会话分段）。
    *
    * 层级：一个会话可能是另一个的子会话（subagent 派生的 Task）。
@@ -1387,6 +1636,9 @@ export async function collectUsage(ctx, options) {
       costUSD: Number(bucket.costUSD.toFixed(4)),
       unpricedTokens: bucket.unpricedTokens,
       creditTokens: bucket.creditTokens,
+      // 订阅 + 折算那部分等价金额（和实际花费分开）
+      worthCNY: Number(bucket.worthCNY.toFixed(4)),
+      worthUSD: Number(bucket.worthUSD.toFixed(4)),
       // 峰谷拆分（只有分时价的厂商会填）
       costCNYPeak: Number(bucket.costCNYPeak.toFixed(4)),
       costCNYOffPeak: Number(bucket.costCNYOffPeak.toFixed(4)),      tokensPeak: bucket.tokensPeak,
@@ -1428,9 +1680,12 @@ export async function collectUsage(ctx, options) {
       // fork / 分支会话复制的历史事件（已从上面所有统计里剔除）
       dedupedCalls: duplicateCalls,
       dedupedTokens: duplicateTokens,
-      // 套餐渠道的等价金额（按官方价折，不是账单）
+      // 套餐渠道的等价金额（按官方价折，不是账单）；含「订阅 + 折算」那部分
       estimateCNY: Number(estimateCNY.toFixed(2)),
       estimateUSD: Number(estimateUSD.toFixed(2)),
+      // 其中订阅线路（打开折算）的等价金额
+      worthCNY: Number(worthCNY.toFixed(2)),
+      worthUSD: Number(worthUSD.toFixed(2)),
       // 实际扣费（DeepSeek 余额差分）—— 拿不到就是 null，别当成 0
       actualCNY: actual === null ? null : Number(actualCNY.toFixed(2)),
       actualDays,
@@ -1440,6 +1695,13 @@ export async function collectUsage(ctx, options) {
     actualByDay,
     bySource,
     byDay,
+    // 「订阅划算吗」：打开了折算的订阅线路，等价月费 vs 参考月费
+    subscriptionWorth,
+    worthMeta: {
+      windowDays: windowMeta.days,
+      usdToCny: USD_TO_CNY,
+      planSnapshotAt: PLAN_SNAPSHOT_AT,
+    },
     creditBalances,
     timeline,
   }

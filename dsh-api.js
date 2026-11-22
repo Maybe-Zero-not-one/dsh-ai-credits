@@ -154,9 +154,11 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
     //   token    按量计费，真花钱
     //   estimate 套餐制但折一个等价金额（标「等价」）
     //   credits  纯订阅，只报 token 不折钱
+    // 订阅那一档还能再叠一个「折算」开关（订阅 + 折算），算等价金额但仍是订阅。
     const autoMode = billingInfo.auto(id)
     const mode = billingInfo.effective(id)
     const override = billingInfo.override(id)
+    const folded = billingInfo.foldCredit(id)
 
     routes.push({
       id,
@@ -175,9 +177,17 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         auto: autoMode,
         override,
         manual: override !== null,
-        label: billingInfo.labels[mode],
+        // 订阅线路额外打开了折算：仍是订阅，但会算等价金额
+        folded,
+        // 折算开关本身的状态（订阅 / 套餐两档都可能是 true，界面按钮高亮用）
+        estimate: billingInfo.estimateFlag(id),
+        label: billingInfo.label(id),
         // 手选过、且和自动判定不一样 —— 界面提示「已按你的选择」
         changed: override !== null && override !== autoMode,
+        // 表里有没有这一条（「自动」按钮要不要显示）
+        touched: billingInfo.touched(id),
+        // 你手填的参考月费（人民币），没有就是 null
+        monthlyCNY: billingInfo.monthlyCNY(id),
         // 这条订阅线路有没有积分查询端点（没有就只能报 token）
         creditEndpoint: billingInfo.creditEndpoint(id),
       },
@@ -241,9 +251,11 @@ export async function collectDshApi(ctx, options) {
       billing: {
         modes: billingInfo.modes,
         labels: billingInfo.labels,
+        foldedLabel: billingInfo.foldedLabel,
         overrides: overrides || {},
         byMode: { token: 0, estimate: 0, credits: 0 },
         manual: 0,
+        folded: 0,
       },
     }
     cache = { at: Date.now(), value, overrideKey }
@@ -261,12 +273,14 @@ export async function collectDshApi(ctx, options) {
   const configured = ordered.filter((route) => route.credential !== null && route.credential.configured === true).length
   const missing = ordered.filter((route) => route.credential !== null && route.credential.configured === false).length
 
-  // 按计费方式分组统计：订阅几条、按量几条、等价几条
+  // 按计费方式分组统计：订阅几条、按量几条、等价几条；订阅里开了折算的单独数
   const byBilling = { token: 0, estimate: 0, credits: 0 }
   let manualCount = 0
+  let foldedCount = 0
   for (const route of ordered) {
     if (route.billing && byBilling[route.billing.mode] !== undefined) byBilling[route.billing.mode] += 1
     if (route.billing && route.billing.manual) manualCount += 1
+    if (route.billing && route.billing.folded) foldedCount += 1
   }
 
   const value = {
@@ -280,9 +294,12 @@ export async function collectDshApi(ctx, options) {
     billing: {
       modes: billingInfo.modes,
       labels: billingInfo.labels,
+      foldedLabel: billingInfo.foldedLabel,
       overrides: overrides || {},
       byMode: byBilling,
       manual: manualCount,
+      // 订阅线路里有多少条同时开了折算
+      folded: foldedCount,
     },
   }
 

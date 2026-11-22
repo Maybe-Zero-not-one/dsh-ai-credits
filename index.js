@@ -24,7 +24,7 @@ import {
   probeAggregator,
 } from './codingplan.js'
 import { collectDshApi } from './dsh-api.js'
-import { collectUsage } from './usage.js'
+import { collectUsage, describeBilling } from './usage.js'
 import { fetchOfficialPricing } from './pricing-sync.js'
 import { collectOfficialUsage, resolveKeyMap, importOfficialFiles } from './official-usage.js'
 
@@ -34,11 +34,34 @@ const CFG_DIR = process.env.DSH_HOME || join(homedir(), '.dsh')
 const DATA_DIR = join(CFG_DIR, 'ai-credits')
 const STORE_FILE = join(DATA_DIR, 'catalog.json')
 /**
- * 线路计费方式的手选覆盖表：{ 线路id: 'token' | 'estimate' | 'credits' }。
+ * 线路计费方式的手选覆盖表：`{ 线路id: { mode, estimate, monthlyCNY } }`。
  * 白名单自动判定总会漏（新线路 / 自建线路 / 连接器内部 id），漏了就只报 token 不折钱。
  * 这张表让用户在「本机接入」栏自己标，比硬编白名单可靠。
+ *
+ * 2.4.8 起一条记录是个对象：
+ *   mode        'token' | 'estimate' | 'credits' | null（null = 不钉模式，跟自动判定）
+ *   estimate    订阅线路也打开折算（算等价金额，判断套餐值不值）
+ *   monthlyCNY  你实际付的月费，用来跟等价月费比；没有就用套餐表里的参考价
+ * 老写法（直接一个字符串）照样能读，进来就归一成这个结构。
  */
 const BILLING_FILE = join(DATA_DIR, 'billing.json')
+const BILLING_MODES = ['token', 'estimate', 'credits']
+
+function normalizeBillingEntry(value) {
+  if (typeof value === 'string') {
+    if (!BILLING_MODES.includes(value)) return null
+    return { mode: value, estimate: value === 'estimate', monthlyCNY: null }
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const mode = BILLING_MODES.includes(value.mode) ? value.mode : null
+  const estimate = value.estimate === true
+  const monthlyCNY =
+    typeof value.monthlyCNY === 'number' && Number.isFinite(value.monthlyCNY) && value.monthlyCNY > 0
+      ? value.monthlyCNY
+      : null
+  if (mode === null && estimate === false && monthlyCNY === null) return null
+  return { mode, estimate, monthlyCNY }
+}
 
 function loadBillingOverrides() {
   try {
@@ -49,9 +72,10 @@ function loadBillingOverrides() {
     const raw = JSON.parse(text)
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
     const out = {}
-    for (const [provider, mode] of Object.entries(raw)) {
+    for (const [provider, value] of Object.entries(raw)) {
       if (typeof provider !== 'string' || provider === '') continue
-      if (mode === 'token' || mode === 'estimate' || mode === 'credits') out[provider] = mode
+      const entry = normalizeBillingEntry(value)
+      if (entry !== null) out[provider] = entry
     }
     return out
   } catch (error) {
@@ -61,9 +85,46 @@ function loadBillingOverrides() {
 
 function saveBillingOverrides(overrides) {
   mkdirSync(DATA_DIR, { recursive: true })
+  // 写出去的形状保持紧凑：只有 mode 就只写 mode，别塞一堆 null
+  const compact = {}
+  for (const [provider, entry] of Object.entries(overrides)) {
+    const value = {}
+    if (entry.mode) value.mode = entry.mode
+    if (entry.estimate) value.estimate = true
+    if (entry.monthlyCNY !== null && entry.monthlyCNY !== undefined) value.monthlyCNY = entry.monthlyCNY
+    if (Object.keys(value).length > 0) compact[provider] = value
+  }
   const tmp = BILLING_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
-  writeFileSync(tmp, JSON.stringify(overrides, null, 2), 'utf8')
+  writeFileSync(tmp, JSON.stringify(compact, null, 2), 'utf8')
   renameSync(tmp, BILLING_FILE)
+}
+
+/**
+ * 刷新时把「自动判定是订阅、却被手选成别的口径」的那几条退回自动。
+ *
+ * 为什么要这样：白名单里那几家（Trae / Qoder / WorkBuddy / 各家 Coding Plan）是**确定**的
+ * 套餐制，自动判成订阅就是对的。手选把它们改成「按量」只会让用量栏凭空多出一笔假花费，
+ * 所以刷新这一下让自动判定压过手选 —— 但你手动给它加的「折算」「月费」不动：
+ * 那是订阅线路上的另一个开关，跟「这条是不是订阅」不是一回事。
+ *
+ * 只改 mode，不碰 estimate / monthlyCNY。清完如果一条记录空了就整条删掉。
+ * @returns {{overrides: object, cleared: string[], changed: boolean}}
+ */
+function reconcileBillingOverrides(overrides) {
+  const auto = describeBilling({}).auto
+  const next = {}
+  const cleared = []
+  for (const [provider, entry] of Object.entries(overrides)) {
+    if (entry.mode && entry.mode !== 'credits' && auto(provider) === 'credits') {
+      cleared.push(provider)
+      const kept = { mode: null, estimate: entry.estimate, monthlyCNY: entry.monthlyCNY }
+      if (kept.estimate === false && kept.monthlyCNY === null) continue
+      next[provider] = kept
+      continue
+    }
+    next[provider] = entry
+  }
+  return { overrides: next, cleared, changed: cleared.length > 0 }
 }
 
 const CATEGORY_ORDER = ['国内 API', '海外 API', '消费级应用', '学生与开发者', '每日新发现']
@@ -1282,6 +1343,17 @@ export function apply(ctx, config) {
     }
   }
 
+  /** 这一下是不是「重新读」按钮按的（?refresh=1）—— 只有这一下让自动判定压过手选 */
+  const refreshRequested = (req) => {
+    try {
+      const parsed = new URL(req.url || '/', 'http://127.0.0.1')
+      const value = parsed.searchParams.get('refresh')
+      return value === '1' || value === 'true'
+    } catch (error) {
+      return false
+    }
+  }
+
   ctx.effect(() =>
     ctx.webServer.register({
       kind: 'exact',
@@ -1309,12 +1381,27 @@ export function apply(ctx, config) {
       path: '/ai-credits/dsh',
       handler: async (req, res) => {
         try {
-          const billing = loadBillingOverrides()
+          let billing = loadBillingOverrides()
+          /**
+           * 点「重新读」才会带 refresh=1。
+           * 这一下让**自动判定压过手选**：白名单判成订阅的那几条，如果被手选改成了
+           * 「按量」/「套餐折算」，退回订阅（否则用量栏会凭空多一笔假花费）。
+           * 手填的「折算」开关和「月费」不跟着退 —— 它们不是「这条算什么」。
+           */
+          let billingRefresh = null
+          if (refreshRequested(req)) {
+            const reconciled = reconcileBillingOverrides(billing)
+            if (reconciled.changed) {
+              saveBillingOverrides(reconciled.overrides)
+              billing = reconciled.overrides
+            }
+            billingRefresh = { cleared: reconciled.cleared, at: new Date().toISOString() }
+          }
           const dshApi = await collectDshApi(ctx, { force: true, billing })
           const official = await fetchOfficialPricing({ force: true }).catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR, { force: true }).catch(() => null)
           const usage = await collectUsage(ctx, { force: true, window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
-          sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage })
+          sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage, billingRefresh })
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
@@ -1454,17 +1541,48 @@ export function apply(ctx, config) {
           sendJson(res, 400, { ok: false, error: '要改哪条线路？' })
           return
         }
+        // mode 只有传了才改：null = 退回自动判定，字符串 = 手选一个口径
         const mode = parsed.mode
-        if (mode !== null && mode !== undefined && !['token', 'estimate', 'credits'].includes(mode)) {
+        const touchMode = mode !== undefined
+        if (touchMode && mode !== null && !['token', 'estimate', 'credits'].includes(mode)) {
           sendJson(res, 400, { ok: false, error: 'mode 只能是 token / estimate / credits，或 null 表示恢复自动' })
           return
         }
+        // estimate 是「折算」开关，跟 mode 独立：对订阅线路来说它意味着「也折个等价金额」
+        const estimate = parsed.estimate
+        if (estimate !== undefined && typeof estimate !== 'boolean') {
+          sendJson(res, 400, { ok: false, error: 'estimate 只能是 true / false' })
+          return
+        }
+        // monthlyCNY：你实际付的月费，用来跟等价月费比；null = 清掉
+        const monthlyCNY = parsed.monthlyCNY
+        if (monthlyCNY !== undefined && monthlyCNY !== null) {
+          const asNumber = typeof monthlyCNY === 'number' ? monthlyCNY : Number(monthlyCNY)
+          if (!Number.isFinite(asNumber) || asNumber <= 0) {
+            sendJson(res, 400, { ok: false, error: 'monthlyCNY 要么是正数，要么是 null' })
+            return
+          }
+        }
         try {
           const overrides = loadBillingOverrides()
-          if (mode === null || mode === undefined) delete overrides[provider]
-          else overrides[provider] = mode
+          const current = overrides[provider] || { mode: null, estimate: false, monthlyCNY: null }
+          const next = { mode: current.mode, estimate: current.estimate, monthlyCNY: current.monthlyCNY }
+          if (touchMode) next.mode = mode
+          if (estimate !== undefined) next.estimate = estimate
+          if (monthlyCNY !== undefined) {
+            next.monthlyCNY =
+              monthlyCNY === null ? null : typeof monthlyCNY === 'number' ? monthlyCNY : Number(monthlyCNY)
+          }
+          // 三个字段都空了就把这条删掉，别留一个空壳
+          if (next.mode === null && next.estimate === false && next.monthlyCNY === null) delete overrides[provider]
+          else overrides[provider] = next
           saveBillingOverrides(overrides)
-          sendJson(res, 200, { ok: true, provider, mode: mode === undefined ? (overrides[provider] || null) : mode, overrides })
+          sendJson(res, 200, {
+            ok: true,
+            provider,
+            entry: overrides[provider] || null,
+            overrides,
+          })
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }

@@ -216,14 +216,13 @@ window.__ModuleLoader__.load({
     ]
 
     /**
-     * 线路计费方式的三种取值。
+     * 线路计费方式的三种取值（「订阅」那档还能再叠一个「折算」开关）。
      * 和宿主 usage.js 的 BILLING_MODES 必须一致 —— 那边是权威，这边只负责显示文案。
      *
      *   token    按量计费：真花钱，折金额
      *   estimate 套餐 · 折算：卖的是套餐，但折一个「拿官方价买要多少钱」当参考
-     *   credits  订阅 · 不折钱：只报 token 和积分
+     *   credits  订阅 · 不折钱：只报 token 和积分；再打开折算就是「订阅 · 折算」
      */
-    const BILLING_MODES = ['token', 'estimate', 'credits']
     const BILLING_LABELS = {
       token: '按量计费',
       estimate: '套餐 · 折算',
@@ -233,6 +232,12 @@ window.__ModuleLoader__.load({
       token: '按量',
       estimate: '折算',
       credits: '订阅',
+    }
+    /** 「订阅划算吗」的三档结论 */
+    const WORTH_VERDICTS = {
+      worth: { text: '划算', tone: 'ok' },
+      near: { text: '差不多', tone: 'idle' },
+      light: { text: '用得少', tone: 'warn' },
     }
 
     const bucketOfSource = (item) => {
@@ -526,6 +531,40 @@ window.__ModuleLoader__.load({
   border-color: var(--dsw-alias-brand-primary, #4d7cfe);
   background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 14%, transparent); }
 .ac-bill-btn:disabled { opacity: .5; cursor: default; }
+/* 订阅 + 折算：折算按钮和「订阅」一起亮，标签换一档颜色（仍是订阅色系，偏亮） */
+.ac-bill-btn[data-folded] { font-weight: 650; color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border-color: var(--dsw-alias-brand-primary, #4d7cfe);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 26%, transparent); }
+.ac-bill-mode[data-folded] { color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 60%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 10%, transparent); }
+/* 折算那一行：等价金额 → 折合月 → 参考月费 → 结论 */
+.ac-bill-worth-row { margin-top: 5px; padding-left: 10px;
+  border-left: 2px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 40%, transparent); }
+.ac-bill-worth { font-size: 11px; color: var(--dsw-alias-label-primary, inherit); }
+.ac-bill-worth b { color: var(--dsw-alias-brand-primary, #4d7cfe); font-weight: 650; }
+.ac-bill-verdict { font-size: 10.5px; font-weight: 650; padding: 1px 6px; border-radius: 5px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.22)); }
+.ac-bill-verdict[data-tone="ok"] { color: var(--dsw-alias-state-success-primary, #22c55e);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 45%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 10%, transparent); }
+.ac-bill-verdict[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 45%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 10%, transparent); }
+.ac-bill-verdict[data-tone="idle"] { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bill-price-wrap { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; }
+.ac-bill-price-wrap::before { content: '¥'; font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bill-price { width: 84px; font-size: 10.5px; padding: 2px 6px; border-radius: 5px;
+  font-family: inherit; color: var(--dsw-alias-label-primary, inherit);
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.24));
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
+.ac-bill-price:focus { outline: none; border-color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-bill-price::placeholder { color: var(--dsw-alias-label-secondary, #8a8f98); opacity: .8; }
+/* 刷新时「自动判定压过手选」的说明 */
+.ac-bill-notice { margin-top: 10px; padding: 8px 12px; border-radius: 8px; font-size: 11px; line-height: 1.6;
+  color: var(--dsw-alias-label-secondary, #8a8f98);
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.22));
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
 .ac-models { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .ac-model-chip { font-size: 10.5px; padding: 3px 7px; border-radius: 6px; font-family: ui-monospace, monospace;
   color: var(--dsw-alias-label-secondary, #8a8f98);
@@ -653,6 +692,22 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, #8a8f98);
   background: color-mix(in srgb, var(--dsw-alias-label-secondary, #8a8f98) 6%, transparent); }
 .ac-caveat b { color: var(--dsw-alias-label-primary, #1a1d21); font-weight: 620; }
+/* ---- 「订阅划算吗」：等价月费 vs 参考月费 ---- */
+.ac-worth { margin-top: 16px; padding: 12px 14px; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 38%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 5%, transparent); }
+.ac-worth-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.ac-worth-title { font-size: 12px; font-weight: 650; color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-worth-meta { font-size: 10.5px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-rows { display: flex; flex-direction: column; gap: 6px; }
+.ac-worth-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 11px;
+  padding: 5px 8px; border-radius: 7px;
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.05)); }
+.ac-worth-name { font-weight: 620; color: var(--dsw-alias-label-primary, inherit); min-width: 120px; }
+.ac-worth-num { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-num b { color: var(--dsw-alias-brand-primary, #4d7cfe); font-weight: 650; font-size: 12.5px; }
+.ac-worth-ref { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-tokens { margin-left: auto; color: var(--dsw-alias-label-secondary, #8a8f98); }
 /* ---- 时间轴（按会话分段）---- */
 .ac-usage-row[data-expandable] .ac-usage-head { cursor: pointer; }
 .ac-caret { font-size: 9px; line-height: 1; opacity: .5; width: 9px; flex: none;
@@ -1005,6 +1060,8 @@ window.__ModuleLoader__.load({
       const [removedOpen, setRemovedOpen] = React.useState(false)
       // 正在改计费方式的那条线路（provider id），按钮显示 … 并禁用
       const [billingBusy, setBillingBusy] = React.useState(null)
+      // 刷新时自动判定压过手选的说明（点「重新读」才会出现，几秒后自己淡出）
+      const [billingNotice, setBillingNotice] = React.useState(null)
       const isSnapshot = data !== null && !fresh
 
       // 宿主在巡检 → 每 2.2 秒问一次，跑完自己就停
@@ -1047,10 +1104,15 @@ window.__ModuleLoader__.load({
 
       // 「本机接入」单独重读：宿主那边对线路清单有 30 秒缓存，这个口会强制重新问一遍。
       // 带 window 就是切时间范围（今天 / 近 7 天 / 近 30 天）。
-      const reloadDsh = React.useCallback(async (windowKey) => {
+      // 带 refresh=true（「重新读」按钮）时，宿主还会把「自动判定是订阅、却被手选成
+      // 别的口径」的线路退回订阅 —— 白名单那几家套餐制是确定的，别让它凭空多出花费。
+      const reloadDsh = React.useCallback(async (windowKey, hardRefresh) => {
         setPending('dsh')
         try {
-          const suffix = typeof windowKey === 'string' && windowKey !== '' ? '?window=' + windowKey : ''
+          const parts = []
+          if (typeof windowKey === 'string' && windowKey !== '') parts.push('window=' + encodeURIComponent(windowKey))
+          if (hardRefresh === true) parts.push('refresh=1')
+          const suffix = parts.length > 0 ? '?' + parts.join('&') : ''
           const response = await fetch(API + '/dsh' + suffix, { cache: 'no-store', credentials: 'same-origin' })
           const payload = await response.json().catch(() => null)
           if (!response.ok || !payload || payload.ok === false) {
@@ -1067,6 +1129,21 @@ window.__ModuleLoader__.load({
                 : { ...payload.usage, creditBalances: balances }
             return { ...prev, dshApi: payload.dshApi, usage: nextUsage }
           })
+          // 刷新时宿主可能把几条手选的口径退回订阅了 —— 说出来，别让人以为点坏了
+          const cleared =
+            payload.billingRefresh && Array.isArray(payload.billingRefresh.cleared)
+              ? payload.billingRefresh.cleared
+              : []
+          if (cleared.length > 0) {
+            setBillingNotice(
+              '刷新时把 ' +
+                String(cleared.length) +
+                ' 条退回自动判定（自动判定是订阅，白名单比手选可信）：' +
+                cleared.join('、'),
+            )
+          } else if (hardRefresh === true) {
+            setBillingNotice('刷新过了：自动判定是订阅的线路都按订阅口径算')
+          }
           setError(null)
         } catch (failure) {
           setError(String((failure && failure.message) || failure))
@@ -1077,20 +1154,25 @@ window.__ModuleLoader__.load({
 
       /**
        * 手动指定一条线路的计费方式。
-       * mode 为 null 表示清掉覆盖、退回自动判定。
+       *
+       * patch 只带要改的字段（宿主那边也是「传了才改」）：
+       *   { mode }                 'token' | 'estimate' | 'credits' | null（null = 退回自动）
+       *   { estimate }             订阅线路的「折算」开关，跟 mode 独立
+       *   { monthlyCNY }           你实际付的月费，跟等价月费比；null = 清掉
        * 改完立刻重读 —— 用量栏的金额分类跟着变，不重读会前后不一致。
        */
       const setBilling = React.useCallback(
-        async (provider, mode) => {
+        async (provider, patch) => {
           setBillingBusy(provider)
           setMutateError(null)
+          setBillingNotice(null)
           try {
             const response = await fetch(API + '/billing', {
               method: 'POST',
               cache: 'no-store',
               credentials: 'same-origin',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ provider, mode }),
+              body: JSON.stringify({ provider, ...patch }),
             })
             const payload = await response.json().catch(() => null)
             if (!response.ok || !payload || payload.ok === false) {
@@ -2071,6 +2153,15 @@ window.__ModuleLoader__.load({
       // 订阅线路：卡片标蓝，汇总里也能直接把名字列出来
       const dshSubscribed = dshRoutes.filter((route) => route.billing && route.billing.mode === 'credits')
       const dshSubscribedNames = dshSubscribed.map((route) => route.name || route.id).join('、')
+      /**
+       * 「订阅划算吗」：宿主在用量那一栏已经按线路聚合好了（等价金额 → 折合月 → 参考月费 → 结论），
+       * 这里按 provider 建个索引，本机接入栏每条订阅卡直接用，不必再算一遍。
+       */
+      const dshWorthList = data && data.usage && Array.isArray(data.usage.subscriptionWorth) ? data.usage.subscriptionWorth : []
+      const worthByProvider = new Map()
+      for (const row of dshWorthList) worthByProvider.set(row.provider, row)
+      const worthMeta = data && data.usage && data.usage.worthMeta ? data.usage.worthMeta : null
+      const dshFolded = dshRoutes.filter((route) => route.billing && route.billing.folded === true)
       const dshDefault = dshApi && dshApi.defaultSelection ? dshApi.defaultSelection : null
       const dshDefaultInfo = dshApi && dshApi.defaultModel ? dshApi.defaultModel : null
       const dshDefaultRoute = dshDefault
@@ -2108,18 +2199,40 @@ window.__ModuleLoader__.load({
 
         /**
          * 计费方式一行：当前标签 + 手选按钮。
-         * 自动判定漏掉的线路（新线路 / 自建 / 连接器内部 id）会落进「订阅」只报 token，
-         * 这里让人自己纠正 —— 四个按钮对应三种模式 + 一个「自动」。
+         *
+         * 「订阅」和「折算」是可以**同时按下**的两个开关：
+         *   · 单按订阅 → 订阅 · 不折钱（只报 token 和积分）
+         *   · 订阅 + 折算 → 订阅 · 折算：仍算订阅，但照官方价折一个等价金额，
+         *     好跟套餐月费比，判断这个套餐值不值
+         *   · 单按折算 → 套餐 · 折算（estimate 那一档）
+         * 判错了按「自动」退回白名单拿去。
          */
         const billingRow = (() => {
           if (bill === null) return null
           const busy = billingBusy === route.id
           const autoLabel = (mode) => (BILLING_SHORT[mode] || mode) + '（自动判定）'
+          const folded = bill.folded === true
+          const worth = worthByProvider.get(route.id) || null
+          // 折算按钮：订阅档是开关，其余档是「切成 estimate」
+          const toggleFold = () => {
+            if (bill.mode === 'credits') setBilling(route.id, { estimate: !folded })
+            else setBilling(route.id, { mode: 'estimate' })
+          }
+          const foldTitle =
+            bill.mode === 'credits'
+              ? folded
+                ? '订阅 + 折算已开：再按一下关掉，这条线路就不折等价金额了'
+                : '订阅 + 折算：订阅身份不变，另外照官方价折一个等价金额，用来跟月费比'
+              : '标成「套餐 · 折算」'
           return h(
             'div',
             { className: 'ac-bill' },
             h('span', { className: 'ac-bill-label' }, '计费'),
-            h('span', { className: 'ac-bill-mode', 'data-mode': bill.mode }, bill.label),
+            h(
+              'span',
+              { className: 'ac-bill-mode', 'data-mode': bill.mode, 'data-folded': folded ? '' : undefined },
+              bill.label || BILLING_LABELS[bill.mode],
+            ),
             bill.manual
               ? h(
                   'span',
@@ -2139,47 +2252,149 @@ window.__ModuleLoader__.load({
                   '这条线路没有积分查询接口，只报 token',
                 )
               : null,
-            !bill.manual
+            !bill.manual && !folded
               ? h('span', { className: 'ac-bill-auto-hint' }, '按白名单自动判定；判错了可以手选')
               : null,
             h(
               'div',
               { className: 'ac-bill-btns' },
-              ...BILLING_MODES.map((mode) =>
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'ac-bill-btn',
-                    key: mode,
-                    disabled: busy,
-                    'data-active': bill.manual && bill.override === mode ? '' : undefined,
-                    // 自动判定命中的那一档描边高亮 —— 一眼看出「订阅是自动认出来的」还是「你标的」
-                    'data-auto': !bill.manual && bill.mode === mode ? '' : undefined,
-                    title:
-                      mode === 'credits'
-                        ? '标成「订阅 · 不折钱」→ 这张卡片标蓝（套餐额度，不折现金）'
-                        : '标成「' + BILLING_LABELS[mode] + '」',
-                    onClick: () => setBilling(route.id, mode),
-                  },
-                  busy ? '…' : BILLING_SHORT[mode],
-                ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-bill-btn',
+                  disabled: busy,
+                  'data-active': bill.manual && bill.override === 'token' ? '' : undefined,
+                  'data-auto': !bill.manual && bill.mode === 'token' ? '' : undefined,
+                  title: '标成「按量计费」：真花钱，折金额',
+                  onClick: () => setBilling(route.id, { mode: 'token' }),
+                },
+                busy ? '…' : BILLING_SHORT.token,
               ),
-              bill.manual
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-bill-btn',
+                  disabled: busy,
+                  // 订阅 + 折算 时这个按钮也是亮的 —— 两个开关同时按着
+                  'data-active':
+                    (bill.manual && bill.override === 'estimate') || folded ? '' : undefined,
+                  'data-auto': !bill.manual && !folded && bill.mode === 'estimate' ? '' : undefined,
+                  'data-folded': folded ? '' : undefined,
+                  title: foldTitle,
+                  onClick: toggleFold,
+                },
+                busy ? '…' : BILLING_SHORT.estimate,
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-bill-btn',
+                  disabled: busy,
+                  'data-active': bill.manual && bill.override === 'credits' ? '' : undefined,
+                  'data-auto': !bill.manual && bill.mode === 'credits' ? '' : undefined,
+                  title: '标成「订阅 · 不折钱」→ 这张卡片标蓝（套餐额度，不折现金）',
+                  onClick: () => setBilling(route.id, { mode: 'credits' }),
+                },
+                busy ? '…' : BILLING_SHORT.credits,
+              ),
+              bill.touched
                 ? h(
                     'button',
                     {
                       type: 'button',
                       className: 'ac-bill-btn',
                       disabled: busy,
-                      title: '清掉手选，退回白名单自动判定（现在是「' + autoLabel(bill.auto) + '」）',
-                      onClick: () => setBilling(route.id, null),
+                      title:
+                        '全清掉：退回白名单自动判定（现在是「' +
+                        autoLabel(bill.auto) +
+                        '」），手填的月费也一起清',
+                      onClick: () => setBilling(route.id, { mode: null, estimate: false, monthlyCNY: null }),
                     },
                     '自动',
                   )
                 : null,
             ),
           )
+        })()
+
+        /**
+         * 订阅折算了才出现的一行：等价金额 → 折合月 → 对上参考月费 → 值不值。
+         * 参考月费来自套餐表里同一条线路那几个套餐的最低价；表里没这条线路就留空，
+         * 让人在右边自己填。
+         */
+        const worthRow = (() => {
+          if (bill === null || bill.folded !== true) return null
+          const busy = billingBusy === route.id
+          const verdict = worth && worth.verdict ? WORTH_VERDICTS[worth.verdict] || null : null
+          const weekly = worth === null ? null : worth.monthlyCNY
+          const priceInput = h('input', {
+            type: 'number',
+            className: 'ac-bill-price',
+            key: 'price-' + (bill.monthlyCNY === null || bill.monthlyCNY === undefined ? '' : String(bill.monthlyCNY)),
+            defaultValue:
+              bill.monthlyCNY === null || bill.monthlyCNY === undefined ? '' : String(bill.monthlyCNY),
+            placeholder: '你付的月费',
+            min: 0,
+            step: 10,
+            disabled: busy,
+            title: '你实际每月付多少（人民币）。填了就拿它跟等价月费比；留空就用套餐表里的参考价',
+            onKeyDown: (event) => {
+              if (event.key === 'Enter') event.target.blur()
+            },
+            onBlur: (event) => {
+              const raw = String(event.target.value || '').trim()
+              const value = raw === '' ? null : Number(raw)
+              if (value !== null && (!Number.isFinite(value) || value <= 0)) return
+              const current = bill.monthlyCNY === null || bill.monthlyCNY === undefined ? null : bill.monthlyCNY
+              if (value === current) return
+              setBilling(route.id, { monthlyCNY: value })
+            },
+          })
+          const parts = [
+            h('span', { className: 'ac-bill-label', key: 'l' }, '折算'),
+            worth === null
+              ? h('span', { className: 'ac-bill-auto-hint', key: 'v' }, '这条线路的模型没有公开价，折不出金额')
+              : h(
+                  'span',
+                  { className: 'ac-bill-worth', key: 'v' },
+                  '等价 ',
+                  h('b', null, fmtPrice(worth.costCNY + worth.costUSD * (worthMeta ? worthMeta.usdToCny : 7.2), 'CNY')),
+                  ' · 折合月 ',
+                  h('b', null, fmtPrice(weekly === null ? 0 : weekly, 'CNY')),
+                ),
+            worth !== null && worth.refMin !== null
+              ? h(
+                  'span',
+                  { className: 'ac-bill-auto-hint', key: 'r' },
+                  '参考月费 ',
+                  worth.refMax !== null && worth.refMax !== worth.refMin
+                    ? fmtPrice(worth.refMin, 'CNY') + '–' + fmtPrice(worth.refMax, 'CNY')
+                    : fmtPrice(worth.refMin, 'CNY'),
+                  worth.refSource === 'manual' ? '（你填的）' : '（套餐表）',
+                )
+              : null,
+            verdict
+              ? h(
+                  'span',
+                  {
+                    className: 'ac-bill-verdict',
+                    key: 'd',
+                    'data-tone': verdict.tone,
+                    title:
+                      worth.refSource === 'manual'
+                        ? '拿等价月费跟你填的月费比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
+                        : '拿等价月费跟套餐表里这条线路的最低价档比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少',
+                  },
+                  verdict.text,
+                  worth.ratio === null ? '' : ' ' + worth.ratio.toFixed(2) + '×',
+                )
+              : null,
+            h('span', { className: 'ac-bill-price-wrap', key: 'p' }, priceInput),
+          ]
+          return h('div', { className: 'ac-bill ac-bill-worth-row' }, ...parts)
         })()
 
         return h(
@@ -2231,6 +2446,7 @@ window.__ModuleLoader__.load({
           ),
           route.modelsError ? h('div', { className: 'ac-note' }, '模型清单没读到：' + route.modelsError) : null,
           billingRow,
+          worthRow,
           route.models.length > 0
             ? h(
                 'div',
@@ -2278,7 +2494,7 @@ window.__ModuleLoader__.load({
                 '这次没读到本机接入情况。',
                 h(
                   'button',
-                  { type: 'button', className: 'ac-btn', style: { marginLeft: '10px' }, onClick: () => reloadDsh() },
+                  { type: 'button', className: 'ac-btn', style: { marginLeft: '10px' }, onClick: () => reloadDsh(undefined, true) },
                   '重新读',
                 ),
               )
@@ -2345,10 +2561,48 @@ window.__ModuleLoader__.load({
                   index > 0 ? ' · ' : '',
                   h('span', { className: 'ac-sub-name' }, route.name),
                   route.billing && route.billing.manual ? h('span', null, '（手选）') : null,
+                  route.billing && route.billing.folded ? h('span', null, '（折算）') : null,
                 ),
               ),
             )
           : null,
+
+        // 订阅里开了折算的，把等价月费汇总一行，直接回答「这些套餐值不值」
+        dshApi !== null && dshFolded.length > 0
+          ? h(
+              'div',
+              { className: 'ac-sub-line' },
+              h('b', null, '订阅 · 折算 ' + String(dshFolded.length) + ' 条'),
+              '：',
+              dshFolded.map((route, index) => {
+                const worth = worthByProvider.get(route.id) || null
+                const verdict = worth && worth.verdict ? WORTH_VERDICTS[worth.verdict] || null : null
+                return h(
+                  'span',
+                  { key: route.id },
+                  index > 0 ? ' · ' : '',
+                  h('span', { className: 'ac-sub-name' }, route.name),
+                  worth === null
+                    ? h('span', null, '（没有公开价，折不出）')
+                    : h(
+                        'span',
+                        null,
+                        ' 折合月 ' + fmtPrice(worth.monthlyCNY, 'CNY'),
+                        verdict ? ' → ' + verdict.text : '',
+                      ),
+                )
+              }),
+              worthMeta !== null && worthMeta.usdToCny
+                ? h(
+                    'span',
+                    { title: '美元套餐按这个汇率折成人民币，只用来比月费' },
+                    '（$1≈¥' + String(worthMeta.usdToCny) + '）',
+                  )
+                : null,
+            )
+          : null,
+
+        billingNotice !== null ? h('div', { className: 'ac-bill-notice' }, billingNotice) : null,
 
         dshDefault !== null
           ? h(
@@ -2382,7 +2636,7 @@ window.__ModuleLoader__.load({
                     type: 'button',
                     className: 'ac-btn',
                     disabled: pending === 'dsh',
-                    onClick: () => reloadDsh(),
+                    onClick: () => reloadDsh(undefined, true),
                   },
                   pending === 'dsh' ? '重新读…' : '重新读',
                 ),
@@ -2427,6 +2681,8 @@ window.__ModuleLoader__.load({
       const usage = data && data.usage ? data.usage : null
       const usageSources = usage && Array.isArray(usage.bySource) ? usage.bySource : []
       const usageDays = usage && Array.isArray(usage.byDay) ? usage.byDay : []
+      // 「订阅划算吗」：订阅线路开了折算之后，宿主按线路聚合出来的等价月费 vs 参考月费
+      const usageWorth = usage && Array.isArray(usage.subscriptionWorth) ? usage.subscriptionWorth : []
       // 实际扣费（DeepSeek 余额差分）：按天对照用
       const actualByDay =
         usage && usage.actualByDay && typeof usage.actualByDay === 'object' ? usage.actualByDay : {}
@@ -2928,9 +3184,11 @@ window.__ModuleLoader__.load({
        */
       const creditRouteCard = (route) => {
         const hasConsumed =
-          route.creditConsumed !== null &&
           route.creditConsumed !== undefined &&
+          route.creditConsumed !== null &&
           route.creditConsumed > 0
+        // 这条订阅线路打开了折算的话，等价金额 / 折合月费在这（宿主按线路聚合好的）
+        const routeWorth = usageWorth.find((item) => item.provider === route.provider) || null
         // 订阅线路同样能展开时间轴（token 用量是按会话记的，跟计费方式无关）
         const creditOpen = expanded === route.provider
         const creditCanOpen = timelineOf(route.provider) !== null
@@ -2984,6 +3242,19 @@ window.__ModuleLoader__.load({
               : null,
             route.creditTotal !== null && route.creditTotal !== undefined
               ? h('span', null, '总额度 ', h('b', null, fmtCredits(route.creditTotal) + ' 积分'))
+              : null,
+            routeWorth !== null
+              ? h(
+                  'span',
+                  null,
+                  '等价 ',
+                  h('b', null, fmtPrice(routeWorth.costCNY + routeWorth.costUSD * (worthMeta ? worthMeta.usdToCny : 7.2), 'CNY')),
+                  ' · 折合月 ',
+                  h('b', null, fmtPrice(routeWorth.monthlyCNY, 'CNY')),
+                  routeWorth.verdict
+                    ? ' · ' + (WORTH_VERDICTS[routeWorth.verdict] ? WORTH_VERDICTS[routeWorth.verdict].text : '')
+                    : '',
+                )
               : null,
           ),
 
@@ -3330,6 +3601,72 @@ window.__ModuleLoader__.load({
             )
           : null,
 
+        // 「订阅划算吗」：只有开了折算的订阅线路才有数
+        usageWorth.length > 0
+          ? h(
+              'div',
+              { className: 'ac-worth' },
+              h(
+                'div',
+                { className: 'ac-worth-head' },
+                h('span', { className: 'ac-worth-title' }, '订阅划算吗'),
+                h(
+                  'span',
+                  { className: 'ac-worth-meta' },
+                  '等价月费 = 这个窗口的等价金额 × ',
+                  String(
+                    usage && usage.worthMeta && usage.worthMeta.windowDays
+                      ? Math.round(30 / usage.worthMeta.windowDays)
+                      : 1,
+                  ),
+                  '（折成 30 天）；≥ 参考月费就算划算，0.6–1 倍差不多，低于 0.6 倍是用得少',
+                ),
+              ),
+              h(
+                'div',
+                { className: 'ac-worth-rows' },
+                usageWorth.map((row) => {
+                  const verdict = row.verdict ? WORTH_VERDICTS[row.verdict] || null : null
+                  return h(
+                    'div',
+                    { className: 'ac-worth-row', key: row.provider },
+                    h('span', { className: 'ac-worth-name' }, row.routeLabel || row.provider),
+                    h(
+                      'span',
+                      { className: 'ac-worth-num' },
+                      h('b', null, fmtPrice(row.monthlyCNY, 'CNY')),
+                      ' / 月',
+                    ),
+                    h(
+                      'span',
+                      { className: 'ac-worth-ref' },
+                      row.refMin === null
+                        ? '参考月费没对上（在「本机接入」里填你付的月费）'
+                        : '参考 ' +
+                          (row.refMax !== null && row.refMax !== row.refMin
+                            ? fmtPrice(row.refMin, 'CNY') + '–' + fmtPrice(row.refMax, 'CNY')
+                            : fmtPrice(row.refMin, 'CNY')) +
+                          (row.refSource === 'manual' ? '（你填的）' : '（套餐表）'),
+                    ),
+                    verdict
+                      ? h(
+                          'span',
+                          { className: 'ac-bill-verdict', 'data-tone': verdict.tone },
+                          verdict.text,
+                          row.ratio === null ? '' : ' ' + row.ratio.toFixed(2) + '×',
+                        )
+                      : null,
+                    h(
+                      'span',
+                      { className: 'ac-worth-tokens' },
+                      fmtTokens(row.totalTokens) + ' token · ' + String(row.calls) + ' 次',
+                    ),
+                  )
+                }),
+              ),
+            )
+          : null,
+
         creditRoutes.length > 0
           ? h(
               'div',
@@ -3345,6 +3682,9 @@ window.__ModuleLoader__.load({
                 '这些线路消耗的是套餐额度或积分，不花现金 —— 不折金额，只报 token 用量和积分。',
                 h('b', null, '积分是整条线路的累计消耗'),
                 '（官方口径），不随上面的时间范围变；官方没有按模型拆分的消耗数据，所以模型只列 token 占比。',
+                usageWorth.length > 0
+                  ? '开了「折算」的线路会多一行等价金额 —— 那是「这些 token 按官方标价买要多少钱」，用来跟套餐月费比，不是账单。'
+                  : '',
               ),
               h('div', { className: 'ac-usage' }, creditRoutes.map(creditRouteCard)),
             )
