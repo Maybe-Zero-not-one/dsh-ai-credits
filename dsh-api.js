@@ -18,6 +18,8 @@
 /** 缓存 30 秒：页面每 60 秒轮询一次，而 listModels 对某些线路会碰网络 */
 const CACHE_MS = 30000
 
+import { describeBilling } from './usage.js'
+
 const isStr = (value) => typeof value === 'string' && value.length > 0
 
 const msgOf = (error) => String((error && error.message) || error || '未知错误')
@@ -117,7 +119,7 @@ function profileOf(entry, settingsIndex) {
   return pickSafeProfile(walkPath(settingsIndex.get(entry.settingsNs), entry.settingsPath))
 }
 
-async function collectRoutes(ctx, llm, directory, settingsIndex) {
+async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
   let providers = []
   try {
     const list = llm.listProviders()
@@ -148,6 +150,14 @@ async function collectRoutes(ctx, llm, directory, settingsIndex) {
     const profile = profileOf(entry, settingsIndex)
     const credential = await describeCredential(ctx, profile.apiKeyEnv)
 
+    // 计费方式：白名单自动判定 + 用户手选覆盖。三种：
+    //   token    按量计费，真花钱
+    //   estimate 套餐制但折一个等价金额（标「等价」）
+    //   credits  纯订阅，只报 token 不折钱
+    const autoMode = billingInfo.auto(id)
+    const mode = billingInfo.effective(id)
+    const override = billingInfo.override(id)
+
     routes.push({
       id,
       name: isStr(info.name) ? info.name : id,
@@ -159,6 +169,18 @@ async function collectRoutes(ctx, llm, directory, settingsIndex) {
       models,
       modelCount: models.length,
       modelsError,
+      // ---- 计费分类 ----
+      billing: {
+        mode,
+        auto: autoMode,
+        override,
+        manual: override !== null,
+        label: billingInfo.labels[mode],
+        // 手选过、且和自动判定不一样 —— 界面提示「已按你的选择」
+        changed: override !== null && override !== autoMode,
+        // 这条订阅线路有没有积分查询端点（没有就只能报 token）
+        creditEndpoint: billingInfo.creditEndpoint(id),
+      },
     })
   }
 
@@ -192,11 +214,17 @@ let cache = { at: 0, value: null }
 /**
  * 收集本机接入情况。失败的段落各自降级，整体永远返回一个能渲染的对象。
  * @param ctx - 宿主上下文。
- * @param options - `{ force: true }` 跳过 30 秒缓存。
+ * @param options - `{ force: true }` 跳过 30 秒缓存；`{ billing: {线路id: 'token'|'estimate'|'credits'} }` 用户手选覆盖。
  */
 export async function collectDshApi(ctx, options) {
   const force = !!(options && options.force === true)
-  if (!force && cache.value !== null && Date.now() - cache.at < CACHE_MS) return cache.value
+  const overrides = (options && options.billing) || null
+  // 覆盖表变了就重算 —— 不能拿旧缓存顶着，否则用户点了按钮页面不动
+  const overrideKey = overrides ? JSON.stringify(overrides) : ''
+  if (!force && cache.value !== null && Date.now() - cache.at < CACHE_MS && cache.overrideKey === overrideKey) {
+    return cache.value
+  }
+  const billingInfo = describeBilling(overrides)
 
   const llm = ctx.get('llm')
   const collectedAt = new Date().toISOString()
@@ -210,21 +238,36 @@ export async function collectDshApi(ctx, options) {
       defaultModel: null,
       routes: [],
       totals: { routes: 0, models: 0, configured: 0, missing: 0, loggedIn: 0 },
+      billing: {
+        modes: billingInfo.modes,
+        labels: billingInfo.labels,
+        overrides: overrides || {},
+        byMode: { token: 0, estimate: 0, credits: 0 },
+        manual: 0,
+      },
     }
-    cache = { at: Date.now(), value }
+    cache = { at: Date.now(), value, overrideKey }
     return value
   }
 
   const directory = readDirectory(llm)
   const settingsIndex = await readSettingsIndex(ctx)
   const defaultSelection = readDefaultSelection(ctx)
-  const { routes, error } = await collectRoutes(ctx, llm, directory, settingsIndex)
+  const { routes, error } = await collectRoutes(ctx, llm, directory, settingsIndex, billingInfo)
   const ordered = sortRoutes(routes, defaultSelection)
   const defaultModel = await readDefaultModelInfo(llm, defaultSelection)
 
   const totalModels = ordered.reduce((sum, route) => sum + route.modelCount, 0)
   const configured = ordered.filter((route) => route.credential !== null && route.credential.configured === true).length
   const missing = ordered.filter((route) => route.credential !== null && route.credential.configured === false).length
+
+  // 按计费方式分组统计：订阅几条、按量几条、等价几条
+  const byBilling = { token: 0, estimate: 0, credits: 0 }
+  let manualCount = 0
+  for (const route of ordered) {
+    if (route.billing && byBilling[route.billing.mode] !== undefined) byBilling[route.billing.mode] += 1
+    if (route.billing && route.billing.manual) manualCount += 1
+  }
 
   const value = {
     ok: error === null,
@@ -234,8 +277,15 @@ export async function collectDshApi(ctx, options) {
     defaultModel,
     routes: ordered,
     totals: { routes: ordered.length, models: totalModels, configured, missing },
+    billing: {
+      modes: billingInfo.modes,
+      labels: billingInfo.labels,
+      overrides: overrides || {},
+      byMode: byBilling,
+      manual: manualCount,
+    },
   }
 
-  cache = { at: Date.now(), value }
+  cache = { at: Date.now(), value, overrideKey }
   return value
 }

@@ -21,7 +21,7 @@
  *   usage.js 按每条调用的真实时间戳判断落在哪边，分别计价。
  *   没有 `peak` 的厂商按单一价算。
  */
-export const PRICE_SNAPSHOT_AT = '2026-11-17'
+export const PRICE_SNAPSHOT_AT = '2026-11-22'
 
 /**
  * 2026 年中国法定节假日（国务院办公厅国办发明电〔2025〕7号）。
@@ -111,6 +111,32 @@ export const PRICE_PROVIDERS = [
       { id: 'qwen3.8-27b', name: 'Qwen3.8-27B', contextK: 1024, input: 3, output: 12, note: '开源尺寸' },
       { id: 'qwen3.8-omni-flash', name: 'Qwen3.8-Omni-Flash', contextK: 1000, input: 0.8, output: 2.7, note: '全模态；缓存命中 ¥0.1' },
       { id: 'qwen3.7-plus', name: 'Qwen3.7-Plus', contextK: 256, input: 2, output: 8, note: '页面价；限时 8 折，实际 ¥1.6 / ¥6.4' },
+    ],
+  },
+  {
+    /* 千问AI平台（qianwenai.com）—— 阿里自家的 MaaS 平台，
+       和上面的「阿里通义千问（百炼）」是两个网址、两套价，别混为一谈。
+       端点 cn-beijing.maas.qianwenaiapi.com，兼容 OpenAI / Anthropic 协议。 */
+    id: 'qianwenai',
+    title: '千问AI平台',
+    region: '国内',
+    currency: 'CNY',
+    pricingUrl: 'https://www.qianwenai.com/models/qwen3.6-flash',
+    sourceDate: '2026-11-22',
+    source: 'official',
+    note: '阿里 MaaS 平台（qianwenai.com）；新用户注册送 tokens 额度',
+    models: [
+      {
+        id: 'qwen3.6-flash',
+        name: 'Qwen3.6-Flash',
+        contextK: 1000,
+        input: 1.2,
+        output: 7.2,
+        cacheRead: 0.12,
+        note:
+          '上下文 1M（最大输入 991K / 输出 65K）；Batch ¥0.6 / ¥3.6；' +
+          '显式缓存创建 ¥1.5、命中 ¥0.12；支持视觉输入与原生思考',
+      },
     ],
   },
   {

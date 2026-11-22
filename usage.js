@@ -788,6 +788,43 @@ const isTokenBilled = (provider) => TOKEN_BILLED.has(provider)
 const isEstimateBilled = (provider) => ESTIMATE_ROUTES.has(provider)
 
 /**
+ * 三条分类规则：按量折钱 / 套餐折等价 / 纯订阅只报 token。
+ *
+ * 自动判定靠上面两张白名单，但白名单总会漏 —— 新线路、自建线路、连接器内部 id
+ * 都可能不在里面，落进「纯订阅」只报 token（安全默认，但可能判错）。
+ * 所以允许 `options.billing` 传一张覆盖表（用户在「本机接入」栏手选的），
+ * 覆盖优先于白名单。
+ */
+const BILLING_MODES = ['token', 'estimate', 'credits']
+
+function billingRules(overrides) {
+  const map = new Map()
+  if (overrides && typeof overrides === 'object') {
+    for (const [provider, mode] of Object.entries(overrides)) {
+      if (typeof provider === 'string' && BILLING_MODES.includes(mode)) map.set(provider, mode)
+    }
+  }
+  const auto = (provider) => {
+    if (isTokenBilled(provider)) return 'token'
+    if (isEstimateBilled(provider)) return 'estimate'
+    return 'credits'
+  }
+  const effective = (provider) => map.get(provider) || auto(provider)
+  return {
+    /** 用户手选的模式，没有就是 null */
+    override: (provider) => map.get(provider) || null,
+    /** 自动判定出来的模式 */
+    auto,
+    /** 最终生效的模式：覆盖优先 */
+    effective,
+    token: (provider) => effective(provider) === 'token',
+    estimate: (provider) => effective(provider) === 'estimate',
+    /** 是否由用户手动指定（界面标「手选」用） */
+    manual: (provider) => map.has(provider),
+  }
+}
+
+/**
  * 时间窗：一天 / 一周 / 一月
  */
 const WINDOWS = {
@@ -810,6 +847,28 @@ function startOfLocalDay(nowMs, backDays) {
  * @param ctx - 宿主上下文。
  * @param options - `{ force: true }` 忽略缓存重算；`{ window: 'day'|'week'|'month' }` 选时间窗。
  */
+/**
+ * 给「本机接入」栏用的分类接口：一条线路现在算哪种计费、是自动判的还是手选的。
+ * 只读常量 + 覆盖表，不碰日志，所以 dsh-api.js 可以直接调用。
+ */
+export function describeBilling(overrides) {
+  const rules = billingRules(overrides)
+  return {
+    /** 三种模式的显示文案 */
+    labels: { token: '按量计费', estimate: '套餐 · 折算', credits: '订阅 · 不折钱' },
+    modes: BILLING_MODES.slice(),
+    auto: (provider) => rules.auto(provider),
+    effective: (provider) => rules.effective(provider),
+    override: (provider) => rules.override(provider),
+    manual: (provider) => rules.manual(provider),
+    /** 这条线路在订阅白名单里有没有积分查询端点 */
+    creditEndpoint: (provider) => {
+      const meta = CREDIT_ROUTES[provider]
+      return meta && meta.endpoint ? meta.endpoint : null
+    },
+  }
+}
+
 export async function collectUsage(ctx, options) {
   // 宿主进程里 DSH_HOME 不一定是环境变量（桌面版就没有），跟 index.js 用同一套兜底
   const home = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -825,6 +884,9 @@ export async function collectUsage(ctx, options) {
       ? options.keyMap
       : PROVIDER_KEY_MAP
   const windowMeta = WINDOWS[windowKey]
+
+  // 线路计费方式：白名单自动判定，用户在「本机接入」栏手选的覆盖优先
+  const billing = billingRules(options && options.billing)
 
   const empty = {
     ok: false,
@@ -949,7 +1011,7 @@ export async function collectUsage(ctx, options) {
 
       const day = dayOf(row.at)
       const price = withOfficial(lookupPrice(row.model).price, official)
-      const isCreditRoute = !isTokenBilled(row.provider)
+      const isCreditRoute = !billing.token(row.provider)
 
       // 单条按它自己的时间戳判峰谷 —— 跨峰谷的批次不能拿总量套一个价
       const inPeak = price === null ? true : isPeakTime(row.at, price.peak)
@@ -1112,8 +1174,8 @@ export async function collectUsage(ctx, options) {
   const bySource = [...sources.values()]
     .map((bucket) => {
       const meta = CREDIT_ROUTES[bucket.provider] || null
-      const realBilled = isTokenBilled(bucket.provider)
-      const estimate = isEstimateBilled(bucket.provider)
+      const realBilled = billing.token(bucket.provider)
+      const estimate = billing.estimate(bucket.provider)
       // 按量的查价；套餐里那几个（通义 Token Plan / opencode-go）也查，用来折算等价金额；
       // 其余套餐渠道不查 —— 没公开价的硬编会编出错的数
       const looked = realBilled || estimate
@@ -1131,6 +1193,7 @@ export async function collectUsage(ctx, options) {
           provider: bucket.provider,
           model: bucket.model,
           billing: 'credits',
+          billingManual: billing.manual(bucket.provider),
           calls: bucket.calls,
           inputTokens: bucket.input,
           outputTokens: bucket.output,
@@ -1191,6 +1254,8 @@ export async function collectUsage(ctx, options) {
         model: bucket.model,
         // 'token' 是按量真花钱；'estimate' 是套餐渠道按官方价折的等价参考
         billing: realBilled ? 'token' : 'estimate',
+        // 这个分类是不是用户在手选里定的（界面标「手选」）；null 表示按自动判定
+        billingManual: billing.manual(bucket.provider),
         calls: bucket.calls,
         inputTokens: bucket.input,
         outputTokens: bucket.output,

@@ -33,6 +33,38 @@ export const inject = ['webServer', 'timer']
 const CFG_DIR = process.env.DSH_HOME || join(homedir(), '.dsh')
 const DATA_DIR = join(CFG_DIR, 'ai-credits')
 const STORE_FILE = join(DATA_DIR, 'catalog.json')
+/**
+ * 线路计费方式的手选覆盖表：{ 线路id: 'token' | 'estimate' | 'credits' }。
+ * 白名单自动判定总会漏（新线路 / 自建线路 / 连接器内部 id），漏了就只报 token 不折钱。
+ * 这张表让用户在「本机接入」栏自己标，比硬编白名单可靠。
+ */
+const BILLING_FILE = join(DATA_DIR, 'billing.json')
+
+function loadBillingOverrides() {
+  try {
+    if (!existsSync(BILLING_FILE)) return {}
+    // 别用 JSON.parse 直接吃原文：Windows 上不少工具写 JSON 会带 UTF-8 BOM，
+    // JSON.parse 遇到 BOM 直接抛错，整张表就静默读成空的了。先剥掉。
+    const text = readFileSync(BILLING_FILE, 'utf8').replace(/^\uFEFF/, '')
+    const raw = JSON.parse(text)
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const out = {}
+    for (const [provider, mode] of Object.entries(raw)) {
+      if (typeof provider !== 'string' || provider === '') continue
+      if (mode === 'token' || mode === 'estimate' || mode === 'credits') out[provider] = mode
+    }
+    return out
+  } catch (error) {
+    return {}
+  }
+}
+
+function saveBillingOverrides(overrides) {
+  mkdirSync(DATA_DIR, { recursive: true })
+  const tmp = BILLING_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
+  writeFileSync(tmp, JSON.stringify(overrides, null, 2), 'utf8')
+  renameSync(tmp, BILLING_FILE)
+}
 
 const CATEGORY_ORDER = ['国内 API', '海外 API', '消费级应用', '学生与开发者', '每日新发现']
 /** 价格页的核对节奏（小时）。数字快照不自动抓，只有官网价格页的可访问性按这个节奏探 */
@@ -1257,10 +1289,11 @@ export function apply(ctx, config) {
       handler: async (req, res) => {
         try {
           // 本机接入情况和用量各自收，出任何错都只让那一栏空着，不拖垮整页
-          const dshApi = await collectDshApi(ctx).catch(() => null)
+          const billing = loadBillingOverrides()
+          const dshApi = await collectDshApi(ctx, { billing }).catch(() => null)
           const official = await fetchOfficialPricing().catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
-          const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
+          const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
           sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
@@ -1276,10 +1309,11 @@ export function apply(ctx, config) {
       path: '/ai-credits/dsh',
       handler: async (req, res) => {
         try {
-          const dshApi = await collectDshApi(ctx, { force: true })
+          const billing = loadBillingOverrides()
+          const dshApi = await collectDshApi(ctx, { force: true, billing })
           const official = await fetchOfficialPricing({ force: true }).catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR, { force: true }).catch(() => null)
-          const usage = await collectUsage(ctx, { force: true, window: usageWindowOf(req), official, officialUsage, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
+          const usage = await collectUsage(ctx, { force: true, window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
           sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage })
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
@@ -1376,11 +1410,61 @@ export function apply(ctx, config) {
             search: parsed.search === true,
             pricesOnly: parsed.pricesOnly === true && parsed.search !== true,
           })
-          const dshApi = await collectDshApi(ctx).catch(() => null)
+          const billing = loadBillingOverrides()
+          const dshApi = await collectDshApi(ctx, { billing }).catch(() => null)
           const official = await fetchOfficialPricing().catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
-          const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
+          const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
           sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+        } catch (error) {
+          sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
+        }
+      },
+    }),
+  )
+
+  // 手动指定某条线路的计费方式。白名单漏掉的线路（新线路 / 自建线路 / 连接器内部 id）
+// 落进「纯订阅」只报 token；这里让用户自己标成 按量 / 套餐折算 / 订阅。
+//   body { provider, mode }  mode 为 'token' | 'estimate' | 'credits'
+//   body { provider, mode: null }  清掉这条的覆盖，退回自动判定
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/ai-credits/billing',
+      handler: async (req, res) => {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: '只接受 POST' })
+          return
+        }
+        const rejected = foreignRejection(req)
+        if (rejected !== 0) {
+          sendJson(res, rejected, { ok: false, error: rejected === 401 ? 'authentication_required' : 'forbidden' })
+          return
+        }
+        let body = ''
+        try {
+          for await (const chunk of req) body += chunk
+        } catch (error) {}
+        let parsed = {}
+        try {
+          parsed = JSON.parse(body || '{}')
+        } catch (error) {}
+        const provider = typeof parsed.provider === 'string' ? parsed.provider.trim() : ''
+        if (provider === '') {
+          sendJson(res, 400, { ok: false, error: '要改哪条线路？' })
+          return
+        }
+        const mode = parsed.mode
+        if (mode !== null && mode !== undefined && !['token', 'estimate', 'credits'].includes(mode)) {
+          sendJson(res, 400, { ok: false, error: 'mode 只能是 token / estimate / credits，或 null 表示恢复自动' })
+          return
+        }
+        try {
+          const overrides = loadBillingOverrides()
+          if (mode === null || mode === undefined) delete overrides[provider]
+          else overrides[provider] = mode
+          saveBillingOverrides(overrides)
+          sendJson(res, 200, { ok: true, provider, mode: mode === undefined ? (overrides[provider] || null) : mode, overrides })
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }

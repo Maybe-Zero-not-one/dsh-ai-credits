@@ -215,6 +215,26 @@ window.__ModuleLoader__.load({
       { key: 'idle', label: '待检查', note: '这一条还没巡检过' },
     ]
 
+    /**
+     * 线路计费方式的三种取值。
+     * 和宿主 usage.js 的 BILLING_MODES 必须一致 —— 那边是权威，这边只负责显示文案。
+     *
+     *   token    按量计费：真花钱，折金额
+     *   estimate 套餐 · 折算：卖的是套餐，但折一个「拿官方价买要多少钱」当参考
+     *   credits  订阅 · 不折钱：只报 token 和积分
+     */
+    const BILLING_MODES = ['token', 'estimate', 'credits']
+    const BILLING_LABELS = {
+      token: '按量计费',
+      estimate: '套餐 · 折算',
+      credits: '订阅 · 不折钱',
+    }
+    const BILLING_SHORT = {
+      token: '按量',
+      estimate: '折算',
+      credits: '订阅',
+    }
+
     const bucketOfSource = (item) => {
       if (item.reachable === true) return 'ok'
       if (item.reachable === false) return 'dead'
@@ -455,6 +475,32 @@ window.__ModuleLoader__.load({
 .ac-key { display: inline-flex; align-items: center; gap: 5px; }
 .ac-key[data-state="ok"] { color: var(--dsw-alias-state-success-primary, #22c55e); }
 .ac-key[data-state="missing"] { color: var(--dsw-alias-state-warn-primary, #c08a2e); }
+/* 计费方式：一行标签 + 一组手选按钮 */
+.ac-bill { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.ac-bill-label { font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bill-mode { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 5px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.22)); }
+.ac-bill-mode[data-mode="token"] { color: var(--dsw-alias-state-success-primary, #22c55e);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 42%, transparent); }
+.ac-bill-mode[data-mode="estimate"] { color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 42%, transparent); }
+.ac-bill-mode[data-mode="credits"] { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bill-manual { font-size: 10px; padding: 1px 5px; border-radius: 4px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 16%, transparent);
+  color: var(--dsw-alias-brand-primary, #4d7cfe); font-weight: 600; }
+.ac-bill-auto-hint { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bill-btns { display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: auto; }
+.ac-bill-btn { font-size: 10.5px; line-height: 1.5; padding: 2px 7px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.24));
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06));
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-bill-btn:hover { border-color: var(--dsw-alias-brand-primary, #4d7cfe);
+  color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-bill-btn[data-active] { font-weight: 650; color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border-color: var(--dsw-alias-brand-primary, #4d7cfe);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 14%, transparent); }
+.ac-bill-btn:disabled { opacity: .5; cursor: default; }
 .ac-models { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .ac-model-chip { font-size: 10.5px; padding: 3px 7px; border-radius: 6px; font-family: ui-monospace, monospace;
   color: var(--dsw-alias-label-secondary, #8a8f98);
@@ -932,6 +978,8 @@ window.__ModuleLoader__.load({
       const [mutateError, setMutateError] = React.useState(null)
       // 「已删除」面板展开状态
       const [removedOpen, setRemovedOpen] = React.useState(false)
+      // 正在改计费方式的那条线路（provider id），按钮显示 … 并禁用
+      const [billingBusy, setBillingBusy] = React.useState(null)
       const isSnapshot = data !== null && !fresh
 
       // 宿主在巡检 → 每 2.2 秒问一次，跑完自己就停
@@ -1001,6 +1049,37 @@ window.__ModuleLoader__.load({
           setPending(null)
         }
       }, [])
+
+      /**
+       * 手动指定一条线路的计费方式。
+       * mode 为 null 表示清掉覆盖、退回自动判定。
+       * 改完立刻重读 —— 用量栏的金额分类跟着变，不重读会前后不一致。
+       */
+      const setBilling = React.useCallback(
+        async (provider, mode) => {
+          setBillingBusy(provider)
+          setMutateError(null)
+          try {
+            const response = await fetch(API + '/billing', {
+              method: 'POST',
+              cache: 'no-store',
+              credentials: 'same-origin',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ provider, mode }),
+            })
+            const payload = await response.json().catch(() => null)
+            if (!response.ok || !payload || payload.ok === false) {
+              throw new Error((payload && payload.error) || 'HTTP ' + response.status)
+            }
+            await reloadDsh()
+          } catch (failure) {
+            setMutateError('改不了计费方式：' + String((failure && failure.message) || failure))
+          } finally {
+            setBillingBusy(null)
+          }
+        },
+        [reloadDsh],
+      )
 
       const sources = data && Array.isArray(data.sources) ? data.sources : []
       const counts = (data && data.counts) || { total: 0, reachable: 0, unreachable: 0, candidates: 0 }
@@ -1961,6 +2040,7 @@ window.__ModuleLoader__.load({
       // ------------------------------------------------------------ 本机接入
 
       const dshApi = data && data.dshApi ? data.dshApi : null
+      const dshBilling = dshApi && dshApi.billing ? dshApi.billing : null
       const dshRoutes = dshApi && Array.isArray(dshApi.routes) ? dshApi.routes : []
       const dshTotals = (dshApi && dshApi.totals) || { routes: 0, models: 0, configured: 0, missing: 0 }
       const dshDefault = dshApi && dshApi.defaultSelection ? dshApi.defaultSelection : null
@@ -1987,6 +2067,7 @@ window.__ModuleLoader__.load({
       const routeCard = (route) => {
         const isDefault = dshDefault !== null && dshDefault.provider === route.id
         const keyState = keyStateOf(route.credential)
+        const bill = route.billing || null
         // 缺密钥的线路通常读不到模型清单，这时候别说「没报模型」，会让人以为线路坏了
         const countText =
           route.modelCount > 0
@@ -1996,6 +2077,78 @@ window.__ModuleLoader__.load({
               : route.modelsError
                 ? '模型没读到'
                 : '没报模型'
+
+        /**
+         * 计费方式一行：当前标签 + 手选按钮。
+         * 自动判定漏掉的线路（新线路 / 自建 / 连接器内部 id）会落进「订阅」只报 token，
+         * 这里让人自己纠正 —— 四个按钮对应三种模式 + 一个「自动」。
+         */
+        const billingRow = (() => {
+          if (bill === null) return null
+          const busy = billingBusy === route.id
+          const autoLabel = (mode) => (BILLING_SHORT[mode] || mode) + '（自动判定）'
+          return h(
+            'div',
+            { className: 'ac-bill' },
+            h('span', { className: 'ac-bill-label' }, '计费'),
+            h('span', { className: 'ac-bill-mode', 'data-mode': bill.mode }, bill.label),
+            bill.manual
+              ? h(
+                  'span',
+                  {
+                    className: 'ac-bill-manual',
+                    title: bill.changed
+                      ? '你手选成了「' + bill.label + '」，自动判定本来是「' + autoLabel(bill.auto) + '」'
+                      : '自动判定也是这个，但你手动钉住了，白名单变了也不会跟着变',
+                  },
+                  '手选',
+                )
+              : null,
+            bill.mode === 'credits' && bill.creditEndpoint === null
+              ? h(
+                  'span',
+                  { className: 'ac-bill-auto-hint' },
+                  '这条线路没有积分查询接口，只报 token',
+                )
+              : null,
+            !bill.manual
+              ? h('span', { className: 'ac-bill-auto-hint' }, '按白名单自动判定；判错了可以手选')
+              : null,
+            h(
+              'div',
+              { className: 'ac-bill-btns' },
+              ...BILLING_MODES.map((mode) =>
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'ac-bill-btn',
+                    key: mode,
+                    disabled: busy,
+                    'data-active': bill.manual && bill.override === mode ? '' : undefined,
+                    title: '标成「' + BILLING_LABELS[mode] + '」',
+                    onClick: () => setBilling(route.id, mode),
+                  },
+                  busy ? '…' : BILLING_SHORT[mode],
+                ),
+              ),
+              bill.manual
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-bill-btn',
+                      disabled: busy,
+                      title: '清掉手选，退回白名单自动判定（现在是「' + autoLabel(bill.auto) + '」）',
+                      onClick: () => setBilling(route.id, null),
+                    },
+                    '自动',
+                  )
+                : null,
+            ),
+          )
+        })()
+
         return h(
           'div',
           { className: 'ac-route', key: route.id, 'data-default': isDefault ? '' : undefined },
@@ -2026,6 +2179,7 @@ window.__ModuleLoader__.load({
             route.settingsNs ? h('span', null, '设置 ', h('code', null, route.settingsNs)) : null,
           ),
           route.modelsError ? h('div', { className: 'ac-note' }, '模型清单没读到：' + route.modelsError) : null,
+          billingRow,
           route.models.length > 0
             ? h(
                 'div',
@@ -2092,6 +2246,30 @@ window.__ModuleLoader__.load({
               h('span', null, '密钥已配 ', h('b', null, String(dshTotals.configured)), ' 条'),
               dshTotals.missing > 0
                 ? h('span', null, '还缺密钥 ', h('b', null, String(dshTotals.missing)), ' 条')
+                : null,
+              // 订阅 / 按量 / 折算各几条 —— 一眼看出「哪些线路在花现金」
+              dshBilling !== null
+                ? h(
+                    'span',
+                    null,
+                    '订阅 ',
+                    h('b', null, String(dshBilling.byMode.credits || 0)),
+                    ' 条 · 按量 ',
+                    h('b', null, String(dshBilling.byMode.token || 0)),
+                    ' 条',
+                    dshBilling.byMode.estimate > 0
+                      ? ' · 折算 ' + String(dshBilling.byMode.estimate) + ' 条'
+                      : '',
+                  )
+                : null,
+              dshBilling !== null && dshBilling.manual > 0
+                ? h(
+                    'span',
+                    { title: '这几条是你手动标定的，不会跟着白名单变' },
+                    '手选 ',
+                    h('b', null, String(dshBilling.manual)),
+                    ' 条',
+                  )
                 : null,
               h('span', null, '读于 ', h('b', null, fmtTime(dshApi.at) || '刚刚')),
             )
@@ -2160,6 +2338,11 @@ window.__ModuleLoader__.load({
               h('span', null, '黄点 缺密钥 / 没登录'),
               h('span', null, '灰点 不需要密钥（自带登录）'),
               h('span', null, '带「图」的模型能吃图片'),
+              h(
+                'span',
+                null,
+                '「按量」真花钱、「折算」按官方价折个参考、「订阅」只报 token —— 判错了点右边按钮自己改',
+              ),
             )
           : null,
       ]
