@@ -329,6 +329,17 @@ window.__ModuleLoader__.load({
   border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 35%, transparent); }
 .ac-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; padding: 0 2px;
   font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+/* 图例里的「蓝边框」样本：左边一条蓝竖条，跟订阅卡片同一套观感 */
+.ac-legend-sub { color: var(--dsw-alias-brand-primary, #4d7cfe); font-weight: 600;
+  padding-left: 8px; box-shadow: inset 3px 0 0 0 var(--dsw-alias-brand-primary, #4d7cfe); }
+/* 订阅线路一次列出来：不用滚下去数卡片 */
+.ac-sub-line { margin-top: 10px; padding: 9px 12px; border-radius: 8px; font-size: 11.5px; line-height: 1.7;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 46%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 7%, transparent);
+  box-shadow: inset 3px 0 0 0 var(--dsw-alias-brand-primary, #4d7cfe);
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-sub-line b { color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-sub-line .ac-sub-name { color: var(--dsw-alias-brand-primary, #4d7cfe); font-weight: 600; }
 .ac-filter { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 20px 0 6px; }
 .ac-chip { padding: 5px 10px; border-radius: 999px; font-size: 11.5px; cursor: pointer; font-family: inherit;
   color: var(--dsw-alias-label-secondary, #8a8f98);
@@ -460,6 +471,16 @@ window.__ModuleLoader__.load({
   background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
 .ac-route[data-default] { border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 46%, transparent);
   background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 6%, transparent); }
+/* 订阅线路标蓝：边框 + 左侧竖条 + 淡蓝底 —— 扫一眼就知道这台机器订了哪些套餐。
+   自动判定为订阅的自动蓝，手选的也蓝（手选另有「手选」小标）。 */
+.ac-route[data-billing="credits"] {
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 68%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 8%, var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)));
+  box-shadow: inset 3px 0 0 0 var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-route[data-billing="credits"][data-default] {
+  border-color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-route-subtag { font-size: 10px; padding: 2px 7px; border-radius: 5px; font-weight: 650;
+  color: #fff; background: var(--dsw-alias-brand-primary, #4d7cfe); }
 .ac-route-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ac-route-name { font-size: 13.5px; font-weight: 650; color: var(--dsw-alias-label-primary, inherit); }
 .ac-route-id { font-size: 10.5px; padding: 2px 6px; border-radius: 5px; font-family: ui-monospace, monospace;
@@ -497,6 +518,10 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-bill-btn:hover { border-color: var(--dsw-alias-brand-primary, #4d7cfe);
   color: var(--dsw-alias-brand-primary, #4d7cfe); }
+/* 自动判定命中的那一档：描边高亮（不是实心），和「手选」区分开 */
+.ac-bill-btn[data-auto] { font-weight: 600; color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 52%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 7%, transparent); }
 .ac-bill-btn[data-active] { font-weight: 650; color: var(--dsw-alias-brand-primary, #4d7cfe);
   border-color: var(--dsw-alias-brand-primary, #4d7cfe);
   background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 14%, transparent); }
@@ -2043,6 +2068,9 @@ window.__ModuleLoader__.load({
       const dshBilling = dshApi && dshApi.billing ? dshApi.billing : null
       const dshRoutes = dshApi && Array.isArray(dshApi.routes) ? dshApi.routes : []
       const dshTotals = (dshApi && dshApi.totals) || { routes: 0, models: 0, configured: 0, missing: 0 }
+      // 订阅线路：卡片标蓝，汇总里也能直接把名字列出来
+      const dshSubscribed = dshRoutes.filter((route) => route.billing && route.billing.mode === 'credits')
+      const dshSubscribedNames = dshSubscribed.map((route) => route.name || route.id).join('、')
       const dshDefault = dshApi && dshApi.defaultSelection ? dshApi.defaultSelection : null
       const dshDefaultInfo = dshApi && dshApi.defaultModel ? dshApi.defaultModel : null
       const dshDefaultRoute = dshDefault
@@ -2126,7 +2154,12 @@ window.__ModuleLoader__.load({
                     key: mode,
                     disabled: busy,
                     'data-active': bill.manual && bill.override === mode ? '' : undefined,
-                    title: '标成「' + BILLING_LABELS[mode] + '」',
+                    // 自动判定命中的那一档描边高亮 —— 一眼看出「订阅是自动认出来的」还是「你标的」
+                    'data-auto': !bill.manual && bill.mode === mode ? '' : undefined,
+                    title:
+                      mode === 'credits'
+                        ? '标成「订阅 · 不折钱」→ 这张卡片标蓝（套餐额度，不折现金）'
+                        : '标成「' + BILLING_LABELS[mode] + '」',
                     onClick: () => setBilling(route.id, mode),
                   },
                   busy ? '…' : BILLING_SHORT[mode],
@@ -2151,7 +2184,13 @@ window.__ModuleLoader__.load({
 
         return h(
           'div',
-          { className: 'ac-route', key: route.id, 'data-default': isDefault ? '' : undefined },
+          {
+            className: 'ac-route',
+            key: route.id,
+            'data-default': isDefault ? '' : undefined,
+            // credits → 卡片标蓝（见样式 .ac-route[data-billing="credits"]）
+            'data-billing': bill === null ? undefined : bill.mode,
+          },
           h(
             'div',
             { className: 'ac-route-head' },
@@ -2161,6 +2200,18 @@ window.__ModuleLoader__.load({
             }),
             h('span', { className: 'ac-route-name' }, route.name),
             h('span', { className: 'ac-route-id' }, route.id),
+            bill !== null && bill.mode === 'credits'
+              ? h(
+                  'span',
+                  {
+                    className: 'ac-route-subtag',
+                    title: bill.manual
+                      ? '你手动标成了「订阅 · 不折钱」：这条线路的消耗算套餐额度，不折现金'
+                      : '自动判定为「订阅 · 不折钱」：这条线路的消耗算套餐额度，不折现金',
+                  },
+                  bill.manual ? '订阅 · 手选' : '订阅',
+                )
+              : null,
             isDefault ? h('span', { className: 'ac-route-tag' }, '当前默认') : null,
             h('span', { className: 'ac-route-count' }, countText),
           ),
@@ -2251,7 +2302,12 @@ window.__ModuleLoader__.load({
               dshBilling !== null
                 ? h(
                     'span',
-                    null,
+                    {
+                      title:
+                        dshSubscribed.length > 0
+                          ? '订阅线路（卡片标蓝）：' + dshSubscribedNames
+                          : '现在没有判定成订阅的线路',
+                    },
                     '订阅 ',
                     h('b', null, String(dshBilling.byMode.credits || 0)),
                     ' 条 · 按量 ',
@@ -2272,6 +2328,25 @@ window.__ModuleLoader__.load({
                   )
                 : null,
               h('span', null, '读于 ', h('b', null, fmtTime(dshApi.at) || '刚刚')),
+            )
+          : null,
+
+        // 订阅线路一次全列出来：不用滚下去逐个数蓝卡片
+        dshApi !== null && dshBilling !== null && dshSubscribed.length > 0
+          ? h(
+              'div',
+              { className: 'ac-sub-line' },
+              h('b', null, '订阅套餐 ' + String(dshSubscribed.length) + ' 条'),
+              '（卡片标蓝，消耗算套餐额度、不折现金）：',
+              dshSubscribed.map((route, index) =>
+                h(
+                  'span',
+                  { key: route.id },
+                  index > 0 ? ' · ' : '',
+                  h('span', { className: 'ac-sub-name' }, route.name),
+                  route.billing && route.billing.manual ? h('span', null, '（手选）') : null,
+                ),
+              ),
             )
           : null,
 
@@ -2338,6 +2413,7 @@ window.__ModuleLoader__.load({
               h('span', null, '黄点 缺密钥 / 没登录'),
               h('span', null, '灰点 不需要密钥（自带登录）'),
               h('span', null, '带「图」的模型能吃图片'),
+              h('span', { className: 'ac-legend-sub' }, '蓝边框 订阅套餐（自动认出或你手标的）'),
               h(
                 'span',
                 null,
