@@ -2161,6 +2161,12 @@ window.__ModuleLoader__.load({
       const worthByProvider = new Map()
       for (const row of dshWorthList) worthByProvider.set(row.provider, row)
       const worthMeta = data && data.usage && data.usage.worthMeta ? data.usage.worthMeta : null
+      // 这个时间窗里哪些线路有用量 —— 开关折算但没用量时，别说成「没有公开价」
+      const dshUsageProviders = new Set(
+        data && data.usage && Array.isArray(data.usage.bySource)
+          ? data.usage.bySource.map((row) => row.provider)
+          : [],
+      )
       const dshFolded = dshRoutes.filter((route) => route.billing && route.billing.folded === true)
       const dshDefault = dshApi && dshApi.defaultSelection ? dshApi.defaultSelection : null
       const dshDefaultInfo = dshApi && dshApi.defaultModel ? dshApi.defaultModel : null
@@ -2356,7 +2362,13 @@ window.__ModuleLoader__.load({
           const parts = [
             h('span', { className: 'ac-bill-label', key: 'l' }, '折算'),
             worth === null
-              ? h('span', { className: 'ac-bill-auto-hint', key: 'v' }, '这条线路的模型没有公开价，折不出金额')
+              ? h(
+                  'span',
+                  { className: 'ac-bill-auto-hint', key: 'v' },
+                  dshUsageProviders.has(route.id)
+                    ? '这条线路的模型没有公开价，折不出金额'
+                    : '这个时间范围里这条线路没有用量，折不出金额',
+                )
               : h(
                   'span',
                   { className: 'ac-bill-worth', key: 'v' },
@@ -2583,7 +2595,7 @@ window.__ModuleLoader__.load({
                   index > 0 ? ' · ' : '',
                   h('span', { className: 'ac-sub-name' }, route.name),
                   worth === null
-                    ? h('span', null, '（没有公开价，折不出）')
+                    ? h('span', null, dshUsageProviders.has(route.id) ? '（没有公开价，折不出）' : '（这段没用量）')
                     : h(
                         'span',
                         null,
