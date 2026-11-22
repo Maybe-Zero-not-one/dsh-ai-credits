@@ -2218,7 +2218,6 @@ window.__ModuleLoader__.load({
           const busy = billingBusy === route.id
           const autoLabel = (mode) => (BILLING_SHORT[mode] || mode) + '（自动判定）'
           const folded = bill.folded === true
-          const worth = worthByProvider.get(route.id) || null
           // 折算按钮：订阅档是开关，其余档是「切成 estimate」
           const toggleFold = () => {
             if (bill.mode === 'credits') setBilling(route.id, { estimate: !folded })
@@ -2334,6 +2333,9 @@ window.__ModuleLoader__.load({
         const worthRow = (() => {
           if (bill === null || bill.folded !== true) return null
           const busy = billingBusy === route.id
+          // 这条线路的等价金额（宿主按线路聚合好放在 subscriptionWorth 里）；
+          // 这段没用量或模型没公开价时是 null
+          const worth = worthByProvider.get(route.id) || null
           const verdict = worth && worth.verdict ? WORTH_VERDICTS[worth.verdict] || null : null
           const weekly = worth === null ? null : worth.monthlyCNY
           const priceInput = h('input', {
