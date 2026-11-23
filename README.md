@@ -460,7 +460,7 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 不需要构建、没有依赖，纯 JS 一个目录。打包：
 
 ```powershell
-pwsh -File pack.ps1          # 产物在 ../ai-credits-dist/ai-credits-<版本>.zip
+pwsh -File pack.ps1          # 产物在 ..\_dist\ai-credits-dist\ai-credits-<版本>.zip
 ```
 
 脚本会先自查四件事再打包：语法、`files` 清单覆盖、有没有混进本机绝对路径 / 密钥、zip 内容。
