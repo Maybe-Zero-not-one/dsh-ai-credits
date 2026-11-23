@@ -700,9 +700,65 @@ window.__ModuleLoader__.load({
 .ac-worth-title { font-size: 12px; font-weight: 650; color: var(--dsw-alias-brand-primary, #4d7cfe); }
 .ac-worth-meta { font-size: 10.5px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-worth-rows { display: flex; flex-direction: column; gap: 6px; }
-.ac-worth-row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 11px;
+.ac-worth-row { display: flex; flex-direction: column; gap: 6px; font-size: 11px;
   padding: 5px 8px; border-radius: 7px;
   background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.05)); }
+.ac-worth-main { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.ac-worth-row[data-expandable] .ac-worth-main { cursor: pointer; }
+.ac-worth-row[data-open] { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 7%, transparent); }
+.ac-worth-row[data-open] .ac-caret { color: var(--dsw-alias-brand-primary, #4d7cfe); opacity: 1; }
+.ac-worth-toggle { font-size: 10px; color: var(--dsw-alias-brand-primary, #4d7cfe); opacity: .82; }
+/* ---- 折算明细（点开才出现）---- */
+.ac-worth-detail { display: flex; flex-direction: column; gap: 8px; margin-top: 2px;
+  padding: 9px 11px 10px; border-radius: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 42%, transparent);
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.04)); }
+.ac-worth-detail-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 10.5px; font-weight: 620; letter-spacing: .02em;
+  color: var(--dsw-alias-label-primary, inherit); }
+.ac-worth-detail-sub { font-size: 10px; font-weight: 500; letter-spacing: 0;
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-empty { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-models { display: flex; flex-direction: column; gap: 3px; }
+.ac-worth-model { display: grid;
+  grid-template-columns: minmax(110px, 1.5fr) minmax(40px, 2fr) 58px 66px 72px minmax(150px, 3fr);
+  align-items: center; gap: 8px; font-size: 10.5px; line-height: 1.5;
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-model-name { font-family: var(--dsw-alias-font-mono, ui-monospace, monospace); font-size: 10.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--dsw-alias-label-primary, inherit); }
+.ac-worth-model-bar { height: 3px; border-radius: 2px; overflow: hidden;
+  background: var(--dsw-alias-bg-layer-2, rgba(128,128,128,.16)); }
+.ac-worth-model-bar i { display: block; height: 100%; border-radius: 2px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 58%, transparent); }
+.ac-worth-model-tokens { text-align: right; font-variant-numeric: tabular-nums; }
+.ac-worth-model-cost { text-align: right; font-variant-numeric: tabular-nums; font-weight: 620;
+  color: var(--dsw-alias-label-primary, inherit); }
+.ac-worth-model-month { text-align: right; font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-worth-model-price { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ac-worth-model-price[data-unpriced] { color: var(--dsw-alias-state-warn-primary, #c08a2e); }
+.ac-worth-days { display: flex; flex-direction: column; gap: 2px; }
+.ac-worth-day { display: flex; align-items: center; gap: 8px; font-size: 10.5px;
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-day-date { min-width: 78px; font-variant-numeric: tabular-nums; }
+.ac-worth-day-bar { flex: 1; min-width: 40px; height: 4px; border-radius: 2px; overflow: hidden;
+  background: color-mix(in srgb, var(--dsw-alias-label-secondary, #8a8f98) 12%, transparent); }
+.ac-worth-day-bar i { display: block; height: 100%; border-radius: 2px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 72%, transparent); }
+.ac-worth-day-cost { min-width: 62px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600;
+  color: var(--dsw-alias-label-primary, inherit); }
+.ac-worth-day-tokens { min-width: 96px; text-align: right; font-variant-numeric: tabular-nums; }
+.ac-worth-refbox { display: flex; flex-direction: column; gap: 4px; }
+.ac-worth-plans { display: flex; flex-wrap: wrap; gap: 6px; font-size: 10.5px;
+  color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-worth-plan { padding: 2px 7px; border-radius: 5px;
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.22)); }
+.ac-worth-plan b { color: var(--dsw-alias-brand-primary, #4d7cfe); font-weight: 650; }
+/* 订阅卡上那行「折合月」也能点开明细 */
+.ac-worth-inline { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.ac-worth-inline:hover { color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-worth-inline[data-open] { color: var(--dsw-alias-brand-primary, #4d7cfe); }
 .ac-worth-name { font-weight: 620; color: var(--dsw-alias-label-primary, inherit); min-width: 120px; }
 .ac-worth-num { color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-worth-num b { color: var(--dsw-alias-brand-primary, #4d7cfe); font-weight: 650; font-size: 12.5px; }
@@ -2816,6 +2872,162 @@ window.__ModuleLoader__.load({
         if (Math.abs(n) >= 1000) return n.toFixed(0)
         return Number.isInteger(n) ? String(n) : n.toFixed(1)
       }
+
+      /** 等价金额按天折成月时用的倍数（30 天口径） */
+      const worthScale =
+        usage && usage.worthMeta && usage.worthMeta.windowDays ? 30 / usage.worthMeta.windowDays : 1
+
+      /**
+       * 折算明细：点开「订阅划算吗」一行（或订阅卡上的「折合月」）才展开的东西。
+       *
+       * 三块：
+       *   1. 模型 × 单价 —— 等价金额是「这堆 token 乘官方单价」出来的，逐条摊开能自己核对
+       *   2. 按天 —— 哪几天用得凶，等价金额怎么随时间摊开
+       *   3. 参考月费从哪来 —— 套餐表里对得上的那几个档位，或你手填的数
+       *
+       * 这些都在宿主的 `subscriptionWorth` 里，没拉到就什么都不显示（不编数字）。
+       */
+      const worthDetail = (row) => {
+        if (!row || typeof row !== 'object') return null
+        const modelRows = Array.isArray(row.modelRows) ? row.modelRows : []
+        const dayRows = Array.isArray(row.byDay) ? row.byDay : []
+        const maxModelCost = modelRows.reduce((max, m) => (m.costCNY > max ? m.costCNY : max), 0)
+        const maxDayCost = dayRows.reduce((max, d) => (d.costCNY > max ? d.costCNY : max), 0)
+        const total = row.totalTokens > 0 ? row.totalTokens : 1
+
+        const modelBlock =
+          modelRows.length === 0
+            ? h('div', { className: 'ac-worth-empty' }, '这个时间范围里没有可折算的模型明细。')
+            : h(
+                'div',
+                { className: 'ac-worth-models' },
+                modelRows.map((m) =>
+                  h(
+                    'div',
+                    { className: 'ac-worth-model', key: m.model },
+                    h('span', { className: 'ac-worth-model-name' }, m.model),
+                    h(
+                      'span',
+                      { className: 'ac-worth-model-bar' },
+                      h('i', { style: { width: Math.max(1, (m.totalTokens / total) * 100).toFixed(1) + '%' } }),
+                    ),
+                    h('span', { className: 'ac-worth-model-tokens' }, fmtTokens(m.totalTokens)),
+                    h('span', { className: 'ac-worth-model-cost' }, fmtPrice(m.costCNY, 'CNY')),
+                    h('span', { className: 'ac-worth-model-month' }, '月 ' + fmtPrice(m.monthlyCNY, 'CNY')),
+                    m.priceProvider === null || m.priceProvider === undefined
+                      ? h('span', { className: 'ac-worth-model-price', 'data-unpriced': '' }, '没有公开价')
+                      : h(
+                          'span',
+                          {
+                            className: 'ac-worth-model-price',
+                            title:
+                              (m.pricingUrl ? '单价来自 ' + m.pricingUrl + ' · ' : '') +
+                              (m.alias ? '模型 id 归到 ' + m.alias + ' 计价' : ''),
+                          },
+                          m.priceProvider,
+                          ' ¥' + String(m.priceInput) + ' / ¥' + String(m.priceOutput),
+                          m.priceCacheRead ? ' / 缓存 ¥' + String(m.priceCacheRead) : '',
+                          ' 每 M',
+                          m.priceDate ? ' · ' + m.priceDate : '',
+                          m.alias ? ' · 按 ' + m.alias : '',
+                        ),
+                  ),
+                ),
+              )
+
+        const dayBlock =
+          dayRows.length === 0
+            ? null
+            : h(
+                'div',
+                { className: 'ac-worth-days' },
+                h(
+                  'div',
+                  { className: 'ac-worth-detail-head' },
+                  '按天',
+                  h('span', { className: 'ac-worth-detail-sub' }, '每天的等价金额（不是账单）'),
+                ),
+                dayRows.slice(0, 14).map((d) =>
+                  h(
+                    'div',
+                    { className: 'ac-worth-day', key: d.day },
+                    h('span', { className: 'ac-worth-day-date' }, d.day),
+                    h(
+                      'span',
+                      { className: 'ac-worth-day-bar' },
+                      h('i', {
+                        style: {
+                          width:
+                            maxDayCost <= 0
+                              ? '0%'
+                              : Math.max(1, (d.costCNY / maxDayCost) * 100).toFixed(1) + '%',
+                        },
+                      }),
+                    ),
+                    h('span', { className: 'ac-worth-day-cost' }, fmtPrice(d.costCNY, 'CNY')),
+                    h('span', { className: 'ac-worth-day-tokens' }, fmtTokens(d.tokens) + ' · ' + String(d.calls) + ' 次'),
+                  ),
+                ),
+              )
+
+        // 参考月费：手填的 > 套餐表的 > 都没有
+        const planRef = row.planRef && Array.isArray(row.planRef.plans) ? row.planRef.plans : []
+        const refBlock = h(
+          'div',
+          { className: 'ac-worth-refbox' },
+          h(
+            'div',
+            { className: 'ac-worth-detail-head' },
+            '参考月费',
+            h(
+              'span',
+              { className: 'ac-worth-detail-sub' },
+              row.refSource === 'manual'
+                ? '你在「本机接入」里填的数'
+                : row.refSource === 'plan'
+                  ? '套餐表（plans.js）里这条线路对得上的档位，取最低一档比'
+                  : '没有参考价 —— 去「本机接入」这条线路右边填你实际付的月费',
+            ),
+          ),
+          planRef.length > 0
+            ? h(
+                'div',
+                { className: 'ac-worth-plans' },
+                planRef.map((plan) =>
+                  h(
+                    'span',
+                    { className: 'ac-worth-plan', key: plan.id },
+                    plan.title,
+                    ' ',
+                    h('b', null, fmtPrice(plan.price, plan.currency)),
+                  ),
+                ),
+              )
+            : null,
+          row.refSource === 'manual' && row.refMin !== null
+            ? h('div', { className: 'ac-worth-plans' }, h('span', { className: 'ac-worth-plan' }, '你填 ', h('b', null, fmtPrice(row.refMin, 'CNY')), ' / 月'))
+            : null,
+        )
+
+        return h(
+          'div',
+          { className: 'ac-worth-detail' },
+          h(
+            'div',
+            { className: 'ac-worth-detail-head' },
+            '模型明细',
+            h(
+              'span',
+              { className: 'ac-worth-detail-sub' },
+              '等价金额 = token × 官方单价；折合月按 ' + String(Math.round(worthScale)) + '× 折成 30 天',
+            ),
+          ),
+          modelBlock,
+          dayBlock,
+          refBlock,
+        )
+      }
+
       const spendCard = (label, value, unit, sub, accent) =>
         h(
           'div',
@@ -3258,19 +3470,37 @@ window.__ModuleLoader__.load({
               ? h('span', null, '总额度 ', h('b', null, fmtCredits(route.creditTotal) + ' 积分'))
               : null,
             routeWorth !== null
-              ? h(
-                  'span',
-                  null,
-                  '等价 ',
-                  h('b', null, fmtPrice(routeWorth.costCNY + routeWorth.costUSD * (worthMeta ? worthMeta.usdToCny : 7.2), 'CNY')),
-                  ' · 折合月 ',
-                  h('b', null, fmtPrice(routeWorth.monthlyCNY, 'CNY')),
-                  routeWorth.verdict
-                    ? ' · ' + (WORTH_VERDICTS[routeWorth.verdict] ? WORTH_VERDICTS[routeWorth.verdict].text : '')
-                    : '',
-                )
+              ? (() => {
+                  const worthKey = 'worth:' + route.provider
+                  const worthOpen = expanded === worthKey
+                  return h(
+                    'span',
+                    {
+                      className: 'ac-worth-inline',
+                      'data-open': worthOpen ? '' : undefined,
+                      onClick: () => setExpanded((prev) => (prev === worthKey ? null : worthKey)),
+                      title: '点开看折算明细：每个模型的单价与金额、按天分布、参考月费来源',
+                    },
+                    h('span', { className: 'ac-caret' }, worthOpen ? '▾' : '▸'),
+                    '等价 ',
+                    h(
+                      'b',
+                      null,
+                      fmtPrice(
+                        routeWorth.costCNY + routeWorth.costUSD * (worthMeta ? worthMeta.usdToCny : 7.2),
+                        'CNY',
+                      ),
+                    ),
+                    ' · 折合月 ',
+                    h('b', null, fmtPrice(routeWorth.monthlyCNY, 'CNY')),
+                    routeWorth.verdict
+                      ? ' · ' + (WORTH_VERDICTS[routeWorth.verdict] ? WORTH_VERDICTS[routeWorth.verdict].text : '')
+                      : '',
+                  )
+                })()
               : null,
           ),
+          routeWorth !== null && expanded === 'worth:' + route.provider ? worthDetail(routeWorth) : null,
 
           // 模型明细：token 与占比，不挂积分
           route.models.length > 0
@@ -3641,40 +3871,67 @@ window.__ModuleLoader__.load({
                 { className: 'ac-worth-rows' },
                 usageWorth.map((row) => {
                   const verdict = row.verdict ? WORTH_VERDICTS[row.verdict] || null : null
+                  // 用 worth:<线路> 作展开键 —— 跟订阅卡的时间轴（用纯线路 id）互不干扰，两块能同时开着
+                  const worthKey = 'worth:' + row.provider
+                  const worthOpen = expanded === worthKey
+                  const hasDetail =
+                    (Array.isArray(row.modelRows) && row.modelRows.length > 0) ||
+                    (Array.isArray(row.byDay) && row.byDay.length > 0)
+                  const toggle = hasDetail
+                    ? () => setExpanded((prev) => (prev === worthKey ? null : worthKey))
+                    : undefined
                   return h(
                     'div',
-                    { className: 'ac-worth-row', key: row.provider },
-                    h('span', { className: 'ac-worth-name' }, row.routeLabel || row.provider),
+                    {
+                      className: 'ac-worth-row',
+                      key: row.provider,
+                      'data-expandable': hasDetail ? '' : undefined,
+                      'data-open': worthOpen ? '' : undefined,
+                    },
                     h(
-                      'span',
-                      { className: 'ac-worth-num' },
-                      h('b', null, fmtPrice(row.monthlyCNY, 'CNY')),
-                      ' / 月',
+                      'div',
+                      { className: 'ac-worth-main', onClick: toggle },
+                      hasDetail ? h('span', { className: 'ac-caret' }, worthOpen ? '▾' : '▸') : null,
+                      h('span', { className: 'ac-worth-name' }, row.routeLabel || row.provider),
+                      h(
+                        'span',
+                        { className: 'ac-worth-num' },
+                        h('b', null, fmtPrice(row.monthlyCNY, 'CNY')),
+                        ' / 月',
+                      ),
+                      h(
+                        'span',
+                        { className: 'ac-worth-ref' },
+                        row.refMin === null
+                          ? '参考月费没对上（在「本机接入」里填你付的月费）'
+                          : '参考 ' +
+                            (row.refMax !== null && row.refMax !== row.refMin
+                              ? fmtPrice(row.refMin, 'CNY') + '–' + fmtPrice(row.refMax, 'CNY')
+                              : fmtPrice(row.refMin, 'CNY')) +
+                            (row.refSource === 'manual' ? '（你填的）' : '（套餐表）'),
+                      ),
+                      verdict
+                        ? h(
+                            'span',
+                            { className: 'ac-bill-verdict', 'data-tone': verdict.tone },
+                            verdict.text,
+                            row.ratio === null ? '' : ' ' + row.ratio.toFixed(2) + '×',
+                          )
+                        : null,
+                      h(
+                        'span',
+                        { className: 'ac-worth-tokens' },
+                        fmtTokens(row.totalTokens) + ' token · ' + String(row.calls) + ' 次',
+                      ),
+                      hasDetail
+                        ? h(
+                            'span',
+                            { className: 'ac-worth-toggle' },
+                            worthOpen ? '收起明细' : '看明细（模型 / 按天 / 参考价）',
+                          )
+                        : null,
                     ),
-                    h(
-                      'span',
-                      { className: 'ac-worth-ref' },
-                      row.refMin === null
-                        ? '参考月费没对上（在「本机接入」里填你付的月费）'
-                        : '参考 ' +
-                          (row.refMax !== null && row.refMax !== row.refMin
-                            ? fmtPrice(row.refMin, 'CNY') + '–' + fmtPrice(row.refMax, 'CNY')
-                            : fmtPrice(row.refMin, 'CNY')) +
-                          (row.refSource === 'manual' ? '（你填的）' : '（套餐表）'),
-                    ),
-                    verdict
-                      ? h(
-                          'span',
-                          { className: 'ac-bill-verdict', 'data-tone': verdict.tone },
-                          verdict.text,
-                          row.ratio === null ? '' : ' ' + row.ratio.toFixed(2) + '×',
-                        )
-                      : null,
-                    h(
-                      'span',
-                      { className: 'ac-worth-tokens' },
-                      fmtTokens(row.totalTokens) + ' token · ' + String(row.calls) + ' 次',
-                    ),
+                    worthOpen ? worthDetail(row) : null,
                   )
                 }),
               ),

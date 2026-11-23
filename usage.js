@@ -1043,6 +1043,13 @@ export async function collectUsage(ctx, options) {
 
   const sources = new Map()
   const days = new Map()
+  /**
+   * 订阅 + 折算线路的按天等价金额：provider → day → { CNY, USD }
+   *
+   * 「订阅划算吗」那一栏点开一条线路要能看出「哪几天用得凶」，所以按线路按天记一份。
+   * 跟 days 里的 worthCNY（全体合计）分开存，互不影响。
+   */
+  const worthDays = new Map()
   // 有请求但没 usage 的调用（搜索 / 标题生成）—— 只用于对齐请求数
   const extraCallsByProvider = new Map()
   /**
@@ -1205,6 +1212,18 @@ export async function collectUsage(ctx, options) {
           if (rowCost !== null) {
             if (price.currency === 'USD') dayBucket.worthUSD += rowCost
             else dayBucket.worthCNY += rowCost
+            // 再按线路记一份，展开明细时画「哪几天用得凶」
+            let byDay = worthDays.get(row.provider)
+            if (byDay === undefined) {
+              byDay = new Map()
+              worthDays.set(row.provider, byDay)
+            }
+            const slot = byDay.get(day) || { cny: 0, usd: 0, tokens: 0, calls: 0 }
+            if (price.currency === 'USD') slot.usd += rowCost
+            else slot.cny += rowCost
+            slot.tokens += row.total
+            slot.calls += 1
+            byDay.set(day, slot)
           }
         } else if (rowCost === null) {
           dayBucket.unpricedTokens += row.total
@@ -1505,6 +1524,8 @@ export async function collectUsage(ctx, options) {
         costCNY: 0,
         costUSD: 0,
         models: 0,
+        // 展开明细用：每个模型一条，带各自单价
+        modelRows: [],
       }
       worthAgg.set(row.provider, agg)
     }
@@ -1513,6 +1534,25 @@ export async function collectUsage(ctx, options) {
     agg.models += 1
     if (row.worth.currency === 'USD') agg.costUSD += row.worth.cost
     else agg.costCNY += row.worth.cost
+    agg.modelRows.push({
+      model: row.model,
+      calls: row.calls,
+      inputTokens: row.inputTokens,
+      outputTokens: row.outputTokens,
+      cacheReadTokens: row.cacheReadTokens,
+      cacheWriteTokens: row.cacheWriteTokens,
+      totalTokens: row.totalTokens,
+      cost: Number(row.worth.cost.toFixed(4)),
+      currency: row.worth.currency,
+      // 单价：折算是拿这些数乘出来的，展开后要能一眼核对
+      priceProvider: row.worth.priceProvider,
+      priceInput: row.worth.priceInput,
+      priceOutput: row.worth.priceOutput,
+      priceCacheRead: row.worth.priceCacheRead,
+      pricingUrl: row.worth.pricingUrl,
+      priceDate: row.worth.priceDate,
+      alias: row.worth.alias,
+    })
   }
 
   const monthlyScale = 30 / windowMeta.days
@@ -1530,6 +1570,20 @@ export async function collectUsage(ctx, options) {
         ratio = Number((monthlyCNY / refMin).toFixed(2))
         verdict = ratio >= 1 ? 'worth' : ratio >= 0.6 ? 'near' : 'light'
       }
+      // 按天：越新的排前面，最多留 31 天（跟 byDay 同一个上限）
+      const dayMap = worthDays.get(agg.provider)
+      const byDay =
+        dayMap === undefined
+          ? []
+          : [...dayMap.entries()]
+              .map(([day, slot]) => ({
+                day,
+                costCNY: Number((slot.cny + slot.usd * USD_TO_CNY).toFixed(4)),
+                tokens: slot.tokens,
+                calls: slot.calls,
+              }))
+              .sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0))
+              .slice(0, 31)
       return {
         provider: agg.provider,
         routeLabel: agg.routeLabel,
@@ -1547,6 +1601,19 @@ export async function collectUsage(ctx, options) {
         ratio,
         verdict,
         planRef,
+        // 展开明细：每个模型的等价金额（统一折成人民币）+ 折合月
+        modelRows: agg.modelRows
+          .slice()
+          .sort((a, b) => b.cost - a.cost)
+          .map((m) => {
+            const cny = m.currency === 'USD' ? m.cost * USD_TO_CNY : m.cost
+            return {
+              ...m,
+              costCNY: Number(cny.toFixed(4)),
+              monthlyCNY: Number((cny * monthlyScale).toFixed(2)),
+            }
+          }),
+        byDay,
       }
     })
     .sort((a, b) => b.monthlyCNY - a.monthlyCNY)
