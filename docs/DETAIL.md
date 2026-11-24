@@ -92,6 +92,15 @@ https://codingplan.fyi/config.json      汇率 / 更新日期
 
 价格不靠人工抄：宿主会**实时拉 DeepSeek 官网价目表**解析，拉到就以官网为准，拉不到才用本地快照。三重校验防止抓错价。
 
+## 云端出图 / 生视频花费（2.6.0 起）
+
+调云端模型画图 / 生视频的钱单独统计（不并入 token 折算），数据两处来：
+
+- **会话日志**里 `cloud_image_generate` / `image_generate` / `cloud_video_generate` / `cloud_video_task` 的 `tool/call`+`tool/result` 事件对（Agent 那条道）
+- **影像工坊面板账本**：`cloud-media-ui.log` + `.cloud-media-state.json`（网页面板手动操作那条道）
+
+两边按**产物文件名**去重。计价：生图**按张**（部分模型按输出像素分档），生视频按官方 token 估算公式（`时长×宽×高×帧率/1024` × 元/M token 单价），所以视频金额标「估算」。只有生成成功的才计费。价格表在 `media-prices.js`（人工核对官方价，带快照日期）。本地模型（SDXL / ComfyUI）出的图不计 —— 不花钱。
+
 ## 时间轴
 
 点开任一渠道，行内展开一张图：**横轴是时间，每一行是一个会话**，柱子高度是那一段消耗的 token。subagent 派生的子会话会缩进挂在父会话下面，所以既像时间轴又能看出调用关系。

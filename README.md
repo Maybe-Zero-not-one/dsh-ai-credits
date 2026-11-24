@@ -205,6 +205,22 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 
 其余套餐渠道（Trae / Qoder / WorkBuddy / CodeArts / Ark 各 Plan）没有公开的「每 token 多少积分」换算，就不折 —— 宁可只报 token，也不编一个看着精确的错数。
 
+### 云端出图 / 生视频花费（和 token 是两套账）
+
+本机通过 API 调云端模型**画图、生成视频**（影像工坊 `dsh-cloud-media` 的 `cloud_image_generate` / `image_generate` / `cloud_video_generate`）也花钱，但计费口径和 LLM 完全不同：**生图按张、生视频按 token**。这部分单独统计在「云端出图 / 生视频花费」小节里，**不并入**上面「按标价折算」那个数。
+
+**记录从哪来**（两处互补，按产物文件名去重，同一张图只算一次）：
+
+1. **会话日志**：Agent 调工具时，`tool/call` + `tool/result` 事件里带着供应商、模型、尺寸、产物文件名（视频还有分辨率 / 时长）。这是主来源。
+2. **影像工坊面板账本**：网页面板上手动点的出图写在 `<视频目录>\cloud-media-ui.log`（Agent 工具调用**不写**这个日志，面板操作**不进**会话日志，两边正好互补）；视频任务的成功状态在 `<视频目录>\.cloud-media-state.json`。视频目录按「面板设置 → profile 配置 → 插件默认」三级自动发现。
+
+**怎么算钱**（价格表在 `media-prices.js`，人工核对的官方公开价，改价要更新 `MEDIA_PRICE_SNAPSHOT_AT`）：
+
+- **生图按张**：Seedream 5.0 pro ¥0.30/张（输出图 >2.61M 像素则 ¥0.60）、5.0 flash ¥0.12、5.5 按像素两档 ¥0.13/¥0.23、4.0 ¥0.20、4.5 ¥0.25；硅基 Qwen-Image ¥0.30；百炼 wan2.7-image ¥0.20、wan2.7-image-pro ¥0.50、qwen-image-3.0-pro ¥0.25（1K 档）。模型 id 带日期后缀（`…-260628`）会自动归一到基础名。
+- **生视频按 token 估算**：官方公式 `(输入视频时长+输出时长) × 宽 × 高 × 帧率(24) / 1024` 得 token 数，再乘「元/M token」单价（Seedance 2.5：70；2.5 flash / 2.0：46；2.0 fast：37；2.0 mini：23，均按 480p/720p 档、输入不含视频）。公式对过官方价格示例（2.5 flash 720p 5s ≈ ¥4.97 ✓）。**只有生成成功的视频计费**（官方口径：失败不收钱）。本机拿不到 API 返回的精确 token 数，所以视频金额是**估算值**，界面上有标注。
+
+生成本地模型（SDXL / ComfyUI）的图不花钱也不计入；`image_generate` 走本地车道（`车道:本地`）的调用会被跳过。
+
 ### 价格从哪来：官网实时拉取
 
 DeepSeek 的价目表**不靠人工抄**，宿主会直接去官网拉：
@@ -381,6 +397,8 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 
 所以「deepseek-account 用了 32.7 亿 tokens、trae 用了 4267 万」这种数是宿主自己记的，不是估的。`compaction/summary`（上下文压缩那次调用）也带 usage，一并算进来。
 
+云端出图 / 生视频则读同一批日志里的 **`tool/call` + `tool/result` 事件对**（工具名是 `cloud_image_generate` / `image_generate` / `cloud_video_generate` / `cloud_video_task`），result 的 JSON 里带供应商、模型、尺寸、产物文件名；再加上影像工坊面板侧的 `cloud-media-ui.log` 和 `.cloud-media-state.json` 补全面板手动操作那条道（见上文「云端出图 / 生视频花费」）。
+
 ### 去重：fork / 分支会话的复制事件
 
 **fork / 分支会话会把父会话的 `assistant/message` 事件原样复制到自己的日志里** —— 时间戳、模型、`usage` 全都一模一样。不去重的话，父会话那段历史会被算两遍，金额虚高一截。
@@ -490,6 +508,8 @@ plugins/ai-credits/
 ├─ index.js           宿主：清单、巡检、联网发现、价格页 / 订阅页核对、存储、HTTP 路由
 ├─ dsh-api.js         宿主：问 llm / settings / credentials 收集「本机接入」情况（30 秒缓存）
 ├─ usage.js           宿主：扫会话日志统计各家用量，按官方分时价折钱（磁盘 + 内存双层缓存）
+├─ media-prices.js    宿主：云端出图 / 生视频价格快照（生图按张、生视频按 token 估算公式）
+├─ media-ledger.js    宿主：读影像工坊面板账本（cloud-media-ui.log + .cloud-media-state.json）
 ├─ pricing-sync.js    宿主：实时拉 DeepSeek 官网价目表解析（6 小时缓存，三重校验）
 ├─ official-usage.js  宿主：解析导入的官方用量 CSV（按 API key 拆，60 秒缓存）
 ├─ client.js          网页：侧栏按钮 + 六个栏目（首屏用 localStorage 快照，零等待）

@@ -25,6 +25,8 @@ import { promisify } from 'node:util'
 import { PRICE_PROVIDERS } from './prices.js'
 import { PROVIDER_KEY_MAP } from './official-usage.js'
 import { CODING_PLANS, PLAN_SNAPSHOT_AT } from './plans.js'
+import { MEDIA_PRICE_SNAPSHOT_AT, imageUnitPrice, videoCost, shortProvider } from './media-prices.js'
+import { readCloudMediaLedger } from './media-ledger.js'
 
 /** 会话日志里没带模型 id 时的兜底别名：宿主用的 id → prices.js 里的 id */
 const MODEL_ALIASES = {
@@ -386,16 +388,105 @@ function searchTagOf(body) {
 }
 
 /**
+ * 云端出图 / 出视频工具（dsh-cloud-media 提供）—— 只有这几个的 tool/result 要解析。
+ * `image_generate` 是本地 / 云端统一入口，靠结果里的 `车道==='在线'` 区分该不该计费。
+ */
+const MEDIA_TOOL_NAMES = new Set([
+  'cloud_image_generate',
+  'image_generate',
+  'cloud_video_generate',
+  'cloud_video_task',
+])
+
+/** 从 tool/result 的 message.content[0].text 里取出 JSON 对象（失败返回 null） */
+function parseToolResultJson(message) {
+  const content = message && Array.isArray(message.content) ? message.content : []
+  for (const part of content) {
+    if (part && part.type === 'text' && typeof part.text === 'string' && part.text.trim() !== '') {
+      try {
+        const obj = JSON.parse(part.text)
+        if (obj && typeof obj === 'object') return obj
+      } catch (error) {
+        return null
+      }
+    }
+  }
+  return null
+}
+
+/**
+ * 把一个媒体工具的 result JSON 拆成 0..n 条计费记录。
+ *
+ * 生图：`出图[]` 里**每张图**一条（kind:'img'），带模型 / 尺寸 / 文件名（去重用）。
+ * 生视频：只有 `状态==='succeeded'` 的任务才计费（kind:'vid'，官方口径失败不收钱），
+ *         带模型 / 分辨率 / 时长 / 任务 id（去重用）。
+ *
+ * `at` 用 result 事件的时间戳（调用完成时刻，和 token 那边同口径）。
+ */
+function mediaRecordsFromResult(toolName, resultObj, at) {
+  const out = []
+  if (!resultObj || typeof resultObj !== 'object') return out
+
+  // ---- 生图 ----
+  if (toolName === 'cloud_image_generate' || toolName === 'image_generate') {
+    if (resultObj.ok !== true) return out
+    // image_generate 走本地车道不花钱；cloud_image_generate 恒为在线
+    const lane = String(resultObj['车道'] || '')
+    if (toolName === 'image_generate' && lane !== '在线' && lane !== 'cloud' && lane !== 'online') return out
+    const model = String(resultObj['模型'] || '')
+    const provider = String(resultObj['供应商'] || '')
+    const defSize = String(resultObj['尺寸'] || '')
+    const imgs = Array.isArray(resultObj['出图']) ? resultObj['出图'] : []
+    for (const img of imgs) {
+      if (!img || typeof img !== 'object') continue
+      out.push({
+        kind: 'img',
+        at,
+        model,
+        provider,
+        size: String(img['尺寸'] || defSize || ''),
+        file: String(img['文件'] || img['路径'] || ''),
+      })
+    }
+    return out
+  }
+
+  // ---- 生视频 ----
+  if (toolName === 'cloud_video_task' || toolName === 'cloud_video_generate') {
+    const tasks = Array.isArray(resultObj['任务']) ? resultObj['任务'] : []
+    for (const t of tasks) {
+      if (!t || typeof t !== 'object') continue
+      if (String(t['状态'] || '') !== 'succeeded') continue
+      out.push({
+        kind: 'vid',
+        at: Date.parse(String(t['创建时间'] || '')) || at,
+        model: String(t['模型'] || ''),
+        provider: String(t['供应商'] || ''),
+        resolution: String(t['分辨率'] || ''),
+        duration: Number(t['时长']) || 0,
+        file: String(t['文件'] || ''),
+        id: String(t.id || ''),
+      })
+    }
+    return out
+  }
+
+  return out
+}
+
+/**
  * 扫一个会话日志文件，只留带 usage 的那两种事件
  */
 async function scanFile(filePath) {
   let text
+
   try {
     text = await decompressAll(await readFile(filePath))
   } catch (error) {
     return {
       rows: [],
       extras: [],
+      media: [],
       messages: 0,
       meta: null,
       error: String((error && error.message) || error),
@@ -404,7 +495,11 @@ async function scanFile(filePath) {
 
   const rows = []
   const extras = []
+  // 云端出图 / 出视频记录（tool/call 给工具名，tool/result 给产物 —— 按 callId 配对）
+  const media = []
+  const callTools = new Map()
   let messages = 0
+
   // 会话元信息：`session` 事件给 id / cwd / origin / parentSession，
   // `session/title` 给人类可读标题 —— 时间轴视图靠这几个才能分行
   let meta = null
@@ -435,7 +530,31 @@ async function scanFile(filePath) {
       continue
     }
 
+    // ---- 云端出图 / 出视频：tool/call 记工具名，tool/result 配对后解析产物 ----
+    if (event.type === 'tool/call') {
+      const data = event.data || {}
+      if (typeof data.callId === 'string' && MEDIA_TOOL_NAMES.has(data.name)) {
+        callTools.set(data.callId, data.name)
+      }
+      continue
+    }
+    if (event.type === 'tool/result') {
+      const message = (event.data && event.data.message) || {}
+      const callId = message.toolCallId || (message.source && message.source.callId) || ''
+      const toolName = callId ? callTools.get(callId) : null
+      if (toolName) {
+        callTools.delete(callId)
+        // 出错的调用不计费（ok!==true / isError 都会在解析里被挡掉）
+        if (message.isError !== true) {
+          const obj = parseToolResultJson(message)
+          for (const rec of mediaRecordsFromResult(toolName, obj, num(event.time))) media.push(rec)
+        }
+      }
+      continue
+    }
+
     let provider = null
+
     let model = null
     let usage = null
     let at = 0
@@ -512,7 +631,7 @@ async function scanFile(filePath) {
   }
   if (title !== null) meta.title = title
 
-  return { rows, extras, messages, meta, error: null }
+  return { rows, extras, media, messages, meta, error: null }
 }
 
 /**
@@ -592,7 +711,7 @@ const fileCache = new Map()
  *
  * 用紧凑数组存（而不是对象），体积约减半。写盘异步，不挡请求。
  */
-const DISK_CACHE_VERSION = 4
+const DISK_CACHE_VERSION = 5
 const DISK_CACHE_MS = 7 * 24 * 60 * 60 * 1000
 let diskLoaded = false
 let diskDirty = false
@@ -611,6 +730,22 @@ const unpackRow = (a) => ({
 })
 const packExtra = (e) => [e.provider, e.kind, e.at, e.model, e.tag || '']
 const unpackExtra = (a) => ({ provider: a[0], kind: a[1], at: a[2], model: a[3], tag: a[4] || '' })
+// 媒体记录用紧凑数组存：[kind, at, model, provider, file, size/resolution, duration, id]
+const packMedia = (m) => [
+  m.kind,
+  m.at,
+  m.model,
+  m.provider || '',
+  m.file || '',
+  m.kind === 'vid' ? m.resolution || '' : m.size || '',
+  m.kind === 'vid' ? m.duration || 0 : 0,
+  m.kind === 'vid' ? m.id || '' : '',
+]
+const unpackMedia = (a) =>
+  a[0] === 'vid'
+    ? { kind: 'vid', at: a[1], model: a[2], provider: a[3], file: a[4], resolution: a[5], duration: a[6], id: a[7] }
+    : { kind: 'img', at: a[1], model: a[2], provider: a[3], file: a[4], size: a[5] }
+
 
 async function loadDiskCache(home) {
   if (diskLoaded) return
@@ -640,6 +775,7 @@ async function loadDiskCache(home) {
       meta: entry.meta && typeof entry.meta === 'object' ? entry.meta : null,
       rows: entry.rows.map(unpackRow),
       extras: Array.isArray(entry.extras) ? entry.extras.map(unpackExtra) : [],
+      media: Array.isArray(entry.media) ? entry.media.map(unpackMedia) : [],
     })
   }
 }
@@ -658,6 +794,7 @@ function scheduleDiskWrite(home) {
       meta: entry.meta || null,
       rows: entry.rows.map(packRow),
       extras: (entry.extras || []).map(packExtra),
+      media: (entry.media || []).map(packMedia),
     }
   }
   const payload = JSON.stringify({ version: DISK_CACHE_VERSION, at: Date.now(), entries })
@@ -675,13 +812,14 @@ async function scanCached(filePath) {
   try {
     info = await stat(filePath)
   } catch (error) {
-    return { rows: [], extras: [], messages: 0, meta: null, error: null }
+    return { rows: [], extras: [], media: [], messages: 0, meta: null, error: null }
   }
   const hit = fileCache.get(filePath)
   if (hit !== undefined && hit.mtimeMs === info.mtimeMs && hit.size === info.size) {
     return {
       rows: hit.rows,
       extras: hit.extras || [],
+      media: hit.media || [],
       messages: hit.messages,
       meta: hit.meta || null,
       error: null,
@@ -693,12 +831,14 @@ async function scanCached(filePath) {
     size: info.size,
     rows: result.rows,
     extras: result.extras || [],
+    media: result.media || [],
     messages: result.messages,
     meta: result.meta || null,
   })
   diskDirty = true
   return result
 }
+
 
 /**
  * 会话 id 归一化。
@@ -1030,6 +1170,7 @@ export async function collectUsage(ctx, options) {
     bySource: [],
     byDay: [],
     creditBalances: {},
+    media: null,
   }
   if (home === '') return empty
 
@@ -1278,7 +1419,177 @@ export async function collectUsage(ctx, options) {
     }
   }
 
+  /**
+   * ================================================================
+   * 云端出图 / 出视频花费（和 token 折算完全分开的一套）
+   * ================================================================
+   * 数据两处来：会话日志里 Agent 调工具的 tool/result（scanFile 已捞进 scanned.media），
+   * 加影像工坊面板侧账本（UI 日志 + 视频任务状态文件，readCloudMediaLedger）。
+   * 两边用**产物文件名 / 任务 id** 去重，同一张图不会算两次。
+   * 按官方媒体单价折算：生图按张（部分按像素分档）、生视频按 token 估算公式。
+   */
+  const mediaSeen = new Set()
+  const mediaByModel = new Map()
+  const mediaDays = new Map()
+  const mediaTotals = {
+    images: 0,
+    videos: 0,
+    imageCNY: 0,
+    videoCNY: 0,
+    imageUSD: 0,
+    videoUSD: 0,
+    unpricedImages: 0,
+    unpricedVideos: 0,
+  }
+  let mediaDeduped = 0
+  let mediaSkippedByWindow = 0
+
+  const addMediaRecord = (rec) => {
+    if (!rec || typeof rec !== 'object') return
+    // 去重键：优先产物文件名 / 任务 id（跨来源、跨 fork 都稳）；没有才退回内容指纹
+    const dedupKey =
+      rec.kind === 'vid'
+        ? `v|${rec.id || rec.file || ''}|${rec.at}|${rec.model}|${rec.resolution}|${rec.duration}`
+        : `i|${rec.file || ''}|${rec.at}|${rec.model}|${rec.size}`
+    if (mediaSeen.has(dedupKey)) {
+      mediaDeduped += 1
+      return
+    }
+    mediaSeen.add(dedupKey)
+    if (!(rec.at >= cutoff)) {
+      mediaSkippedByWindow += 1
+      return
+    }
+
+    // 折算金额（原币种 + 折人民币）
+    let cost = null // { value, currency, unit, note, url, provider }
+    if (rec.kind === 'img') {
+      const p = imageUnitPrice(rec.model, rec.size)
+      if (p !== null) {
+        cost = { value: p.unit, currency: p.currency, unit: p.unit, note: p.note, url: p.url, provider: p.provider, tier: p.tier, pixels: p.pixels }
+      }
+    } else {
+      const v = videoCost(rec.model, { resolution: rec.resolution, durationSec: rec.duration })
+      if (v !== null) {
+        cost = { value: v.cny, currency: v.currency, unit: v.rate, note: v.note, url: v.url, provider: v.provider, tokens: v.tokens, res: v.res }
+      }
+    }
+    const cny = cost === null ? 0 : cost.currency === 'USD' ? cost.value * USD_TO_CNY : cost.value
+    const usd = cost === null ? 0 : cost.currency === 'USD' ? cost.value : cost.value / USD_TO_CNY
+
+    if (rec.kind === 'img') {
+      mediaTotals.images += 1
+      if (cost === null) mediaTotals.unpricedImages += 1
+      else {
+        mediaTotals.imageCNY += cny
+        mediaTotals.imageUSD += usd
+      }
+    } else {
+      mediaTotals.videos += 1
+      if (cost === null) mediaTotals.unpricedVideos += 1
+      else {
+        mediaTotals.videoCNY += cny
+        mediaTotals.videoUSD += usd
+      }
+    }
+
+    // 按模型聚合
+    const mKey = `${rec.kind}|${rec.model}`
+    let mb = mediaByModel.get(mKey)
+    if (mb === undefined) {
+      mb = {
+        kind: rec.kind,
+        model: rec.model,
+        // 面板账本没有供应商名，退回价格表里那家的短名
+        provider: shortProvider(rec.provider) || (cost ? shortProvider(cost.provider) : '') || rec.model,
+        count: 0,
+        cny: 0,
+        usd: 0,
+        unpriced: 0,
+        unit: cost ? cost.unit : null,
+        currency: cost ? cost.currency : null,
+        note: cost ? cost.note : '',
+        url: cost ? cost.url : '',
+        // 生视频估算的 token / 分辨率；生图的像素档
+        detail: cost ? (rec.kind === 'vid' ? { res: cost.res, tokens: cost.tokens } : { tier: cost.tier }) : null,
+      }
+      mediaByModel.set(mKey, mb)
+    }
+    mb.count += 1
+    if (cost === null) mb.unpriced += 1
+    else {
+      mb.cny += cny
+      mb.usd += usd
+    }
+
+    // 按天
+    const day = dayOf(rec.at)
+    if (day !== null) {
+      let db = mediaDays.get(day)
+      if (db === undefined) {
+        db = { day, images: 0, videos: 0, cny: 0 }
+        mediaDays.set(day, db)
+      }
+      if (rec.kind === 'img') db.images += 1
+      else db.videos += 1
+      db.cny += cny
+    }
+  }
+
+  // 1) 会话日志里的媒体工具调用
+  for (const { scanned } of ordered) {
+    for (const rec of scanned.media || []) addMediaRecord(rec)
+  }
+  // 2) 影像工坊面板侧账本（网页手动操作那条道 + 视频任务状态）
+  const mediaLedger = await readCloudMediaLedger(home).catch(() => ({ images: [], videos: [], dirsFound: [] }))
+  for (const rec of mediaLedger.images) addMediaRecord(rec)
+  for (const rec of mediaLedger.videos) addMediaRecord(rec)
+
+  const byMediaModel = [...mediaByModel.values()]
+    .map((mb) => ({
+      kind: mb.kind,
+      model: mb.model,
+      provider: mb.provider,
+      count: mb.count,
+      unpriced: mb.unpriced,
+      cny: Number(mb.cny.toFixed(4)),
+      usd: Number(mb.usd.toFixed(4)),
+      unit: mb.unit,
+      currency: mb.currency,
+      note: mb.note,
+      url: mb.url,
+      detail: mb.detail,
+    }))
+    .sort((a, b) => b.cny - a.cny || b.count - a.count)
+
+  const mediaByDay = [...mediaDays.values()]
+    .filter((d) => d.day >= dayOf(cutoff))
+    .sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0))
+    .slice(0, 31)
+    .map((d) => ({ day: d.day, images: d.images, videos: d.videos, cny: Number(d.cny.toFixed(4)) }))
+
+  const media = {
+    totals: {
+      images: mediaTotals.images,
+      videos: mediaTotals.videos,
+      count: mediaTotals.images + mediaTotals.videos,
+      imageCNY: Number(mediaTotals.imageCNY.toFixed(2)),
+      videoCNY: Number(mediaTotals.videoCNY.toFixed(2)),
+      totalCNY: Number((mediaTotals.imageCNY + mediaTotals.videoCNY).toFixed(2)),
+      totalUSD: Number((mediaTotals.imageUSD + mediaTotals.videoUSD).toFixed(2)),
+      unpricedImages: mediaTotals.unpricedImages,
+      unpricedVideos: mediaTotals.unpricedVideos,
+      deduped: mediaDeduped,
+      skippedByWindow: mediaSkippedByWindow,
+    },
+    byModel: byMediaModel,
+    byDay: mediaByDay,
+    ledgerDirs: mediaLedger.dirsFound || [],
+    snapshotAt: MEDIA_PRICE_SNAPSHOT_AT,
+  }
+
   const creditBalances = {}
+
 
   // 扫过新内容就把结果写盘，下次重载直接复用（异步，不挡本次响应）
   scheduleDiskWrite(home)
@@ -1771,6 +2082,8 @@ export async function collectUsage(ctx, options) {
     },
     creditBalances,
     timeline,
+    // 云端出图 / 出视频花费（独立小节，不并入上面的 token 折算）
+    media,
   }
 
   return result

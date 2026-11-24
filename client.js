@@ -3698,7 +3698,100 @@ window.__ModuleLoader__.load({
             )
           : null,
 
+        // ---------------------------------------------------------------- 云端出图 / 生视频花费
+        // 和上面的 token 折算是两套账：生图按张、生视频按 token 估算，都是按量真花钱。
+        (() => {
+          const m = usage && usage.media ? usage.media : null
+          if (m === null || !m.totals || (m.totals.count || 0) === 0) return null
+          const t = m.totals
+          const models = Array.isArray(m.byModel) ? m.byModel : []
+          const maxMediaCost = models.reduce((mx, r) => (r.cny > mx ? r.cny : mx), 0)
+
+          const mediaRow = (row) => {
+            const isVid = row.kind === 'vid'
+            const unpriced = !(row.cny > 0) && row.unpriced > 0
+            const width = unpriced || maxMediaCost <= 0 ? 0 : Math.max(2, (row.cny / maxMediaCost) * 100)
+            // 单价说明：生图「¥0.30/张」，生视频「46 元/M token · 720p」
+            const unitText =
+              row.unit === null || row.unit === undefined
+                ? ''
+                : isVid
+                  ? row.unit + ' 元/M token' + (row.detail && row.detail.res ? ' · ' + row.detail.res : '')
+                  : (row.currency === 'USD' ? '$' : '¥') + row.unit + '/张'
+            return h(
+              'div',
+              {
+                className: 'ac-usage-row',
+                'data-unpriced': unpriced ? '' : undefined,
+                'data-billing': 'token',
+                key: row.kind + '|' + row.model,
+              },
+              h(
+                'div',
+                { className: 'ac-usage-head' },
+                h('span', { className: 'ac-usage-provider' }, row.provider || (isVid ? '生视频' : '生图')),
+                h('span', { className: 'ac-usage-tag' }, isVid ? '视频' : '图片'),
+                h('span', { className: 'ac-usage-model' }, row.model),
+                h(
+                  'span',
+                  { className: 'ac-usage-cost', 'data-unpriced': unpriced ? '' : undefined },
+                  unpriced ? '没有标价' : fmtMoney(row.cny, 'CNY'),
+                ),
+              ),
+              h(
+                'div',
+                { className: 'ac-usage-facts' },
+                h('span', null, isVid ? '生成 ' : '出图 ', h('b', null, String(row.count)), isVid ? ' 条' : ' 张'),
+                unitText ? h('span', null, '单价 ', h('b', null, unitText)) : null,
+                row.unpriced > 0 ? h('span', null, h('b', null, String(row.unpriced)), ' 条没标价') : null,
+                isVid && row.detail && row.detail.tokens
+                  ? h('span', null, '估算 ', h('b', null, fmtTokens(row.detail.tokens)), ' tokens')
+                  : null,
+              ),
+              !unpriced && width > 0
+                ? h('div', { className: 'ac-usage-bar' }, h('i', { style: { width: width.toFixed(1) + '%' } }))
+                : null,
+              row.note ? h('div', { className: 'ac-caveat', style: { marginTop: '6px' } }, row.note) : null,
+            )
+          }
+
+          return h(
+            'div',
+            null,
+            h('div', { className: 'ac-dsh-section', style: { marginTop: '22px' } }, '云端出图 / 生视频花费'),
+            h(
+              'div',
+              { className: 'ac-caveat', style: { marginTop: '0' } },
+              '本机通过 API 调云端模型',
+              h('b', null, '出图 / 生视频'),
+              '的花费 —— 和上面的 token 折算是两套账。生图',
+              h('b', null, '按张'),
+              '计价（部分模型按输出像素分档）；生视频',
+              h('b', null, '按 token'),
+              '计价，本机拿不到官方 token 数，用的是官方估算公式（',
+              h('code', null, '时长 × 宽 × 高 × 帧率 / 1024'),
+              '），所以视频金额是',
+              h('b', null, '估算值'),
+              '。数据来自会话日志里的工具调用 + 影像工坊面板账本，按产物文件名去重。单价快照 ',
+              m.snapshotAt || '',
+              '。',
+            ),
+            h(
+              'div',
+              { className: 'ac-spend', style: { marginTop: '12px' } },
+              spendCard('云端出图', fmtMoney(t.imageCNY, 'CNY'), '', String(t.images) + ' 张' + (t.unpricedImages > 0 ? ' · ' + t.unpricedImages + ' 张没标价' : '')),
+              spendCard('云端生视频', fmtMoney(t.videoCNY, 'CNY'), '', String(t.videos) + ' 条（估算）' + (t.unpricedVideos > 0 ? ' · ' + t.unpricedVideos + ' 条没标价' : '')),
+              spendCard('出图+生视频合计', fmtMoney(t.totalCNY, 'CNY'), '', t.totalUSD > 0 ? '≈ $' + t.totalUSD.toFixed(2) : '按量真花钱 · ' + (usage.windowLabel || ''), true),
+              t.deduped > 0 ? spendCard('已去重', String(t.deduped), ' 条', '会话日志与面板账本的重复记录') : null,
+            ),
+            models.length > 0
+              ? h('div', { className: 'ac-usage', style: { marginTop: '12px' } }, models.map(mediaRow))
+              : null,
+          )
+        })(),
+
         // 官方账单：唯一能拿到官方计费口径的途径（API 没有用量端点）
+
         officialUsage !== null && officialUsage.ok === true && Array.isArray(officialUsage.byKey)
           ? h(
               'div',
