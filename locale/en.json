@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Cyber egg pickup",
-    "description": "One page for free AI credit and point offers, API list prices, subscription tiers, which model routes this machine is wired to, and what those routes cost: vendor prices checked live, spend priced at peak/off-peak and cache-hit rates, forked sessions deduped, one-click official usage CSV import for reconciliation, a per-session token timeline per route, and per-image / per-token spend for cloud image and video generation.",
+    "description": "One page for free AI credit and point offers, API list prices, subscription tiers, the model routes your setup is wired to, and what those routes cost: vendor prices checked live, spend priced at peak/off-peak and cache-hit rates, forked sessions deduped, one-click official usage CSV import for reconciliation, a per-session token timeline per route, and per-image / per-token spend for cloud image and video generation. Everything stays on your machine and is never uploaded.",
     "detail": "docs/DETAIL.md"
   }
 }
