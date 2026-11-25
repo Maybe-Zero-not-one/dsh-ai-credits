@@ -436,7 +436,7 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 | 层 | 作用 | 效果（实测，128MB / 79 文件 / 19824 条记录） |
 |:--|:--|:--|
 | **前端首屏快照** | localStorage 存上次 payload，组件初始化直接拿来渲染 | 点进去 **0ms** 有内容，后台静默刷新 |
-| **磁盘扫描缓存** | `$DSH_HOME/ai-credits/usage-cache.json`，插件重载后免于重解日志 | 重载首次 8.9s → **0.7~1.9s**（只重扫变过的文件） |
+| **磁盘扫描缓存** | `$DSH_HOME/ai-credits/usage-cache.json`，插件重载后免于重解日志 | 重载时只重扫变过的文件，比首次全量解快一个数量级 |
 | **文件级增量缓存** | 路径 + mtime + size 没变就不重扫 | 热态 **140ms** |
 | **Intl 实例缓存** | `DateTimeFormat` 按 timeZone 复用 | 单这一项就省掉 **约 1 秒** |
 
@@ -475,17 +475,13 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 
 ## 分享给别人
 
-不需要构建、没有依赖，纯 JS 一个目录。打包：
+不需要构建、没有 npm 依赖，纯 JS 一个目录，包已经发在 npm 上（`dsh-ai-credits`）。
 
-```powershell
-pwsh -File pack.ps1          # 产物在 ..\_dist\ai-credits-dist\ai-credits-<版本>.zip
-```
+对方怎么装（任选一种）：
 
-脚本会先自查四件事再打包：语法、`files` 清单覆盖、有没有混进本机绝对路径 / 密钥、zip 内容。
-
-对方怎么装：
-
-1. 解压得到 `ai-credits\` 目录
+1. `dsh plugin add dsh-ai-credits`
+2. 或者 DSH → 插件 → **添加插件** → 填 `dsh-ai-credits`
+3. 或者把整个目录拷过去当本地插件选（解压后是 `ai-credits\` 目录）
 2. DSH → 插件 → **添加插件** → 选这个目录
 3. 重启 DSH（Host 半边要重启才生效）
 
@@ -508,17 +504,20 @@ plugins/ai-credits/
 ├─ index.js           宿主：清单、巡检、联网发现、价格页 / 订阅页核对、存储、HTTP 路由
 ├─ dsh-api.js         宿主：问 llm / settings / credentials 收集「接入情况」（30 秒缓存）
 ├─ usage.js           宿主：扫会话日志统计各家用量，按官方分时价折钱（磁盘 + 内存双层缓存）
-├─ media-prices.js    宿主：云端出图 / 生视频价格快照（生图按张、生视频按 token 估算公式）
-├─ media-ledger.js    宿主：读影像工坊面板账本（cloud-media-ui.log + .cloud-media-state.json）
+├─ prices.js          各家 API 价格快照（人工核对；DeepSeek 由官网实时覆盖）
+├─ plans.js           各家订阅套餐快照（人工核对，带核对日期）
+├─ codingplan.js      codingplan.fyi 聚合源：plans / platforms / config 三个静态 JSON
 ├─ pricing-sync.js    宿主：实时拉 DeepSeek 官网价目表解析（6 小时缓存，三重校验）
 ├─ official-usage.js  宿主：解析导入的官方用量 CSV（按 API key 拆，60 秒缓存）
+├─ media-prices.js    宿主：云端出图 / 生视频价格快照（生图按张、生视频按 token 估算公式）
+├─ media-ledger.js    宿主：读影像工坊面板账本（cloud-media-ui.log + .cloud-media-state.json）
 ├─ client.js          网页：侧栏按钮 + 六个栏目（首屏用 localStorage 快照，零等待）
-├─ prices.js          各家 API 价格快照（人工核对；DeepSeek 由官网实时覆盖）
-├─ plans.js           各家 coding plan / Agent 套餐快照（人工核对，带核对日期）
+├─ catalog/self.json  本插件自己那份市场条目（给 dsh-plugin-catalog 对照用）
 ├─ cordis.patch.yml   loader 行
 ├─ locale/{zh,en}.json
 ├─ docs/DETAIL.md     插件详情页的说明（`meta.detail` 指向它）
 ├─ icon.svg
-├─ pack.ps1           打包脚本（开发用，不进 zip）
+├─ package.json       npm 包清单（`files` 决定发什么）
+├─ LICENSE
 └─ README.md
 ```
