@@ -1,20 +1,17 @@
-# ai-credits — 左侧「积分」页
-#
-# Host 半边负责：内置入口清单、每天巡检链接、联网发现新入口、把结果存在本机。
-# Client 半边负责：侧栏「积分」按钮 + 主区的列表页。
-#
-# 下面所有 config 都有默认值，删光也能跑。逐项说明见 README「配置」一节。
-- insert:
-    - id: ai-credits
-      name: '@local/ai-credits'
-      config:
-        refreshHour: 9
-        dailySearch: true
-        checkTimeoutMs: 10000
-        maxCandidates: 80
-        # 官方用量账单里哪个 key 对应哪条线路。
-        # 不填会按 key 名字自动猜；填了以这里为准（账单里不存在的名字会被忽略，
-        # 所以把插件分享给别人时这份配置不会挡住对方 —— 会退回自动探测）。
-        officialKeyMap:
-          deepseek-account: DeepSeek Harness (App-managed)
-          deepseek-official: '4'
+  # ai-credits — 左侧「积分」页
+  #
+  # Host 半边负责：内置入口清单、每天巡检链接、联网发现新入口、把结果存在本机。
+  # Client 半边负责：侧栏「积分」按钮 + 主区的列表页。
+  #
+  # 下面所有 config 都有默认值，删光也能跑。逐项说明见 README「配置」一节。
+  - insert:
+      - id: ai-credits
+        name: '@local/ai-credits'
+        config:
+          refreshHour: 9
+          dailySearch: true
+          checkTimeoutMs: 10000
+          maxCandidates: 80
+          # 官方用量账单里哪个 key 对应哪条线路，形如 { "deepseek-official": "4" }。
+          # 留空 = 按账单里的 key 名字自动猜（推荐：换账号、换机器都不用改配置）。
+          officialKeyMap: {}

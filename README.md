@@ -463,11 +463,11 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 | `dailySearch` | `true` | 自动巡检时要不要顺带联网发现 |
 | `checkTimeoutMs` | `10000` | 单个入口 / 价格页 / 订阅页的超时 |
 | `maxCandidates` | `80` | 「每日新发现」最多留多少条（超过 45 天的自动清掉） |
-| `officialKeyMap` | 自动猜 | 官方用量账单里 `api_key_name` 对应哪条线路，形如 `{"deepseek-official":"4"}` |
+| `officialKeyMap` | `{}`（自动猜） | 官方用量账单里 `api_key_name` 对应哪条线路，形如 `{"deepseek-official":"4"}`；留空按 key 名字自动猜 |
 
 **全部可选，删光也能跑。** 插件没有导出 `Config`（那需要宿主注入 schema 构造器，拿不到会让整个插件不激活），所以配置在这里自己校验、给默认值 —— 配错了只是退回默认，不会让插件挂掉。
 
-`officialKeyMap` 的处理有个细节：配置里写了的名字，如果**当前账单里不存在，会被忽略**，然后按 key 名字自动探测补上。所以把插件分享给别人时，这份带着你本机 key 名的配置不会挡住对方。
+`officialKeyMap` 的处理有个细节：配置里写了的名字，如果**当前账单里不存在，会被忽略**，然后按 key 名字自动探测补上。默认留空（`{}`）就走自动猜 —— 这样配置里不会带任何人的 key 名。
 
 价格页 / 订阅页的核对节奏固定为 20 小时（`index.js` 里的 `PRICE_CHECK_HOURS`），不跟 `refreshHour` 绑死，这样白天重开 DSH 也会补一次。
 

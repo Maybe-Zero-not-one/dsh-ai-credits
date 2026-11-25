@@ -180,13 +180,11 @@ export async function importOfficialFiles(home, name, data) {
  * 官方账单里 `api_key_name` 是用户在开放平台给 key 起的名字，DSH 里根本不叫这个。
  * 这里把「哪个 key 对应哪条线路」写死，界面才能把官方金额摆到对应渠道旁边。
  *
- * ⚠ 这张表是**本机**的 key 名，换台机器对不上 —— 所以只在配置里没给的时候兜底用。
- * 想在自己的机器上用，把 `officialKeyMap` 写进插件配置，或让下面的自动探测猜。
+ * ⚠ 这张**故意留空**：写死任何人的 key 名都会跟着包发给别人，所以在配置没给的时候
+ * 一律交给下面的自动探测（`guessKeyMap`）去猜；用户想固定，就把 `officialKeyMap`
+ * 写进自己的插件配置。
  */
-export const PROVIDER_KEY_MAP = {
-  'deepseek-account': 'DeepSeek Harness (App-managed)',
-  'deepseek-official': '4',
-}
+export const PROVIDER_KEY_MAP = {}
 
 /**
  * 猜「官方账单里哪个 key 是 DSH 自己的」。
@@ -220,7 +218,7 @@ function guessKeyMap(byKey) {
  * 定下这张映射表：配置优先，探测补空缺，配置里不存在的 key 名会被丢掉。
  *
  * 为什么要丢掉：这张表带着的是**本机**的 key 名。把插件打包给别人时，配置也会
- * 一起过去，里面的 `DeepSeek Harness (App-managed)` / `4` 在对方账单里根本不存在。
+ * 一起过去，里面写的名字在对方账单里根本不存在。
  * 与其让它们占着位置、让对方那栏永远空着，不如过滤掉再按对方的名字重新猜。
  */
 export function resolveKeyMap(configMap, byKey) {
