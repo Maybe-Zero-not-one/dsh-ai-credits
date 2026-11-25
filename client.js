@@ -1478,7 +1478,7 @@ window.__ModuleLoader__.load({
             'data-on': view === 'dsh' ? '' : undefined,
             onClick: () => setView('dsh'),
           },
-          '本机接入',
+          '接入情况',
         ),
         h(
           'button',
@@ -2557,11 +2557,11 @@ window.__ModuleLoader__.load({
       const dshBody = [
         dshApi === null
           ? data === null && error === null
-            ? h('div', { className: 'ac-state' }, '正在读取本机接入…')
+            ? h('div', { className: 'ac-state' }, '正在读取接入情况…')
             : h(
                 'div',
                 { className: 'ac-state' },
-                '这次没读到本机接入情况。',
+                '这次没读到接入情况。',
                 h(
                   'button',
                   { type: 'button', className: 'ac-btn', style: { marginLeft: '10px' }, onClick: () => reloadDsh(undefined, true) },
@@ -2983,10 +2983,10 @@ window.__ModuleLoader__.load({
               'span',
               { className: 'ac-worth-detail-sub' },
               row.refSource === 'manual'
-                ? '你在「本机接入」里填的数'
+                ? '你在「接入情况」里填的数'
                 : row.refSource === 'plan'
                   ? '套餐表（plans.js）里这条线路对得上的档位，取最低一档比'
-                  : '没有参考价 —— 去「本机接入」这条线路右边填你实际付的月费',
+                  : '没有参考价 —— 去「接入情况」这条线路右边填你实际付的月费',
             ),
           ),
           planRef.length > 0
@@ -3996,7 +3996,7 @@ window.__ModuleLoader__.load({
                         'span',
                         { className: 'ac-worth-ref' },
                         row.refMin === null
-                          ? '参考月费没对上（在「本机接入」里填你付的月费）'
+                          ? '参考月费没对上（在「接入情况」里填你付的月费）'
                           : '参考 ' +
                             (row.refMax !== null && row.refMax !== row.refMin
                               ? fmtPrice(row.refMin, 'CNY') + '–' + fmtPrice(row.refMax, 'CNY')

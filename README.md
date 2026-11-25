@@ -6,7 +6,7 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 - **各家价格**：各家 AI 的 API 官方标价，按每 100 万 tokens 摆成一张表，输入 / 输出分列，看着挑便宜的那家。
 - **通用订阅**：各家平台的 Token / 会员 / Coding Plan 订阅（腾讯云 Token Plan、阿里云 Token Plan、火山方舟 Token Plan 与 Coding Plan、GLM Coding、小米 MiMo、MiniMax M Plan、Kimi 会员与 Kimi Code，以及 Claude Pro/Max/Ultra、Google AI Pro/Ultra、Manus、ChatGPT Go/Plus/Pro 等）。
 - **编程工具订阅**：**限定本家编程软件使用**的订阅（腾讯 WorkBuddy / CodeBuddy、阿里 Qoder、字节 Trae、Cursor、GitHub Copilot、Windsurf、Devin），不是跨工具的 coding plan。
-- **本机接入**：这台机器上的 DSH 现在接了哪几家模型线路、每条线路有哪些模型、密钥配了没、新会话默认用哪个。
+- **接入情况**：你当前的 DSH 接了哪几家模型线路、每条线路有哪些模型、密钥配了没、新会话默认用哪个。
 - **用量花费**：各家模型来源用了多少 tokens。按 token 计费的线路（DeepSeek 官方 / 账户）折成金额；订阅线路（Trae / Qoder / WorkBuddy / CodeArts）只报 token 和剩余积分、不折钱。可按今天 / 近 7 天 / 近 30 天看。
 
 ## 它每天做什么
@@ -38,7 +38,7 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 - 表按 **国内 / 海外** 分组，同一区域里再按标价币种分开（人民币 / 美元），每行一个模型：输入价、输出价、上下文、说明；绿色「最低」是该分组里最便宜的输入 / 输出。
 - 单位是 **每 100 万 tokens**；缓存价、批量价、税费都另算，以「官网核价 →」打开的官方页面为准。
 - 顶部 **价格快照** 是数字的人工核对日期；**最近核对** 是价格页可访问性的检查时间。快照超过 45 天没更新会提醒你去官网看一眼。
-- 标「聚合价」的几家（OpenAI / Google / xAI / Mistral / Amazon / NVIDIA）官网价格页对本机自动访问不友好，数字按 OpenRouter 目录核对；Meta Llama 用 AWS Bedrock 官方按需价；其余都是官网原价。
+- 标「聚合价」的几家（OpenAI / Google / xAI / Mistral / Amazon / NVIDIA）官网价格页对自动访问不友好，数字按 OpenRouter 目录核对；Meta Llama 用 AWS Bedrock 官方按需价；其余都是官网原价。
 - 价格栏的按钮是 **立即核对价格**：只探价格页 / 订阅页（不重跑 38 个领取入口），一分钟左右回来。
 - 价格数据在 `prices.js` 里（`PRICE_SNAPSHOT_AT` + `PRICE_PROVIDERS`），加一家、改一个价，保存后插件热重载就生效。
 
@@ -70,7 +70,7 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 - 顶部一行写清当前用的是哪个源、数据日期、聚合缓存时长；聚合挂了会明确提示已回退。
 - 想改本地兜底快照就改 `plans.js`（`PLAN_SNAPSHOT_AT` + `CODING_PLANS`）；想改聚合映射规则就改 `codingplan.js` 里的 `mapPlan`。两者保存后热重载生效。
 
-## 本机接入
+## 接入情况
 
 这一栏不存数据，每次都直接问宿主当下的活状态：
 
@@ -91,7 +91,7 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 - 默认线路会标「当前默认」并高亮；`agentDefaultModel` 单独一块显示新会话默认模型。
 - 缺密钥的线路通常读不到模型清单，这时模型数那栏写「缺密钥，模型没读到」，不是「没报模型」。
 - 自带登录的线路（TRAE / Qoder / WorkBuddy / CodeArts / Claude Code / Codex CLI）没有 `apiKeyEnv`，显示「无需密钥」。
-- 右上角按钮在**本机接入**这一栏会变成 **重新读**：宿主那边对线路清单有 30 秒缓存，这个口会强制重新问一遍。
+- 右上角按钮在**接入情况**这一栏会变成 **重新读**：宿主那边对线路清单有 30 秒缓存，这个口会强制重新问一遍。
 - **永远不会显示密钥本身**：`credentials.describe()` 按设计只返回 `configured / source / writable`，这个插件也只调它、不调 `resolve()`。
 - 改接入去「设置 → 模型」，这里只负责告诉你现在接了什么。
 
@@ -110,7 +110,7 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 - 点一下按钮就改口径，**改完立刻重算**，用量栏的金额分类跟着变
 - 手选过的标「手选」；和自动判定不一样时会提示「自动判定本来是哪个」
 - 表里有这一条（哪怕只开了折算）就会多一个 **自动** 按钮，一下全清、退回白名单判定
-- 存在 `$DSH_HOME/ai-credits/billing.json`；只在本机，删掉就全部回自动
+- 存在 `$DSH_HOME/ai-credits/billing.json`；只存在你本地，删掉就全部回自动
 - 读这个文件时会先剥掉 UTF-8 BOM —— Windows 上拿记事本 / PowerShell 手改过 JSON 常带 BOM，不剥的话 `JSON.parse` 直接抛，整张表会静默读成空（2.4.7 修的就是这个）
 
 `billing.json` 一条记录长这样（也认 2.4.7 的老写法，直接一个字符串）：
@@ -207,7 +207,7 @@ DSH 的左侧栏最下面多一栏 **「赛博鸡蛋领取处」**，点进去�
 
 ### 云端出图 / 生视频花费（和 token 是两套账）
 
-本机通过 API 调云端模型**画图、生成视频**（影像工坊 `dsh-cloud-media` 的 `cloud_image_generate` / `image_generate` / `cloud_video_generate`）也花钱，但计费口径和 LLM 完全不同：**生图按张、生视频按 token**。这部分单独统计在「云端出图 / 生视频花费」小节里，**不并入**上面「按标价折算」那个数。
+通过 API 调云端模型**画图、生成视频**（影像工坊 `dsh-cloud-media` 的 `cloud_image_generate` / `image_generate` / `cloud_video_generate`）也花钱，但计费口径和 LLM 完全不同：**生图按张、生视频按 token**。这部分单独统计在「云端出图 / 生视频花费」小节里，**不并入**上面「按标价折算」那个数。
 
 **记录从哪来**（两处互补，按产物文件名去重，同一张图只算一次）：
 
@@ -290,7 +290,7 @@ DeepSeek **没有用量查询 API**（`/user/usage`、`/user/billing` 都是 404
 对账时要注意三件事：
 
 1. **同一账号下可能有多个 API key**。官方账单里全都在，但 DSH 只用其中一两个；其余 key 的调用不在会话日志里，折算自然偏小。
-2. **余额差分（`.dshw-usage.json`）是全账号口径**，所以它应该和「官方账单总额」对得上，而不是和「日志折算」对得上。实测两者分别是 ¥152.0 和 ¥152.25，基本吻合。
+2. **余额差分（`.dshw-usage.json`）是全账号口径**，所以它应该和「官方账单总额」对得上，而不是和「日志折算」对得上。两者口径对得上（差额在几毛钱以内）。
 3. 搜索按次计费不计入 token。
 
 ### 分时价（峰谷）与缓存命中
@@ -347,7 +347,7 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 
 所以页面上每条订阅线路会显示：**已耗 N 积分**、**还剩 N 积分**、**总额度 N 积分**，以及这条线路下各模型的 **token 占比**。
 
-**为什么积分只到线路级、不到模型级？** 两个原因，都实测过：
+**为什么积分只到线路级、不到模型级？** 两个原因，都验证过：
 
 1. 官方接口只给整条线路的累计值，没有按模型拆分的明细。
 2. 各家都没有公开「每 token 扣多少积分」的换算。模型名里那个 `x0.06` 是**相对系数、不是绝对单价** —— 实测反推常数：qoder 约 521、trae 约 48，差 10 倍；trae 自己两次采样还从 43.8 漂到 48（错峰折扣会改单价）。硬乘会得出一个看着精确、其实是错的数。
@@ -395,7 +395,7 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 | `message.source` | `{ provider, model }` —— 这条回复是哪条线路的哪个模型答的 |
 | `usage` | `{ inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens }` |
 
-所以「deepseek-account 用了 32.7 亿 tokens、trae 用了 4267 万」这种数是宿主自己记的，不是估的。`compaction/summary`（上下文压缩那次调用）也带 usage，一并算进来。
+所以某条线路用了多少 tokens 这种数是宿主从日志里记下来的，不是估的。`compaction/summary`（上下文压缩那次调用）也带 usage，一并算进来。
 
 云端出图 / 生视频则读同一批日志里的 **`tool/call` + `tool/result` 事件对**（工具名是 `cloud_image_generate` / `image_generate` / `cloud_video_generate` / `cloud_video_task`），result 的 JSON 里带供应商、模型、尺寸、产物文件名；再加上影像工坊面板侧的 `cloud-media-ui.log` 和 `.cloud-media-state.json` 补全面板手动操作那条道（见上文「云端出图 / 生视频花费」）。
 
@@ -414,7 +414,7 @@ DeepSeek 官方**没有消费明细 API**（`/user/balance` 只给余额，`/use
 配套的两个细节：
 
 - **扫描顺序**：复制方（有 `parentSession` 且 `origin` 不是 `subagent`）排在原始方**后面**。否则 fork 先被扫到、占了名额，父会话反而被丢掉 —— 总量虽然对得上，但时间轴上这段历史会记到 fork 名下，归属就错了。
-- **`subagent` 不算复制方**：子代理是独立干活、用自己的调用，不会复制父会话的事件（本机实测 28 个 subagent，0 条重复）。
+- **`subagent` 不算复制方**：子代理是独立干活、用自己的调用，不会复制父会话的事件（实测下来子代理不产生重复事件）。
 
 去重后的条数和 token 会显示在用量栏顶部（「已去重 N 条」），没有重复就不显示。
 
@@ -494,7 +494,7 @@ pwsh -File pack.ps1          # 产物在 ..\_dist\ai-credits-dist\ai-credits-<�
 | 栏目 | 状态 |
 |:--|:--|
 | 领取入口 / 各家价格 / 通用订阅 / 编程工具订阅 | 完整可用 |
-| 本机接入 | 完整可用（读的是对方自己的 DSH） |
+| 接入情况 | 完整可用（读的是对方自己的 DSH） |
 | 用量花费 · token 统计 / 时间轴 | 完整可用 |
 | 用量花费 · 金额 | 只有对方配置了按量渠道才有 |
 | 积分 / 实际扣费 / 官方账单 | 显示「—」或「积分未知」，因为依赖 dsh-connect-* 连接器、`.dshw-usage.json`、官方 CSV |
@@ -506,7 +506,7 @@ pwsh -File pack.ps1          # 产物在 ..\_dist\ai-credits-dist\ai-credits-<�
 ```
 plugins/ai-credits/
 ├─ index.js           宿主：清单、巡检、联网发现、价格页 / 订阅页核对、存储、HTTP 路由
-├─ dsh-api.js         宿主：问 llm / settings / credentials 收集「本机接入」情况（30 秒缓存）
+├─ dsh-api.js         宿主：问 llm / settings / credentials 收集「接入情况」（30 秒缓存）
 ├─ usage.js           宿主：扫会话日志统计各家用量，按官方分时价折钱（磁盘 + 内存双层缓存）
 ├─ media-prices.js    宿主：云端出图 / 生视频价格快照（生图按张、生视频按 token 估算公式）
 ├─ media-ledger.js    宿主：读影像工坊面板账本（cloud-media-ui.log + .cloud-media-state.json）
