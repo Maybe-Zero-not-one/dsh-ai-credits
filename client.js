@@ -979,6 +979,7 @@ window.__ModuleLoader__.load({
 .ac-acc-select { max-width: 260px; }
 .ac-acc-edit-hint { font-size: 10.5px; color: var(--dsw-alias-brand-primary, #4d7cfe); }
 .ac-acc-edit-hint b { font-weight: 600; }
+.ac-acc-copy { display: inline-flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 .ac-models { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .ac-model-chip { font-size: 10.5px; padding: 3px 7px; border-radius: 6px; font-family: ui-monospace, monospace;
   color: var(--dsw-alias-label-secondary, #8a8f98);
@@ -2849,14 +2850,58 @@ window.__ModuleLoader__.load({
           }
           const base = accEntry || {}
           const next = { ...base, ...patch }
-          // 清掉空字段，别把一堆 null 写进盘
+          // 清掉空字段，别把一堆 null 写进盘。
+          // ⚠ autoRenew=false 是「一次买断」这个**真实选择**，不能当空值删（2.7.8 修）
           for (const k of Object.keys(next)) {
+            if (k === 'autoRenew') {
+              if (next[k] === null || next[k] === undefined) delete next[k]
+              continue
+            }
             if (next[k] === null || next[k] === undefined || next[k] === false) delete next[k]
           }
           const entries = { ...((rawBill && rawBill.accountEntries) || {}) }
           if (Object.keys(next).length > 0) entries[activeAcc] = next
           else delete entries[activeAcc]
           setBilling(route.id, { accountEntries: Object.keys(entries).length > 0 ? entries : null })
+        }
+        /**
+         * 一键复制设置（2.7.8）：整条渠道 ⇄ 某个账户。
+         * 复制的是**记录内容**（订阅形式/档位/时间/时长/实付/优惠/续费方式/额度池/赠送），
+         * 不含计费口径（mode/estimate 始终线路级）和账户快照来源标记。
+         */
+        const COPY_FIELDS = [
+          'planType', 'subscribedAt', 'promoNote', 'termMonths', 'paidTotal', 'paidCurrency',
+          'monthlyCNY', 'planTier', 'autoRenew', 'basePrice', 'baseCurrency', 'quotaPools', 'gifts',
+        ]
+        const pickCopy = (src) => {
+          const out = {}
+          if (!src || typeof src !== 'object') return out
+          for (const k of COPY_FIELDS) {
+            if (src[k] !== null && src[k] !== undefined) out[k] = src[k]
+          }
+          return out
+        }
+        const copyChannelToAccount = () => {
+          if (activeAcc === null || rawBill === null) return
+          const copied = pickCopy(rawBill)
+          const entries = { ...((rawBill && rawBill.accountEntries) || {}) }
+          if (Object.keys(copied).length > 0) entries[activeAcc] = copied
+          else delete entries[activeAcc]
+          setBilling(route.id, { accountEntries: Object.keys(entries).length > 0 ? entries : null })
+          setBillingNotice('已把整条渠道的设置复制到「' + accNameOf(activeAcc) + '」（计费口径不变）')
+        }
+        const copyAccountToChannel = () => {
+          if (activeAcc === null || accEntry === null) return
+          const copied = pickCopy(accEntry)
+          const patch = {}
+          for (const k of COPY_FIELDS) patch[k] = copied[k] !== undefined ? copied[k] : null
+          setBilling(route.id, patch)
+          setBillingNotice('已把「' + accNameOf(activeAcc) + '」的设置复制到整条渠道（计费口径不变）')
+        }
+        const accNameOf = (id) => {
+          if (accountsInfo === null) return id
+          const a = accountsInfo.accounts.find((x) => x.id === id)
+          return a && a.name ? a.name : id
         }
         // 缺密钥的线路通常读不到模型清单，这时候别说「没报模型」，会让人以为线路坏了
         const countText =
@@ -3048,9 +3093,11 @@ window.__ModuleLoader__.load({
           const firstPeriod = period !== null && period.periodIndex === 1
 
           /**
-           * 账户订阅对齐行（2.7.5）：连接器 /usage（CodeArts 是 /api/codearts/status）
-           * 能读到「档位名 + 当前有效期」，但**读不到首次订阅时间和实付金额** ——
-           * 那两样永远手填。这里把读到的摆出来，一键记进本条订阅（后台 billing.json）。
+           * 账户订阅快照行（2.7.5 起，2.7.8 改名「存到本地」）：连接器 /usage
+           * （CodeArts 是 /api/codearts/status）能读到「档位名 + 当前有效期」，
+           * 但**读不到首次订阅时间和实付金额** —— 那两样永远手填。
+           * 按钮方向是**线上 → 本地**：把读到的存一份快照进 billing.json，
+           * 离线 / 连接器没开时也有数；不会改线上订阅。
            */
           const accountPlanRow = (() => {
             const live = accountBook && accountBook.plan ? accountBook.plan : null
@@ -3094,7 +3141,7 @@ window.__ModuleLoader__.load({
                 shown.name ? shown.name + ' · ' : '',
                 shown.planName ? h('b', null, shown.planName) : '（连接器没给档位名）',
                 shown.expiresAt ? ' · 账户有效期到 ' + shown.expiresAt : '',
-                live === null && saved !== null ? '（上次同步的快照）' : '',
+                live !== null ? '（线上实时）' : saved !== null ? '（本地快照）' : '',
               ),
               live !== null
                 ? h(
@@ -3103,15 +3150,22 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       className: 'ac-chip',
                       disabled: busy || alreadySame,
-                      title: '把账户读到的档位名 / 有效期记进这条订阅（后台 billing.json）。首次订阅时间和实付金额账户里没有，仍要手填',
+                      title:
+                        '方向：线上 → 本地。把刚从连接器读到的线上订阅信息（档位名 / 有效期）存一份快照进本地 billing.json，' +
+                        '下次离线 / 连接器没开时也有数。不会改你线上的订阅，也不动首次订阅时间和实付（那两样线上没有，仍手填）',
                       onClick: syncNow,
                     },
-                    alreadySame ? '已对齐' : '对齐到账户',
+                    alreadySame ? '已存快照' : '存到本地',
                   )
                 : null,
               matchedTier !== null && bill.planTier !== matchedTier
-                ? h('span', { className: 'ac-bill-auto-hint' }, '名字对上官方档位「' + matchedTier + '」，点对齐会一起选上')
+                ? h('span', { className: 'ac-bill-auto-hint' }, '名字对上官方档位「' + matchedTier + '」，点「存到本地」会一起选上')
                 : null,
+              h(
+                'span',
+                { className: 'ac-bill-auto-hint' },
+                '「存到本地」= 把线上读到的档位/有效期记一份本地快照，不是改线上订阅',
+              ),
             )
           })()
 
@@ -3979,6 +4033,37 @@ window.__ModuleLoader__.load({
                     : '（还没记过，填一条就有）',
                 )
               : h('span', { className: 'ac-bill-auto-hint' }, '多账号可以分开记：选一个账号，下面的设置就记到它名下'),
+            // 一键复制（2.7.8）：整条渠道 ⇄ 选中账户。覆盖式复制，先说清楚再动手
+            activeAcc !== null
+              ? h(
+                  'span',
+                  { className: 'ac-acc-copy' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: billingBusy === route.id,
+                      title: '把整条渠道当前的订阅设置（形式/档位/时间/时长/实付/优惠/续费方式/额度池/赠送）整体复制给「' + nameOf(activeAcc) + '」，覆盖它原有的记录。计费口径（API按量/订阅/折算）不复制',
+                      onClick: copyChannelToAccount,
+                    },
+                    '渠道设置 → 此账户',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: billingBusy === route.id || accEntry === null,
+                      title: accEntry === null
+                        ? '这个账户还没记过设置，没东西可复制'
+                        : '把「' + nameOf(activeAcc) + '」的订阅设置整体复制回整条渠道，覆盖渠道原有的记录。计费口径不复制',
+                      onClick: copyAccountToChannel,
+                    },
+                    '此账户 → 渠道设置',
+                  ),
+                )
+              : null,
           )
         })()
 

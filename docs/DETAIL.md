@@ -172,7 +172,7 @@ plans.js 的 Qoder / WorkBuddy 条目是**国际版 USD 价**，国内账号拿�
 ### 「自动」按钮条件与账户订阅对齐（2.7.5）
 
 - **`resettable`**（usage.js billingRules → describeBilling → dsh-api → client）：「自动」按钮只在**手选了模式**（mode 非空）或**订阅档开了折算**时出现。老条件 `touched`（表里有没有记录）会让只填过额度池/快捷时长的 opencode-go / ark / qoder 一直挂着按钮。按钮语义收窄为「退 mode + 关折算」，订阅信息另给「清空订阅信息」chips。`touched` 字段保留兼容但界面不再用它。
-- **`accountPlan` / `accountSyncedAt`**：账户订阅快照 `{ name, planName, planTier, expiresAt, periodStart, source, atMs }`。页面同源读连接器：Qoder `credits.planExpiresAtMs`；WorkBuddy `credits.packages` 里 `monthly:true` 的包名（「CodeBuddy个人体验版」）+ `cycleRefreshMs`；**CodeArts 走 `/api/codearts/status` 的 `credits.credits`（planName / periodStart / periodEnd，最全）**；Trae 只给账号列表，读不到就明说。⚠ **金额（首次订阅时间 / 实付）账户里没有**，永远手填；有效期靠 subscriptionPeriod 从首订日推算对齐。「对齐到账户」按钮把快照 POST 进 billing.json，`matchTierByName` 按关键词（体验版→free、专业→pro…）对上官方档位时顺手选 planTier。
+- **`accountPlan` / `accountSyncedAt`**：账户订阅快照 `{ name, planName, planTier, expiresAt, periodStart, source, atMs }`。页面同源读连接器：Qoder `credits.planExpiresAtMs`；WorkBuddy `credits.packages` 里 `monthly:true` 的包名（「CodeBuddy个人体验版」）+ `cycleRefreshMs`；**CodeArts 走 `/api/codearts/status` 的 `credits.credits`（planName / periodStart / periodEnd，最全）**；Trae 只给账号列表，读不到就明说。⚠ **金额（首次订阅时间 / 实付）账户里没有**，永远手填；有效期靠 subscriptionPeriod 从首订日推算对齐。「存到本地」按钮（2.7.8 前叫「对齐到账户」）把快照 POST 进 billing.json —— 方向是**线上 → 本地**，不改线上订阅；`matchTierByName` 按关键词（体验版→free、专业→pro…）对上官方档位时顺手选 planTier。
 - 新字段全链路：normalize（usage.js + index.js 两份必须镜像）/ saveBillingOverrides 紧凑写 / reconcile 保留 / POST 校验（autoRenew 认布尔、accountPlan 认对象、accountSyncedAt 认正毫秒）。
 
 ### 订阅形式排序与「赠送」记账（2.7.6 起，2.7.7 扩充）
@@ -183,12 +183,14 @@ plans.js 的 Qoder / WorkBuddy 条目是**国际版 USD 价**，国内账号拿�
 - **只记账不参与折算**：gifts 不进 effectiveMonthlyCNY / subscriptionWorth，也不影响 resettable。
 - **2.7.7 全渠道**：`giftsRow` 从 subscriptionRow 里挪到 **routeCard 作用域**（所有渠道都渲染，bill 非 null 即可）。⚠ 挪动时注意作用域：giftsRow 引用的 `setEntry`/`giftDraft` 都在 routeCard/CreditsPage 层，放在 subscriptionRow 内部会让非订阅渠道渲染时 `giftsRow is not defined` 整页消失（坑 #1 同款）。
 
-### 多账户设置选择 `accountEntries`（2.7.7）
+### 多账户设置选择 `accountEntries`（2.7.7 起，2.7.8 修 POST + 一键复制）
 
 - **存储**：线路记录里多一个 `accountEntries: { 账户id: 同构记录 }`（最多 20 个账户），每个账户一份自己的订阅/赠送账。归一在 normalizeOverrideEntry / normalizeBillingEntry 里递归调用自身（⚠ 递归深度：账户记录里不再嵌 accountEntries，归一时子记录的 accountEntries 会被当普通字段——实际前端不往子记录写它，宿主校验也不收）。
-- **前端投影**：routeCard 里 `accountEdit[route.id]` 存选中的账户 id；选中后把 `accountEntries[id]` 投影成 bill 的形状（period/giftTotals/effectiveMonthlyCNY 用前端镜像函数 `periodOf`/`giftTotalsOf` 现算，口径与宿主一致），表单代码不用改。`setEntry(patch)` 分流：选了账号就整份替换那个账户的记录（清空 null/false 字段），否则走线路级 setBilling。
+- **⚠ 2.7.8 修的 bug**：2.7.7 加字段时改了归一/落盘/reconcile/透出，**唯独 POST /billing 处理器没接 accountEntries** → 前端发过去被静默丢弃、回包还 ok:true，逐账户订阅形式/档位存不上。教训：新存储字段要改**五处**（两份归一 / 紧凑写 / reconcile / **POST 接收+合并**），落地后跑 `test-billing-post.mjs`（真调处理器，假 ctx + 临时 DSH_HOME，DSH_HOME 必须在 import 前设）。
+- **前端投影**：routeCard 里 `accountEdit[route.id]` 存选中的账户 id；选中后把 `accountEntries[id]` 投影成 bill 的形状（period/giftTotals/effectiveMonthlyCNY 用前端镜像函数 `periodOf`/`giftTotalsOf` 现算，口径与宿主一致），表单代码不用改。`setEntry(patch)` 分流：选了账号就整份替换那个账户的记录，否则走线路级 setBilling。⚠ 清空值时 **autoRenew=false 要保留**（「一次买断」是真实选择，不是空值，2.7.8 修）。
+- **一键复制（2.7.8）**：`COPY_FIELDS` = planType/subscribedAt/promoNote/termMonths/paidTotal/paidCurrency/monthlyCNY/planTier/autoRenew/basePrice/baseCurrency/quotaPools/gifts。`copyChannelToAccount` 把线路级 pickCopy 结果整份写进 entries[activeAcc]；`copyAccountToChannel` 反向（COPY_FIELDS 逐字段 patch，缺的给 null 清掉）。**mode/estimate 不复制**（计费口径始终线路级）。覆盖式，复制后 billingNotice 提示。
 - **计费口径不随账号变**：billingRow 的三个模式按钮 + 「自动」仍直接 setBilling（线路级）；worthRow 的月费输入也是线路级（折算比较是线路口径）。
-- **选择器**：`accountSelector` 只在 accountsInfo.count > 1 时出现，选项标「当前在用」「已记」；probe-click 用 `CHANGE_CLASS=ac-acc-select CHANGE_VALUE=<id> CHANGE_INDEX=<n>` 模拟换值。
+- **选择器**：`accountSelector` 只在 accountsInfo.count > 1 时出现，选项标「当前在用」「已记」；probe-click 用 `CHANGE_CLASS=ac-acc-select CHANGE_VALUE=<id>` 模拟换值，**按选项值认亲下拉**（不猜渲染序号，未配置线路收起后顺序会变）。
 
 ⚠ `accountsPanel` 在 routeCard 里（约 2497 行），**不能引用用量栏的 `fmtCredits`**（3655 行才声明，const 箭头函数不提升 → TDZ → 整页消失，坑 #1）。面板内自带 `fmtAccCredits`。
 

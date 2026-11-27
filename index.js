@@ -1865,7 +1865,7 @@ export function apply(ctx, config) {
             return
           }
         }
-        // gifts（2.7.6）：赠金 / 免费 token 记录，整表替换（前端加一条/删一条都发全量）
+        // gifts（2.7.6）：「赠送」记录，整表替换（前端加一条/删一条都发全量）
         const gifts = parsed.gifts
         if (gifts !== undefined && gifts !== null) {
           if (!Array.isArray(gifts)) {
@@ -1894,6 +1894,32 @@ export function apply(ctx, config) {
             }
           }
         }
+        // accountEntries（2.7.7 起，2.7.8 修：之前 POST 根本没接这个字段，
+        // 逐账户设置被静默丢弃 —— 订阅形式 / 档位选了存不上就是它）：
+        // { 账户id: 同构记录 }，整表替换；null = 清掉全部逐账户设置
+        const accountEntries = parsed.accountEntries
+        if (accountEntries !== undefined && accountEntries !== null) {
+          if (typeof accountEntries !== 'object' || Array.isArray(accountEntries)) {
+            sendJson(res, 400, { ok: false, error: 'accountEntries 要对象 { 账户id: 记录 }，或 null' })
+            return
+          }
+          const ids = Object.keys(accountEntries)
+          if (ids.length > 20) {
+            sendJson(res, 400, { ok: false, error: 'accountEntries 最多 20 个账户' })
+            return
+          }
+          for (const id of ids) {
+            if (id === '' || id.length > 80) {
+              sendJson(res, 400, { ok: false, error: 'accountEntries 账户 id 要 1~80 字符' })
+              return
+            }
+            const sub = accountEntries[id]
+            if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) {
+              sendJson(res, 400, { ok: false, error: 'accountEntries 每个账户要一份记录对象' })
+              return
+            }
+          }
+        }
         try {
           const overrides = loadBillingOverrides()
           const current = overrides[provider] || {}
@@ -1915,6 +1941,7 @@ export function apply(ctx, config) {
             accountPlan: current.accountPlan === undefined ? null : current.accountPlan,
             accountSyncedAt: current.accountSyncedAt === undefined ? null : current.accountSyncedAt,
             gifts: current.gifts === undefined ? null : current.gifts,
+            accountEntries: current.accountEntries === undefined ? null : current.accountEntries,
           }
           if (touchMode) next.mode = mode
           if (estimate !== undefined) next.estimate = estimate
@@ -1979,7 +2006,11 @@ export function apply(ctx, config) {
                   }))
             if (Array.isArray(next.gifts) && next.gifts.length === 0) next.gifts = null
           }
-          // 落盘前归一：accountPlan 里的脏字段在这一步被裁掉；全空就整条删掉
+          if (accountEntries !== undefined) {
+            // 整表替换；每个账户的记录在落盘前的 normalizeBillingEntry 里递归归一
+            next.accountEntries = accountEntries
+          }
+          // 落盘前归一：accountPlan / accountEntries 里的脏字段在这一步被裁掉；全空就整条删掉
           const normalized = normalizeBillingEntry(next)
           if (normalized === null) delete overrides[provider]
           else overrides[provider] = normalized
