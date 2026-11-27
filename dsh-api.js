@@ -242,6 +242,13 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         quotaPoolConfig: quotaPoolCfg,
         // opencode-go 的官方额度池建议（一键填进 quotaPools）
         goPoolSuggestion: goPool,
+        // ---- 官方档位与计费挡位（2.7.4）----
+        // 选定的国内官方档位 id；下拉选项在 cnTiers
+        planTier: billingInfo.planTier(id),
+        // 这条线路的国内官方档位表（Qoder CN / TRAE / WorkBuddy / 码道），没有 null
+        cnTiers: billingInfo.cnTiers(id),
+        // 月付挡 / 多月包挡 / 年付挡 —— 一次买俩月的限时优惠仍归月付挡
+        billingClass: billingInfo.billingClass(id),
         // 这条订阅线路有没有积分查询端点（没有就只能报 token）
         creditEndpoint: billingInfo.creditEndpoint(id),
       },

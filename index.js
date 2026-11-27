@@ -27,6 +27,7 @@ import { collectDshApi } from './dsh-api.js'
 import { collectUsage, describeBilling } from './usage.js'
 import { fetchOfficialPricing } from './pricing-sync.js'
 import { fetchGoModels, searchGoModels, OPENCODE_GO_TIERS, OPENCODE_GO_SNAPSHOT_AT } from './opencode-go.js'
+import { cnTierById } from './cn-tiers.js'
 import { collectOfficialUsage, resolveKeyMap, importOfficialFiles } from './official-usage.js'
 
 export const inject = ['webServer', 'timer']
@@ -56,7 +57,7 @@ function normalizeBillingEntry(value) {
     return {
       mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
       subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
-      basePrice: null, baseCurrency: null, quotaPools: null,
+      basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
     }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -95,14 +96,16 @@ function normalizeBillingEntry(value) {
     }
     if (rows.length > 0) quotaPools = rows
   }
+  // 官方档位（2.7.4）：只认 cn-tiers.js 里存在的 id
+  const planTier = typeof value.planTier === 'string' && cnTierById(value.planTier) !== null ? value.planTier : null
   const empty =
     mode === null && estimate === false && monthlyCNY === null && planType === null &&
     subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
-    basePrice === null && quotaPools === null
+    basePrice === null && quotaPools === null && planTier === null
   if (empty) return null
   return {
     mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
-    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools,
+    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
   }
 }
 
@@ -148,6 +151,7 @@ function saveBillingOverrides(overrides) {
       value.baseCurrency = entry.baseCurrency || 'USD'
     }
     if (Array.isArray(entry.quotaPools) && entry.quotaPools.length > 0) value.quotaPools = entry.quotaPools
+    if (entry.planTier) value.planTier = entry.planTier
     if (Object.keys(value).length > 0) compact[provider] = value
   }
   const tmp = BILLING_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
@@ -187,6 +191,7 @@ function reconcileBillingOverrides(overrides) {
         basePrice: entry.basePrice,
         baseCurrency: entry.baseCurrency,
         quotaPools: entry.quotaPools,
+        planTier: entry.planTier === undefined ? null : entry.planTier,
       }
       if (
         kept.estimate === false &&
@@ -197,7 +202,8 @@ function reconcileBillingOverrides(overrides) {
         kept.termMonths === null &&
         kept.paidTotal === null &&
         kept.basePrice === null &&
-        kept.quotaPools === null
+        kept.quotaPools === null &&
+        kept.planTier === null
       ) {
         continue
       }
@@ -1753,6 +1759,12 @@ export function apply(ctx, config) {
             }
           }
         }
+        // planTier：国内官方档位 id（2.7.4），只认 cn-tiers.js 里存在的；null = 清掉
+        const planTier = parsed.planTier
+        if (planTier !== undefined && planTier !== null && cnTierById(String(planTier)) === null) {
+          sendJson(res, 400, { ok: false, error: 'planTier 不是已知的官方档位 id，或 null' })
+          return
+        }
         try {
           const overrides = loadBillingOverrides()
           const current = overrides[provider] || {}
@@ -1769,6 +1781,7 @@ export function apply(ctx, config) {
             basePrice: current.basePrice === undefined ? null : current.basePrice,
             baseCurrency: current.baseCurrency === undefined ? null : current.baseCurrency,
             quotaPools: current.quotaPools === undefined ? null : current.quotaPools,
+            planTier: current.planTier === undefined ? null : current.planTier,
           }
           if (touchMode) next.mode = mode
           if (estimate !== undefined) next.estimate = estimate
@@ -1811,6 +1824,7 @@ export function apply(ctx, config) {
                     .slice(0, 40)
             if (Array.isArray(next.quotaPools) && next.quotaPools.length === 0) next.quotaPools = null
           }
+          if (planTier !== undefined) next.planTier = planTier === null ? null : String(planTier)
           // 所有字段都空了就把这条删掉，别留一个空壳
           if (
             next.mode === null &&
@@ -1822,7 +1836,8 @@ export function apply(ctx, config) {
             next.termMonths === null &&
             next.paidTotal === null &&
             next.basePrice === null &&
-            next.quotaPools === null
+            next.quotaPools === null &&
+            next.planTier === null
           ) {
             delete overrides[provider]
           } else {

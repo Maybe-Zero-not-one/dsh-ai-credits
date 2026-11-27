@@ -144,9 +144,20 @@ OpenCode Go 那种：付一笔**基础价**（$10），各家模型各给一笔�
 
 更准的路子（还没接）：官方响应头 `opencode.allowance` 报每次请求吃掉多少额度；`/inference/go/v1/usage` 给 rolling/weekly/monthly 三个限额的已用百分比。都需要 Go 的 API key。
 
-### 多账号逐账号订阅状态（2.7.2）
+#### 实时检索（2.7.3）
+
+`fetchGoModels({force})` 宿主直接拉公开端点（6h 缓存 / 15s 超时 / sanity：≥10 个带额度模型且额度 <100000）。失败保留上次成功值（stale），再不行退快照 —— 照 pricing-sync.js 的规矩，绝不用半截数据覆盖。
+
+- `currentGoModels()`：同步读「当前最好的表」（实时缓存优先），`goModelLimit` / `goModelPrice` / `normalizeGoModel` / `buildGoPool` 全走它 → **折算自动跟着实时表**。
+- `searchGoModels(query, models, routeModelIds)`：全表检索，本线路有的排前面（id 归一后比对），其余按 Go 额度降序。
+- payload `opencodeGo` 段：source/at/count/tiers/models 全表；`/list`、`/dsh`、`/refresh` 三个口都带，`/dsh?refresh=1` 强制刷新表。
+- 界面全表在额度池区「查全部模型额度（N）▾」展开，前端本地过滤（goTableQuery state）。
+
+### 多账号逐账号订阅状态（2.7.2，2.7.3 强化）
 
 连接器 `/usage` 的 **`pool.accounts[]`** 带 `member`（是否会员）、`credits`、`planExpiresAtMs`、`current`、`checkedInToday`；`pool.memberAccountIds` / `effectiveMemberAccountIds` 兜底。`readAccounts()` 按 accountId 关联，会员判定优先 `pool.member`，退回落名单，两样都没有 → `null`（界面标「订阅未知」，不瞎猜）。
+
+**过期核查（2.7.3）**：`member === true` 但 `planExpiresAtMs <= now` → member 降为 false、标 `planExpired`（连接器的会员标记可能是缓存旧状态）。界面红色「订阅已过期」，徽标「M/N 已订阅」的 M 不含过期账号。
 
 ⚠ `accountsPanel` 在 routeCard 里（约 2497 行），**不能引用用量栏的 `fmtCredits`**（3655 行才声明，const 箭头函数不提升 → TDZ → 整页消失，坑 #1）。面板内自带 `fmtAccCredits`。
 

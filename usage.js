@@ -26,6 +26,7 @@ import { promisify } from 'node:util'
 import { PRICE_PROVIDERS } from './prices.js'
 import { PROVIDER_KEY_MAP } from './official-usage.js'
 import { goUsageUSD, goModelLimit, buildGoPool, OPENCODE_GO_SNAPSHOT_AT } from './opencode-go.js'
+import { cnTiersOf, cnTierById, billingClassOfTerm, CN_TIERS_SNAPSHOT_AT } from './cn-tiers.js'
 import { CODING_PLANS, PLAN_SNAPSHOT_AT } from './plans.js'
 import { MEDIA_PRICE_SNAPSHOT_AT, imageUnitPrice, videoCost, shortProvider } from './media-prices.js'
 import { readCloudMediaLedger } from './media-ledger.js'
@@ -1022,10 +1023,29 @@ const SUBSCRIPTION_PLAN_HINTS = {
 const USD_TO_CNY = 7.2
 
 /**
- * 这条订阅线路在套餐表里的参考月费（人民币，取最低档到最高档）。
- * 套餐表里没有对得上的 → null，界面退回手填。
+ * 这条订阅线路的参考月费（人民币）。
+ *
+ * 优先级（2.7.4）：
+ *   1. 用户选定的**国内官方档位**（planTier）→ 该档官方月付原价（CNY），单点不是区间
+ *   2. plans.js 套餐表候选（老路，国际版 USD 折 ¥7.2）
+ * 都没有 → null，界面退回手填。
  */
-function subscriptionPlanRef(provider) {
+function subscriptionPlanRef(provider, planTierId) {
+  // 官方档位优先：国内账号按国内价，别拿国际版美元价折
+  if (typeof planTierId === 'string' && planTierId !== '') {
+    const tier = cnTierById(planTierId)
+    if (tier !== null && typeof tier.monthlyCNY === 'number') {
+      return {
+        minCNY: tier.monthlyCNY,
+        maxCNY: tier.monthlyCNY,
+        plans: [{ id: tier.id, title: tier.providerLabel + ' ' + tier.official, price: tier.monthlyCNY, currency: 'CNY' }],
+        snapshotAt: CN_TIERS_SNAPSHOT_AT,
+        usdToCny: USD_TO_CNY,
+        tierSource: 'cn-official',
+        tier,
+      }
+    }
+  }
   const ids = SUBSCRIPTION_PLAN_HINTS[provider]
   if (!Array.isArray(ids) || ids.length === 0) return null
   const picked = CODING_PLANS.filter((plan) => ids.includes(plan.id) && typeof plan.price === 'number')
@@ -1045,6 +1065,7 @@ function subscriptionPlanRef(provider) {
     plans: names,
     snapshotAt: PLAN_SNAPSHOT_AT,
     usdToCny: USD_TO_CNY,
+    tierSource: 'plans-snapshot',
   }
 }
 
@@ -1116,12 +1137,13 @@ const PLAN_TYPE_KEYWORDS = {
  * 给一条订阅线路挑参考套餐档（「订阅形式」和套餐表联动的那一步）。
  * @returns {{ planType:string|null, plans:Array, minCNY:number|null, maxCNY:number|null, matched:boolean }|null}
  */
-function suggestPlanRef(provider, planType) {
-  const base = subscriptionPlanRef(provider)
+function suggestPlanRef(provider, planType, planTierId) {
+  const base = subscriptionPlanRef(provider, planTierId)
   if (base === null) return null
   const keywords = planType ? PLAN_TYPE_KEYWORDS[planType] : null
-  if (!Array.isArray(keywords) || keywords.length === 0) {
-    return { planType: planType || null, plans: base.plans, minCNY: base.minCNY, maxCNY: base.maxCNY, matched: false, snapshotAt: base.snapshotAt }
+  if (!Array.isArray(keywords) || keywords.length === 0 || base.tierSource === 'cn-official') {
+    // 选了官方档位就不再按关键词过滤 —— 用户已经明确指定了哪一档
+    return { planType: planType || null, plans: base.plans, minCNY: base.minCNY, maxCNY: base.maxCNY, matched: base.tierSource === 'cn-official', snapshotAt: base.snapshotAt, tierSource: base.tierSource }
   }
   const picked = base.plans.filter((p) => {
     const hay = (String(p.id || '') + ' ' + String(p.title || '')).toLowerCase()
@@ -1291,7 +1313,7 @@ function normalizeOverrideEntry(value) {
     return {
       mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
       subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
-      basePrice: null, baseCurrency: null, quotaPools: null,
+      basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
     }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -1338,14 +1360,17 @@ function normalizeOverrideEntry(value) {
     }
     if (rows.length > 0) quotaPools = rows
   }
+  // 官方档位（2.7.4）：国内官方档位表的 id（cn-tiers.js），选了它参考价就按官方月付原价
+  const planTier =
+    typeof value.planTier === 'string' && cnTierById(value.planTier) !== null ? value.planTier : null
   const empty =
     mode === null && estimate === false && monthlyCNY === null && planType === null &&
     subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
-    basePrice === null && quotaPools === null
+    basePrice === null && quotaPools === null && planTier === null
   if (empty) return null
   return {
     mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
-    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools,
+    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
   }
 }
 
@@ -1459,6 +1484,18 @@ function billingRules(overrides) {
         pools: entry.quotaPools.slice(),
       }
     },
+    /** 选定的官方档位 id（2.7.4），没选 null */
+    planTier: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.planTier
+    },
+    /** 计费挡位：月付 / 多月包 / 年付。一次买俩月的限时优惠仍归月付挡 */
+    billingClass: (provider) => {
+      const entry = entryOf(provider)
+      return billingClassOfTerm(entry === null ? null : entry.termMonths)
+    },
+    /** 这条线路的国内官方档位表（下拉用），没有 null */
+    cnTiers: (provider) => cnTiersOf(provider),
     /** 整条覆盖记录（所有字段都要时用） */
     entry: (provider) => entryOf(provider),
     /** 要不要查价、要不要算钱（按量 / 套餐折算 / 订阅+折算 三种都算） */
@@ -1537,8 +1574,12 @@ export function describeBilling(overrides) {
     paid: (provider) => rules.paid(provider),
     effectiveMonthlyCNY: (provider) => rules.effectiveMonthlyCNY(provider),
     quotaPool: (provider) => rules.quotaPool(provider),
-    /** 按订阅形式从套餐表挑的参考档（联动 plans.js） */
-    planSuggestion: (provider) => suggestPlanRef(provider, rules.planType(provider)),
+    /** 按订阅形式从套餐表挑的参考档（联动 plans.js / 国内官方档位） */
+    planSuggestion: (provider) => suggestPlanRef(provider, rules.planType(provider), rules.planTier(provider)),
+    /** 官方档位 / 计费挡位 / 国内档位表（2.7.4） */
+    planTier: (provider) => rules.planTier(provider),
+    billingClass: (provider) => rules.billingClass(provider),
+    cnTiers: (provider) => rules.cnTiers(provider),
     /** 本地 CLI agent 的本机登录态（2.7.2）；不是这类线路返回 null */
     localCli: (provider) => {
       if (!isLocalCliAgent(provider)) return null
@@ -2302,13 +2343,16 @@ export async function collectUsage(ctx, options) {
   const subscriptionWorth = [...worthAgg.values()]
     .map((agg) => {
       const monthlyCNY = Number(((agg.costCNY + agg.costUSD * USD_TO_CNY) * monthlyScale).toFixed(2))
-      const planRef = subscriptionPlanRef(agg.provider)
-      // 参考月费：优先用「本次实付 ÷ 订阅月数」（年付要摊到月），退回老的手填月费，再退回套餐表
+      const planTierId = billing.planTier(agg.provider)
+      const planRef = subscriptionPlanRef(agg.provider, planTierId)
+      // 参考月费（2.7.4 优先级）：官方档位（国内价）> 本次实付÷月数 > 手填月费 > plans.js 候选
       const manualMonthly = billing.effectiveMonthlyCNY(agg.provider)
       const paid = billing.paid(agg.provider)
-      const refMin = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.minCNY
-      const refMax = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.maxCNY
-      const refSource = manualMonthly !== null ? (paid !== null ? 'paid' : 'manual') : planRef === null ? null : 'plan'
+      const officialTier = planRef !== null && planRef.tierSource === 'cn-official' ? planRef : null
+      const refMin = officialTier !== null ? officialTier.minCNY : manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.minCNY
+      const refMax = officialTier !== null ? officialTier.maxCNY : manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.maxCNY
+      const refSource =
+        officialTier !== null ? 'tier' : manualMonthly !== null ? (paid !== null ? 'paid' : 'manual') : planRef === null ? null : 'plan'
       /**
        * 额度池订阅（quota-pool）：按「用掉的额度 / 该模型额度」的比例，从基础价里扣。
        *
@@ -2391,6 +2435,9 @@ export async function collectUsage(ctx, options) {
         // 订阅时长 / 到期（界面「本期」那行用）
         termMonths: billing.termMonths(agg.provider),
         paid,
+        // 官方档位与计费挡位（2.7.4）：月付挡含「一次买俩月」的限时优惠
+        planTier: planTierId,
+        billingClass: billing.billingClass(agg.provider),
         // 展开明细：每个模型的等价金额（统一折成人民币）+ 折合月
         modelRows: agg.modelRows
           .slice()

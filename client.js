@@ -748,6 +748,15 @@ window.__ModuleLoader__.load({
 .ac-sub-term { width: 58px; }
 .ac-sub-unit { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-sub-term-quick { font-size: 10px; padding: 2px 7px; }
+/* 官方档位下拉 + 计费挡位标签（2.7.4） */
+.ac-tier-select { max-width: 220px; }
+.ac-bill-class { font-size: 9.5px; padding: 1px 6px; border-radius: 4px; font-weight: 600;
+  color: var(--dsw-alias-label-secondary, #8a8f98);
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.26)); }
+.ac-bill-class[data-class="monthly"] { color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 40%, transparent); }
+.ac-bill-class[data-class="yearly"] { color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 40%, transparent); }
 .ac-sub-cur { width: 46px; padding: 3px 4px; }
 .ac-sub-monthly { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-sub-monthly b { color: var(--dsw-alias-label-primary, inherit); }
@@ -2713,6 +2722,7 @@ window.__ModuleLoader__.load({
                           planType: null,
                           subscribedAt: null,
                           promoNote: null,
+                          planTier: null,
                         }),
                     },
                     '自动',
@@ -3076,6 +3086,53 @@ window.__ModuleLoader__.load({
                   )
                 : h('span', { className: 'ac-bill-auto-hint' }, '订阅表里没有这条线路的参考档，实付价自己填'),
             ),
+            // 官方档位下拉（2.7.4）：国内账号按国内官方价。选了档位参考价就按它的月付原价
+            bill.cnTiers
+              ? h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h('span', { className: 'ac-bill-label' }, '官方档位'),
+                  h(
+                    'select',
+                    {
+                      className: 'ac-sub-select ac-tier-select',
+                      disabled: busy,
+                      value: bill.planTier === null || bill.planTier === undefined ? '' : bill.planTier,
+                      title: '按官方页面给出的版本选（' + bill.cnTiers.label + '）。参考价按这一档的月付原价（国内价）算',
+                      onChange: (event) => setBilling(route.id, { planTier: event.target.value === '' ? null : event.target.value }),
+                    },
+                    h('option', { value: '' }, '未指定'),
+                    bill.cnTiers.tiers.map((t) =>
+                      h(
+                        'option',
+                        { key: t.id, value: t.id },
+                        t.official +
+                          (t.monthlyCNY === 0 ? '（免费）' : t.monthlyCNY !== null ? '（¥' + t.monthlyCNY + '/月）' : ''),
+                      ),
+                    ),
+                  ),
+                  (() => {
+                    const sel =
+                      bill.planTier && bill.cnTiers
+                        ? bill.cnTiers.tiers.find((t) => t.id === bill.planTier) || null
+                        : null
+                    if (sel === null) return h('span', { className: 'ac-bill-auto-hint' }, '选官方版本，参考价按国内月付原价')
+                    return h(
+                      'span',
+                      { className: 'ac-sub-suggest' },
+                      sel.monthlyCNY === 0
+                        ? '免费档 · ' + (sel.promoNote || '')
+                        : '官方月付 ¥' + sel.monthlyCNY + '/月',
+                      sel.promoCNY !== null && sel.promoCNY !== undefined
+                        ? ' · 当前促销 ¥' + sel.promoCNY + '（' + (sel.promoNote || '') + '）'
+                        : sel.promoNote
+                          ? ' · ' + sel.promoNote
+                          : '',
+                      sel.credits ? ' · 每月 ' + sel.credits + ' 积分' : '',
+                    )
+                  })(),
+                )
+              : null,
             h(
               'div',
               { className: 'ac-sub-detail-row' },
@@ -3119,8 +3176,8 @@ window.__ModuleLoader__.load({
                 }),
                 h('span', { className: 'ac-sub-unit' }, '个月'),
               ),
-              // 常用时长快捷按钮：月 / 季 / 年
-              ...[1, 3, 12].map((n) =>
+              // 常用时长快捷按钮：月 / 两月优惠 / 季 / 年
+              ...[1, 2, 3, 12].map((n) =>
                 h(
                   'button',
                   {
@@ -3129,10 +3186,18 @@ window.__ModuleLoader__.load({
                     className: 'ac-chip ac-sub-term-quick',
                     'data-on': (bill.termMonths || 1) === n ? '' : undefined,
                     disabled: busy,
+                    title: n === 2 ? '限时优惠一次买俩月 —— 仍归月付挡，不是季付' : undefined,
                     onClick: () => setBilling(route.id, { termMonths: n }),
                   },
-                  n === 1 ? '月付' : n === 3 ? '季付' : '年付',
+                  n === 1 ? '月付' : n === 2 ? '两月优惠' : n === 3 ? '季付' : '年付',
                 ),
+              ),
+              // 计费挡位标签（2.7.4）：两月优惠仍归月付挡
+              h(
+                'span',
+                { className: 'ac-bill-class', 'data-class': bill.billingClass || 'monthly' },
+                bill.billingClass === 'yearly' ? '年付挡' : bill.billingClass === 'quarterly' ? '多月包挡' : '月付挡',
+                (bill.termMonths || 1) === 2 ? '（限时优惠买俩月，仍按月付）' : '',
               ),
               period !== null
                 ? h(
@@ -3335,11 +3400,13 @@ window.__ModuleLoader__.load({
                   worth.refMax !== null && worth.refMax !== worth.refMin
                     ? fmtPrice(worth.refMin, 'CNY') + '–' + fmtPrice(worth.refMax, 'CNY')
                     : fmtPrice(worth.refMin, 'CNY'),
-                  worth.refSource === 'paid'
-                    ? '（本次实付 ÷ 订阅月数）'
-                    : worth.refSource === 'manual'
-                      ? '（你填的）'
-                      : '（套餐表）',
+                  worth.refSource === 'tier'
+                    ? '（官方档位·国内价）'
+                    : worth.refSource === 'paid'
+                      ? '（本次实付 ÷ 订阅月数）'
+                      : worth.refSource === 'manual'
+                        ? '（你填的）'
+                        : '（套餐表）',
                 )
               : null,
             verdict
@@ -3350,11 +3417,13 @@ window.__ModuleLoader__.load({
                     key: 'd',
                     'data-tone': verdict.tone,
                     title:
-                      worth.refSource === 'paid'
-                        ? '拿等价月费跟「本次实付 ÷ 订阅月数」比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
-                        : worth.refSource === 'manual'
-                          ? '拿等价月费跟你填的月费比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
-                          : '拿等价月费跟套餐表里这条线路的最低价档比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少',
+                      worth.refSource === 'tier'
+                        ? '拿等价月费跟你选的官方档位月付原价（国内价）比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
+                        : worth.refSource === 'paid'
+                          ? '拿等价月费跟「本次实付 ÷ 订阅月数」比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
+                          : worth.refSource === 'manual'
+                            ? '拿等价月费跟你填的月费比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
+                            : '拿等价月费跟套餐表里这条线路的最低价档比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少',
                   },
                   verdict.text,
                   worth.ratio === null ? '' : ' ' + worth.ratio.toFixed(2) + '×',
@@ -4024,13 +4093,15 @@ window.__ModuleLoader__.load({
             h(
               'span',
               { className: 'ac-worth-detail-sub' },
-              row.refSource === 'paid'
-                ? '本次实付 ÷ 订阅月数（年付摊到月）—— 在「接入情况」里填的'
-                : row.refSource === 'manual'
-                  ? '你在「接入情况」里填的数'
-                  : row.refSource === 'plan'
-                    ? '套餐表（plans.js）里这条线路对得上的档位，取最低一档比'
-                    : '没有参考价 —— 去「接入情况」这条线路右边填你实际付的月费',
+              row.refSource === 'tier'
+                ? '你选的官方档位月付原价（国内价，cn-tiers.js）—— 促销价另记在实付里'
+                : row.refSource === 'paid'
+                  ? '本次实付 ÷ 订阅月数（年付摊到月）—— 在「接入情况」里填的'
+                  : row.refSource === 'manual'
+                    ? '你在「接入情况」里填的数'
+                    : row.refSource === 'plan'
+                      ? '套餐表（plans.js）里这条线路对得上的档位，取最低一档比'
+                      : '没有参考价 —— 去「接入情况」这条线路右边填你实际付的月费',
             ),
           ),
           planRef.length > 0
@@ -5067,11 +5138,13 @@ window.__ModuleLoader__.load({
                             (row.refMax !== null && row.refMax !== row.refMin
                               ? fmtPrice(row.refMin, 'CNY') + '–' + fmtPrice(row.refMax, 'CNY')
                               : fmtPrice(row.refMin, 'CNY')) +
-                            (row.refSource === 'paid'
-                              ? '（实付÷月数）'
-                              : row.refSource === 'manual'
-                                ? '（你填的）'
-                                : '（套餐表）'),
+                            (row.refSource === 'tier'
+                              ? '（官方档位·国内价）'
+                              : row.refSource === 'paid'
+                                ? '（实付÷月数）'
+                                : row.refSource === 'manual'
+                                  ? '（你填的）'
+                                  : '（套餐表）'),
                       ),
                       verdict
                         ? h(
