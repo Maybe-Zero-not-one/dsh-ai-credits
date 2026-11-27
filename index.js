@@ -58,7 +58,7 @@ function normalizeBillingEntry(value) {
       mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
       subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
       basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
-      autoRenew: null, accountPlan: null, accountSyncedAt: null,
+      autoRenew: null, accountPlan: null, accountSyncedAt: null, gifts: null,
     }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -126,16 +126,34 @@ function normalizeBillingEntry(value) {
     typeof value.accountSyncedAt === 'number' && Number.isFinite(value.accountSyncedAt) && value.accountSyncedAt > 0
       ? value.accountSyncedAt
       : null
+  // 赠金 / 免费 token 记录（2.7.6）—— 必须和 usage.js 的 normalizeGifts 镜像
+  let gifts = null
+  if (Array.isArray(value.gifts)) {
+    const rows = []
+    for (const row of value.gifts) {
+      if (!row || typeof row !== 'object') continue
+      const kind = row.kind === 'credit' || row.kind === 'tokens' ? row.kind : null
+      const amount = typeof row.amount === 'number' && Number.isFinite(row.amount) && row.amount > 0 ? row.amount : null
+      if (kind === null || amount === null) continue
+      const units = kind === 'credit' ? ['CNY', 'USD'] : ['raw', 'K', 'M', 'B']
+      const unit = units.includes(row.unit) ? row.unit : units[0]
+      const note = typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null
+      const at = typeof row.at === 'number' && Number.isFinite(row.at) && row.at > 0 ? row.at : Date.now()
+      rows.push({ kind, amount, unit, note, at })
+      if (rows.length >= 60) break
+    }
+    if (rows.length > 0) gifts = rows
+  }
   const empty =
     mode === null && estimate === false && monthlyCNY === null && planType === null &&
     subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
     basePrice === null && quotaPools === null && planTier === null &&
-    autoRenew === null && accountPlan === null && accountSyncedAt === null
+    autoRenew === null && accountPlan === null && accountSyncedAt === null && gifts === null
   if (empty) return null
   return {
     mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
     termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
-    autoRenew, accountPlan, accountSyncedAt,
+    autoRenew, accountPlan, accountSyncedAt, gifts,
   }
 }
 
@@ -185,6 +203,7 @@ function saveBillingOverrides(overrides) {
     if (typeof entry.autoRenew === 'boolean') value.autoRenew = entry.autoRenew
     if (entry.accountPlan && typeof entry.accountPlan === 'object') value.accountPlan = entry.accountPlan
     if (entry.accountSyncedAt !== null && entry.accountSyncedAt !== undefined) value.accountSyncedAt = entry.accountSyncedAt
+    if (Array.isArray(entry.gifts) && entry.gifts.length > 0) value.gifts = entry.gifts
     if (Object.keys(value).length > 0) compact[provider] = value
   }
   const tmp = BILLING_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
@@ -228,6 +247,7 @@ function reconcileBillingOverrides(overrides) {
         autoRenew: entry.autoRenew === undefined ? null : entry.autoRenew,
         accountPlan: entry.accountPlan === undefined ? null : entry.accountPlan,
         accountSyncedAt: entry.accountSyncedAt === undefined ? null : entry.accountSyncedAt,
+        gifts: entry.gifts === undefined ? null : entry.gifts,
       }
       if (
         kept.estimate === false &&
@@ -242,7 +262,8 @@ function reconcileBillingOverrides(overrides) {
         kept.planTier === null &&
         kept.autoRenew === null &&
         kept.accountPlan === null &&
-        kept.accountSyncedAt === null
+        kept.accountSyncedAt === null &&
+        kept.gifts === null
       ) {
         continue
       }
@@ -1825,6 +1846,35 @@ export function apply(ctx, config) {
             return
           }
         }
+        // gifts（2.7.6）：赠金 / 免费 token 记录，整表替换（前端加一条/删一条都发全量）
+        const gifts = parsed.gifts
+        if (gifts !== undefined && gifts !== null) {
+          if (!Array.isArray(gifts)) {
+            sendJson(res, 400, { ok: false, error: 'gifts 要数组 [{kind,amount,unit,note,at}]，或 null' })
+            return
+          }
+          if (gifts.length > 60) {
+            sendJson(res, 400, { ok: false, error: 'gifts 最多 60 条' })
+            return
+          }
+          for (const row of gifts) {
+            const kind = row && row.kind
+            const amount = row ? Number(row.amount) : NaN
+            if (kind !== 'credit' && kind !== 'tokens') {
+              sendJson(res, 400, { ok: false, error: 'gifts 每条 kind 要 credit（赠金）/ tokens（免费 token）' })
+              return
+            }
+            if (!Number.isFinite(amount) || amount <= 0) {
+              sendJson(res, 400, { ok: false, error: 'gifts 每条 amount 要正数' })
+              return
+            }
+            const units = kind === 'credit' ? ['CNY', 'USD'] : ['raw', 'K', 'M', 'B']
+            if (row.unit !== undefined && row.unit !== null && !units.includes(row.unit)) {
+              sendJson(res, 400, { ok: false, error: 'gifts unit：赠金 CNY/USD，token raw/K/M/B' })
+              return
+            }
+          }
+        }
         try {
           const overrides = loadBillingOverrides()
           const current = overrides[provider] || {}
@@ -1845,6 +1895,7 @@ export function apply(ctx, config) {
             autoRenew: current.autoRenew === undefined ? null : current.autoRenew,
             accountPlan: current.accountPlan === undefined ? null : current.accountPlan,
             accountSyncedAt: current.accountSyncedAt === undefined ? null : current.accountSyncedAt,
+            gifts: current.gifts === undefined ? null : current.gifts,
           }
           if (touchMode) next.mode = mode
           if (estimate !== undefined) next.estimate = estimate
@@ -1895,6 +1946,19 @@ export function apply(ctx, config) {
           }
           if (accountSyncedAt !== undefined) {
             next.accountSyncedAt = accountSyncedAt === null ? null : Number(accountSyncedAt)
+          }
+          if (gifts !== undefined) {
+            next.gifts =
+              gifts === null
+                ? null
+                : gifts.map((row) => ({
+                    kind: row.kind,
+                    amount: Number(row.amount),
+                    unit: row.unit === undefined || row.unit === null ? (row.kind === 'credit' ? 'CNY' : 'raw') : row.unit,
+                    note: typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null,
+                    at: typeof row.at === 'number' && row.at > 0 ? row.at : Date.now(),
+                  }))
+            if (Array.isArray(next.gifts) && next.gifts.length === 0) next.gifts = null
           }
           // 落盘前归一：accountPlan 里的脏字段在这一步被裁掉；全空就整条删掉
           const normalized = normalizeBillingEntry(next)

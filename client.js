@@ -883,6 +883,29 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-state-warn-primary, #c08a2e);
   border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 40%, transparent); }
 .ac-quota-note { margin-top: 5px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
+/* 赠金 / 免费 token 记账（2.7.6） */
+.ac-gifts { margin-top: 7px; padding-top: 7px;
+  border-top: 1px dashed color-mix(in srgb, var(--dsw-alias-state-ok-primary, #3aa76d) 35%, transparent); }
+.ac-gift-amount { width: 90px; }
+.ac-gift-note { flex: 1; min-width: 140px; }
+.ac-gift-list { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+.ac-gift-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 10.5px;
+  padding: 3px 8px; border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
+.ac-gift-kind { font-size: 9.5px; padding: 0 5px; border-radius: 4px; font-weight: 600; }
+.ac-gift-kind[data-kind="credit"] { color: var(--dsw-alias-state-ok-primary, #3aa76d);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-ok-primary, #3aa76d) 40%, transparent); }
+.ac-gift-kind[data-kind="tokens"] { color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 40%, transparent); }
+.ac-gift-amount { font-size: 11.5px; }
+.ac-gift-note-text { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-gift-at { margin-left: auto; font-size: 9.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-gift-del { border: none; background: none; cursor: pointer; font-size: 10px; padding: 1px 4px;
+  color: var(--dsw-alias-label-secondary, #8a8f98); border-radius: 4px; }
+.ac-gift-del:hover { color: var(--dsw-alias-state-danger-primary, #d9534f);
+  background: color-mix(in srgb, var(--dsw-alias-state-danger-primary, #d9534f) 12%, transparent); }
+.ac-gift-total { margin-top: 5px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-gift-total b { color: var(--dsw-alias-label-primary, inherit); }
 .ac-models { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .ac-model-chip { font-size: 10.5px; padding: 3px 7px; border-radius: 6px; font-family: ui-monospace, monospace;
   color: var(--dsw-alias-label-secondary, #8a8f98);
@@ -1206,6 +1229,8 @@ window.__ModuleLoader__.load({
       // Go 官方额度全表展开 + 表内检索词（2.7.3）
       const [goTableOpen, setGoTableOpen] = React.useState(false)
       const [goTableQuery, setGoTableQuery] = React.useState('')
+      // 赠金 / 免费 token 输入草稿（2.7.6）：按线路 id 存，每输入一条记一条
+      const [giftDraft, setGiftDraft] = React.useState({})
 
       const load = React.useCallback(async () => {
         try {
@@ -2948,6 +2973,167 @@ window.__ModuleLoader__.load({
           })()
 
           /**
+           * 赠金 / 免费 token 记账（2.7.6）：每输入一条就记一条。
+           *
+           * 一条 = { kind: credit 赠金 / tokens 免费token, amount, unit, note, at }。
+           * 只记账不参与「值不值」折算 —— 赠金不是订阅费。整表替换式提交：
+           * 加一条 / 删一条都把全量 gifts POST 给宿主，落 billing.json。
+           */
+          const giftsRow = (() => {
+            const gifts = Array.isArray(bill.gifts) ? bill.gifts : []
+            const totals = bill.giftTotals || null
+            const draft = giftDraft[route.id] || { kind: 'credit', amount: '', unit: 'CNY', note: '' }
+            const patchDraft = (p) => setGiftDraft((prev) => ({ ...prev, [route.id]: { ...draft, ...p } }))
+            const fmtTokens = (n) => {
+              if (typeof n !== 'number' || !Number.isFinite(n)) return '—'
+              if (n >= 1e9) return (n / 1e9).toFixed(n % 1e9 === 0 ? 0 : 2) + 'B'
+              if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 2) + 'M'
+              if (n >= 1e3) return (n / 1e3).toFixed(n % 1e3 === 0 ? 0 : 1) + 'K'
+              return String(n)
+            }
+            const addOne = () => {
+              const amount = Number(draft.amount)
+              if (!Number.isFinite(amount) || amount <= 0) return
+              const unit =
+                draft.kind === 'credit'
+                  ? draft.unit === 'USD' ? 'USD' : 'CNY'
+                  : ['raw', 'K', 'M', 'B'].includes(draft.unit) ? draft.unit : 'raw'
+              const row = {
+                kind: draft.kind,
+                amount,
+                unit,
+                note: String(draft.note || '').trim().slice(0, 80) || null,
+                at: Date.now(),
+              }
+              setBilling(route.id, { gifts: [...gifts, row].slice(0, 60) })
+              patchDraft({ amount: '', note: '' })
+            }
+            const removeOne = (idx) => {
+              const next = gifts.filter((_, i) => i !== idx)
+              setBilling(route.id, { gifts: next.length > 0 ? next : null })
+            }
+            return h(
+              'div',
+              { className: 'ac-gifts' },
+              h(
+                'div',
+                { className: 'ac-sub-detail-row' },
+                h('span', { className: 'ac-bill-label' }, '赠金 / 免费token'),
+                h(
+                  'select',
+                  {
+                    className: 'ac-sub-select',
+                    disabled: busy,
+                    value: draft.kind,
+                    title: '赠金 = 送的钱（¥/$）；免费 token = 送的 token 额度（个/K/M/B）',
+                    onChange: (e) => patchDraft({ kind: e.target.value, unit: e.target.value === 'credit' ? 'CNY' : 'M' }),
+                  },
+                  h('option', { value: 'credit' }, '赠金'),
+                  h('option', { value: 'tokens' }, '免费 token 额度'),
+                ),
+                h('input', {
+                  type: 'number',
+                  className: 'ac-sub-input ac-gift-amount',
+                  value: draft.amount,
+                  placeholder: draft.kind === 'credit' ? '金额' : '数量',
+                  min: 0,
+                  step: 'any',
+                  disabled: busy,
+                  onChange: (e) => patchDraft({ amount: e.target.value }),
+                  onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
+                }),
+                h(
+                  'select',
+                  {
+                    className: 'ac-sub-select ac-sub-cur',
+                    disabled: busy,
+                    value: draft.unit,
+                    onChange: (e) => patchDraft({ unit: e.target.value }),
+                  },
+                  draft.kind === 'credit'
+                    ? [h('option', { key: 'CNY', value: 'CNY' }, '¥'), h('option', { key: 'USD', value: 'USD' }, '$')]
+                    : [
+                        h('option', { key: 'raw', value: 'raw' }, '个'),
+                        h('option', { key: 'K', value: 'K' }, 'K 千'),
+                        h('option', { key: 'M', value: 'M' }, 'M 百万'),
+                        h('option', { key: 'B', value: 'B' }, 'B 十亿'),
+                      ],
+                ),
+                h('input', {
+                  type: 'text',
+                  className: 'ac-sub-input ac-gift-note',
+                  value: draft.note,
+                  placeholder: '备注（来源 / 活动名，可空）',
+                  maxLength: 80,
+                  disabled: busy,
+                  onChange: (e) => patchDraft({ note: e.target.value }),
+                  onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
+                }),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'ac-chip',
+                    disabled: busy || !(Number(draft.amount) > 0),
+                    title: '记一条：每输入一条就存一条，落在后台 billing.json',
+                    onClick: addOne,
+                  },
+                  '记一条',
+                ),
+              ),
+              gifts.length > 0
+                ? h(
+                    'div',
+                    { className: 'ac-gift-list' },
+                    ...gifts.map((g, idx) =>
+                      h(
+                        'div',
+                        { className: 'ac-gift-row', key: String(g.at) + '-' + idx },
+                        h(
+                          'span',
+                          { className: 'ac-gift-kind', 'data-kind': g.kind },
+                          g.kind === 'credit' ? '赠金' : '免费token',
+                        ),
+                        h(
+                          'b',
+                          { className: 'ac-gift-amount' },
+                          g.kind === 'credit'
+                            ? (g.unit === 'USD' ? '$' : '¥') + g.amount
+                            : g.amount + (g.unit === 'raw' ? ' 个' : ' ' + g.unit),
+                        ),
+                        g.note ? h('span', { className: 'ac-gift-note-text' }, g.note) : null,
+                        h('span', { className: 'ac-gift-at' }, (() => { const d = new Date(g.at); return (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') })()),
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'ac-gift-del',
+                            disabled: busy,
+                            title: '删掉这条记录',
+                            onClick: () => removeOne(idx),
+                          },
+                          '✕',
+                        ),
+                      ),
+                    ),
+                  )
+                : null,
+              totals !== null
+                ? h(
+                    'div',
+                    { className: 'ac-gift-total' },
+                    '已记 ',
+                    h('b', null, String(totals.count)),
+                    ' 条',
+                    totals.creditCount > 0 ? ' · 赠金合计 ' + fmtPrice(totals.creditCNY, 'CNY') : '',
+                    totals.tokenCount > 0 ? ' · 免费 token 合计 ' + fmtTokens(totals.tokensRaw) + ' 个' : '',
+                    '（只记账，不参与「值不值」折算）',
+                  )
+                : h('div', { className: 'ac-bill-auto-hint' }, '领到的赠金 / 免费 token 额度在这里逐条记，不参与折算'),
+            )
+          })()
+
+          /**
            * 额度池订阅（2.7.1）—— OpenCode Go 那种：
            * 付 $10 基础价，各家模型各给一笔额度（DeepSeek $100、Kimi K3 $15…），
            * 用掉多少就按「用掉的 / 该模型额度」的比例，从基础价里扣掉对应的钱。
@@ -3589,6 +3775,7 @@ window.__ModuleLoader__.load({
                 )
               : null,
             quotaPoolRow,
+            giftsRow,
           )
         })()
 

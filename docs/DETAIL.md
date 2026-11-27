@@ -175,6 +175,13 @@ plans.js 的 Qoder / WorkBuddy 条目是**国际版 USD 价**，国内账号拿�
 - **`accountPlan` / `accountSyncedAt`**：账户订阅快照 `{ name, planName, planTier, expiresAt, periodStart, source, atMs }`。页面同源读连接器：Qoder `credits.planExpiresAtMs`；WorkBuddy `credits.packages` 里 `monthly:true` 的包名（「CodeBuddy个人体验版」）+ `cycleRefreshMs`；**CodeArts 走 `/api/codearts/status` 的 `credits.credits`（planName / periodStart / periodEnd，最全）**；Trae 只给账号列表，读不到就明说。⚠ **金额（首次订阅时间 / 实付）账户里没有**，永远手填；有效期靠 subscriptionPeriod 从首订日推算对齐。「对齐到账户」按钮把快照 POST 进 billing.json，`matchTierByName` 按关键词（体验版→free、专业→pro…）对上官方档位时顺手选 planTier。
 - 新字段全链路：normalize（usage.js + index.js 两份必须镜像）/ saveBillingOverrides 紧凑写 / reconcile 保留 / POST 校验（autoRenew 认布尔、accountPlan 认对象、accountSyncedAt 认正毫秒）。
 
+### 订阅形式排序与赠金记账（2.7.6）
+
+- **`PLAN_TYPES` 顺序即下拉顺序**：`agent-plan → coding-plan → token-plan → quota-pool → token-pack → other`（「未指定」是前端单独加的第一项）。改顺序要同步 `test-subscription.mjs` 的枚举断言。
+- **`gifts`**：`[{ kind: 'credit'|'tokens', amount>0, unit, note≤80, at }]`，最多 60 条。赠金 unit ∈ CNY/USD（缺省 CNY），token unit ∈ raw/K/M/B（缺省 raw）。`normalizeGifts`（usage.js）与 index.js 的镜像归一**必须同步改**。POST /billing **整表替换**：前端加/删一条都发全量数组。
+- **`giftTotals(gifts)`**（usage.js 导出 + describeBilling 贯通）：赠金折 CNY（USD×7.2）、token 折「个」（K=1e3/M=1e6/B=1e9），返回 `{creditCNY, tokensRaw, creditCount, tokenCount, count}`。
+- **只记账不参与折算**：gifts 不进 effectiveMonthlyCNY / subscriptionWorth，也不影响 resettable。界面 `giftsRow` 在 subscriptionRow 里（quotaPoolRow 之后），草稿态按线路 id 存 `giftDraft`。
+
 ⚠ `accountsPanel` 在 routeCard 里（约 2497 行），**不能引用用量栏的 `fmtCredits`**（3655 行才声明，const 箭头函数不提升 → TDZ → 整页消失，坑 #1）。面板内自带 `fmtAccCredits`。
 
 ## 用量花费怎么算

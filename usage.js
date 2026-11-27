@@ -1111,14 +1111,14 @@ const BILLING_LABEL_FOLDED = '订阅 · 折算'
  * 单独留一档；`quota-pool` 是**额度池订阅**（OpenCode Go 那种：付 $10，各家模型
  * 各给一笔美元额度，用掉的按比例折回那 $10 上扣）；`other` 兜住没归进上面几类的。
  */
-const PLAN_TYPES = ['agent-plan', 'token-plan', 'coding-plan', 'token-pack', 'quota-pool', 'other']
+const PLAN_TYPES = ['agent-plan', 'coding-plan', 'token-plan', 'quota-pool', 'token-pack', 'other']
 
 const PLAN_TYPE_LABELS = {
   'agent-plan': 'Agent Plan',
-  'token-plan': 'Token Plan',
   'coding-plan': 'Coding Plan',
-  'token-pack': '特价 token 包',
+  'token-plan': 'Token Plan',
   'quota-pool': '额度池订阅',
+  'token-pack': '特价 token 包',
   other: '其他订阅',
 }
 
@@ -1309,6 +1309,65 @@ export function subscriptionPeriod(subscribedAt, nowMs, termMonths, autoRenew) {
 }
 
 /**
+ * 赠金 / 免费 token 额度记录（2.7.6）。
+ *
+ * 主人要「每输入一条就记一条」：一条 = { kind, amount, unit, note, at }。
+ *   kind   'credit' 赠金（钱，¥/$）| 'tokens' 免费 token 额度（个）
+ *   unit   赠金：CNY / USD；token：raw 个 / K 千 / M 百万 / B 十亿
+ *   amount 正数（按 unit 的原值，不做换算存储，展示时再折）
+ *   note   备注（来源 / 活动名），≤80 字
+ *   at     记录时间戳（毫秒）
+ * 只记账不参与折算 —— 赠金不是订阅费，别混进「值不值」的比较里。
+ * 一条订阅最多记 60 条，防滥用。
+ */
+const GIFT_KINDS = ['credit', 'tokens']
+const GIFT_UNITS = { credit: ['CNY', 'USD'], tokens: ['raw', 'K', 'M', 'B'] }
+
+function normalizeGifts(value) {
+  if (!Array.isArray(value)) return null
+  const rows = []
+  for (const row of value) {
+    if (!row || typeof row !== 'object') continue
+    const kind = GIFT_KINDS.includes(row.kind) ? row.kind : null
+    const amount = typeof row.amount === 'number' && Number.isFinite(row.amount) && row.amount > 0 ? row.amount : null
+    if (kind === null || amount === null) continue
+    const unit = GIFT_UNITS[kind].includes(row.unit) ? row.unit : GIFT_UNITS[kind][0]
+    const note = typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null
+    const at = typeof row.at === 'number' && Number.isFinite(row.at) && row.at > 0 ? row.at : Date.now()
+    rows.push({ kind, amount, unit, note, at })
+    if (rows.length >= 60) break
+  }
+  return rows.length > 0 ? rows : null
+}
+
+/** 赠金记录汇总：赠金折 CNY 总额 + 免费 token 折「个」总额（展示用） */
+export function giftTotals(gifts) {
+  if (!Array.isArray(gifts) || gifts.length === 0) return null
+  let creditCNY = 0
+  let tokensRaw = 0
+  let creditCount = 0
+  let tokenCount = 0
+  const TOKEN_SCALE = { raw: 1, K: 1e3, M: 1e6, B: 1e9 }
+  for (const g of gifts) {
+    if (!g || typeof g.amount !== 'number') continue
+    if (g.kind === 'credit') {
+      creditCNY += g.unit === 'USD' ? g.amount * USD_TO_CNY : g.amount
+      creditCount += 1
+    } else if (g.kind === 'tokens') {
+      tokensRaw += g.amount * (TOKEN_SCALE[g.unit] || 1)
+      tokenCount += 1
+    }
+  }
+  return {
+    creditCNY: Number(creditCNY.toFixed(2)),
+    tokensRaw,
+    creditCount,
+    tokenCount,
+    count: gifts.length,
+  }
+}
+
+/**
  * 覆盖表一条记录的真身。
  *
  * 历史写法是 `{ 线路id: 'token' }`（纯字符串），2.4.8 起允许
@@ -1324,7 +1383,7 @@ function normalizeOverrideEntry(value) {
       mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
       subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
       basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
-      autoRenew: null, accountPlan: null, accountSyncedAt: null,
+      autoRenew: null, accountPlan: null, accountSyncedAt: null, gifts: null,
     }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -1404,16 +1463,18 @@ function normalizeOverrideEntry(value) {
     typeof value.accountSyncedAt === 'number' && Number.isFinite(value.accountSyncedAt) && value.accountSyncedAt > 0
       ? value.accountSyncedAt
       : null
+  // 赠金 / 免费 token 记录（2.7.6）：逐条记账，不参与折算
+  const gifts = normalizeGifts(value.gifts)
   const empty =
     mode === null && estimate === false && monthlyCNY === null && planType === null &&
     subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
     basePrice === null && quotaPools === null && planTier === null &&
-    autoRenew === null && accountPlan === null && accountSyncedAt === null
+    autoRenew === null && accountPlan === null && accountSyncedAt === null && gifts === null
   if (empty) return null
   return {
     mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
     termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
-    autoRenew, accountPlan, accountSyncedAt,
+    autoRenew, accountPlan, accountSyncedAt, gifts,
   }
 }
 
@@ -1547,6 +1608,11 @@ function billingRules(overrides) {
       const entry = entryOf(provider)
       return entry === null ? null : entry.accountSyncedAt
     },
+    /** 赠金 / 免费 token 记录（2.7.6），没记过 null */
+    gifts: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.gifts
+    },
     /**
      * 「自动」按钮要不要出现（2.7.5）：有**用户意图**才出现。
      *
@@ -1660,6 +1726,9 @@ export function describeBilling(overrides) {
     accountPlan: (provider) => rules.accountPlan(provider),
     accountSyncedAt: (provider) => rules.accountSyncedAt(provider),
     resettable: (provider) => rules.resettable(provider),
+    /** 赠金 / 免费 token 记录与汇总（2.7.6） */
+    gifts: (provider) => rules.gifts(provider),
+    giftTotals: (provider) => giftTotals(rules.gifts(provider)),
     /** 本地 CLI agent 的本机登录态（2.7.2）；不是这类线路返回 null */
     localCli: (provider) => {
       if (!isLocalCliAgent(provider)) return null
