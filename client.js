@@ -262,6 +262,69 @@ window.__ModuleLoader__.load({
       return null
     }
 
+    /**
+     * 周期账（2.7.7 前端镜像版）：给「按账户投影」的记录算当前有效期。
+     * 口径与宿主 subscriptionPeriod 一致：autoRenew !== false 时到期 = 包含今天的本期结束。
+     * 只用于多账户选中时的展示；线路级记录仍用宿主算好的 period。
+     */
+    const periodOf = (subscribedAt, termMonths, autoRenew) => {
+      if (typeof subscribedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(subscribedAt)) return null
+      const start = new Date(subscribedAt + 'T00:00:00')
+      if (Number.isNaN(start.getTime())) return null
+      const now = new Date()
+      if (now < start) return null
+      const term = typeof termMonths === 'number' && termMonths >= 1 && termMonths <= 120 ? Math.floor(termMonths) : 1
+      const renew = autoRenew !== false
+      const addMonths = (n) => {
+        const d = new Date(start.getFullYear(), start.getMonth() + n, 1)
+        const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()
+        d.setDate(Math.min(start.getDate(), lastDay))
+        return d
+      }
+      let idx = 0
+      while (idx < 1200 && addMonths((idx + 1) * term) <= now) idx += 1
+      const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      const termEnd = renew ? addMonths((idx + 1) * term) : addMonths(term)
+      return {
+        periodIndex: idx + 1,
+        periodStart: fmt(addMonths(idx * term)),
+        periodEnd: fmt(addMonths((idx + 1) * term)),
+        daysSince: Math.floor((now - start) / 86400000),
+        termMonths: term,
+        expiresAt: fmt(termEnd),
+        daysLeft: Math.ceil((termEnd - now) / 86400000),
+        expired: termEnd <= now,
+        autoRenew: renew,
+      }
+    }
+
+    /** 赠送汇总（2.7.7 前端镜像版）：给按账户投影的记录算合计，口径与宿主 giftTotals 一致 */
+    const giftTotalsOf = (gifts) => {
+      if (!Array.isArray(gifts) || gifts.length === 0) return null
+      let creditCNY = 0
+      let pointsRaw = 0
+      let tokensRaw = 0
+      let creditCount = 0
+      let pointsCount = 0
+      let tokenCount = 0
+      const SCALE = { raw: 1, K: 1e3, M: 1e6, B: 1e9 }
+      for (const g of gifts) {
+        if (!g || typeof g.amount !== 'number') continue
+        if (g.kind === 'credit') { creditCNY += g.unit === 'USD' ? g.amount * 7.2 : g.amount; creditCount += 1 }
+        else if (g.kind === 'points') { pointsRaw += g.amount; pointsCount += 1 }
+        else if (g.kind === 'tokens') { tokensRaw += g.amount * (SCALE[g.unit] || 1); tokenCount += 1 }
+      }
+      return {
+        creditCNY: Number(creditCNY.toFixed(2)),
+        pointsRaw: Number(pointsRaw.toFixed(2)),
+        tokensRaw,
+        creditCount,
+        pointsCount,
+        tokenCount,
+        count: gifts.length,
+      }
+    }
+
     const fetchCreditBalances = async () => {
       const out = {}
       await Promise.all(
@@ -906,6 +969,16 @@ window.__ModuleLoader__.load({
   background: color-mix(in srgb, var(--dsw-alias-state-danger-primary, #d9534f) 12%, transparent); }
 .ac-gift-total { margin-top: 5px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-gift-total b { color: var(--dsw-alias-label-primary, inherit); }
+.ac-gift-kind[data-kind="points"] { color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 40%, transparent); }
+/* 多账户设置选择（2.7.7） */
+.ac-acc-edit { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 7px;
+  padding: 6px 10px; border-radius: 8px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 22%, transparent); }
+.ac-acc-select { max-width: 260px; }
+.ac-acc-edit-hint { font-size: 10.5px; color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-acc-edit-hint b { font-weight: 600; }
 .ac-models { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .ac-model-chip { font-size: 10.5px; padding: 3px 7px; border-radius: 6px; font-family: ui-monospace, monospace;
   color: var(--dsw-alias-label-secondary, #8a8f98);
@@ -1229,8 +1302,10 @@ window.__ModuleLoader__.load({
       // Go 官方额度全表展开 + 表内检索词（2.7.3）
       const [goTableOpen, setGoTableOpen] = React.useState(false)
       const [goTableQuery, setGoTableQuery] = React.useState('')
-      // 赠金 / 免费 token 输入草稿（2.7.6）：按线路 id 存，每输入一条记一条
+      // 「赠送」输入草稿（2.7.6 起）：按线路 id 存，每输入一条记一条
       const [giftDraft, setGiftDraft] = React.useState({})
+      // 多账户设置选择（2.7.7）：{ 线路id: 账户id }，null/缺省 = 整条渠道
+      const [accountEdit, setAccountEdit] = React.useState({})
 
       const load = React.useCallback(async () => {
         try {
@@ -2711,10 +2786,78 @@ window.__ModuleLoader__.load({
       const routeCard = (route) => {
         const isDefault = dshDefault !== null && dshDefault.provider === route.id
         const keyState = keyStateOf(route.credential)
-        const bill = route.billing || null
+        const rawBill = route.billing || null
         // 多账号（2.7.1）：账号列表由页面问连接器 /usage 拿的，挂在 usage.creditBalances 上
         const accountBook = usageCreditBooks[route.id]
         const accountsInfo = accountBook && accountBook.accounts ? accountBook.accounts : null
+        /**
+         * 多账户设置选择（2.7.7）：这条渠道加了多个账号时，可以选「给哪个账号记设置」。
+         * 选中某个账号后，下面的订阅表单 / 赠送记录读写的都是**那个账号自己的账**
+         * （billing.json 的 accountEntries[账户id]）；「整条渠道」才是线路级记录。
+         * 计费口径按钮（API按量/订阅/折算）始终是线路级的，不随账号变。
+         */
+        const accSel = accountEdit[route.id] || null
+        const accValid =
+          accSel !== null && accountsInfo !== null && accountsInfo.accounts.some((a) => a.id === accSel)
+        const activeAcc = accValid ? accSel : null
+        const accEntry =
+          activeAcc !== null && rawBill && rawBill.accountEntries && rawBill.accountEntries[activeAcc]
+            ? rawBill.accountEntries[activeAcc]
+            : null
+        // 选中账号时把它的记录「投影」成 bill 的形状，表单代码不用改；
+        // mode/auto/label 这些线路级字段保持原样。没填过的字段给 null，别漏出线路级的值。
+        const bill = (() => {
+          if (rawBill === null) return null
+          if (activeAcc === null) return rawBill
+          const e = accEntry || {}
+          const term = typeof e.termMonths === 'number' ? e.termMonths : null
+          const subAt = typeof e.subscribedAt === 'string' ? e.subscribedAt : null
+          const paidTotal = typeof e.paidTotal === 'number' ? e.paidTotal : null
+          return {
+            ...rawBill,
+            planType: e.planType || null,
+            planTypeLabel: e.planType && dshBilling && dshBilling.planTypeLabels ? dshBilling.planTypeLabels[e.planType] || null : null,
+            subscribedAt: subAt,
+            promoNote: e.promoNote || null,
+            termMonths: term,
+            paid: paidTotal !== null ? { total: paidTotal, currency: e.paidCurrency || 'CNY' } : null,
+            monthlyCNY: typeof e.monthlyCNY === 'number' ? e.monthlyCNY : null,
+            effectiveMonthlyCNY:
+              paidTotal !== null
+                ? Number(((e.paidCurrency === 'USD' ? paidTotal * 7.2 : paidTotal) / (term || 1)).toFixed(4))
+                : typeof e.monthlyCNY === 'number' ? e.monthlyCNY : null,
+            planTier: e.planTier || null,
+            autoRenew: typeof e.autoRenew === 'boolean' ? e.autoRenew : null,
+            accountPlan: e.accountPlan || null,
+            accountSyncedAt: typeof e.accountSyncedAt === 'number' ? e.accountSyncedAt : null,
+            gifts: Array.isArray(e.gifts) ? e.gifts : null,
+            giftTotals: giftTotalsOf(e.gifts),
+            quotaPoolConfig:
+              typeof e.basePrice === 'number' && Array.isArray(e.quotaPools)
+                ? { basePrice: e.basePrice, baseCurrency: e.baseCurrency || 'USD', pools: e.quotaPools }
+                : null,
+            billingClass: term === null || term <= 2 ? 'monthly' : term < 12 ? 'quarterly' : 'yearly',
+            period: subAt !== null ? periodOf(subAt, term, typeof e.autoRenew === 'boolean' ? e.autoRenew : null) : null,
+            planSuggestion: rawBill.planSuggestion,
+          }
+        })()
+        /** 表单写回：选了账号就整份替换那个账户的记录，否则走线路级 patch */
+        const setEntry = (patch) => {
+          if (activeAcc === null) {
+            setBilling(route.id, patch)
+            return
+          }
+          const base = accEntry || {}
+          const next = { ...base, ...patch }
+          // 清掉空字段，别把一堆 null 写进盘
+          for (const k of Object.keys(next)) {
+            if (next[k] === null || next[k] === undefined || next[k] === false) delete next[k]
+          }
+          const entries = { ...((rawBill && rawBill.accountEntries) || {}) }
+          if (Object.keys(next).length > 0) entries[activeAcc] = next
+          else delete entries[activeAcc]
+          setBilling(route.id, { accountEntries: Object.keys(entries).length > 0 ? entries : null })
+        }
         // 缺密钥的线路通常读不到模型清单，这时候别说「没报模型」，会让人以为线路坏了
         const countText =
           route.modelCount > 0
@@ -2939,7 +3082,7 @@ window.__ModuleLoader__.load({
               }
               // 档位没选过且名字对得上 → 顺手把官方档位也选上
               if (matchedTier !== null && (bill.planTier === null || bill.planTier === undefined)) patch.planTier = matchedTier
-              setBilling(route.id, patch)
+              setEntry(patch)
             }
             return h(
               'div',
@@ -2969,167 +3112,6 @@ window.__ModuleLoader__.load({
               matchedTier !== null && bill.planTier !== matchedTier
                 ? h('span', { className: 'ac-bill-auto-hint' }, '名字对上官方档位「' + matchedTier + '」，点对齐会一起选上')
                 : null,
-            )
-          })()
-
-          /**
-           * 赠金 / 免费 token 记账（2.7.6）：每输入一条就记一条。
-           *
-           * 一条 = { kind: credit 赠金 / tokens 免费token, amount, unit, note, at }。
-           * 只记账不参与「值不值」折算 —— 赠金不是订阅费。整表替换式提交：
-           * 加一条 / 删一条都把全量 gifts POST 给宿主，落 billing.json。
-           */
-          const giftsRow = (() => {
-            const gifts = Array.isArray(bill.gifts) ? bill.gifts : []
-            const totals = bill.giftTotals || null
-            const draft = giftDraft[route.id] || { kind: 'credit', amount: '', unit: 'CNY', note: '' }
-            const patchDraft = (p) => setGiftDraft((prev) => ({ ...prev, [route.id]: { ...draft, ...p } }))
-            const fmtTokens = (n) => {
-              if (typeof n !== 'number' || !Number.isFinite(n)) return '—'
-              if (n >= 1e9) return (n / 1e9).toFixed(n % 1e9 === 0 ? 0 : 2) + 'B'
-              if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 2) + 'M'
-              if (n >= 1e3) return (n / 1e3).toFixed(n % 1e3 === 0 ? 0 : 1) + 'K'
-              return String(n)
-            }
-            const addOne = () => {
-              const amount = Number(draft.amount)
-              if (!Number.isFinite(amount) || amount <= 0) return
-              const unit =
-                draft.kind === 'credit'
-                  ? draft.unit === 'USD' ? 'USD' : 'CNY'
-                  : ['raw', 'K', 'M', 'B'].includes(draft.unit) ? draft.unit : 'raw'
-              const row = {
-                kind: draft.kind,
-                amount,
-                unit,
-                note: String(draft.note || '').trim().slice(0, 80) || null,
-                at: Date.now(),
-              }
-              setBilling(route.id, { gifts: [...gifts, row].slice(0, 60) })
-              patchDraft({ amount: '', note: '' })
-            }
-            const removeOne = (idx) => {
-              const next = gifts.filter((_, i) => i !== idx)
-              setBilling(route.id, { gifts: next.length > 0 ? next : null })
-            }
-            return h(
-              'div',
-              { className: 'ac-gifts' },
-              h(
-                'div',
-                { className: 'ac-sub-detail-row' },
-                h('span', { className: 'ac-bill-label' }, '赠金 / 免费token'),
-                h(
-                  'select',
-                  {
-                    className: 'ac-sub-select',
-                    disabled: busy,
-                    value: draft.kind,
-                    title: '赠金 = 送的钱（¥/$）；免费 token = 送的 token 额度（个/K/M/B）',
-                    onChange: (e) => patchDraft({ kind: e.target.value, unit: e.target.value === 'credit' ? 'CNY' : 'M' }),
-                  },
-                  h('option', { value: 'credit' }, '赠金'),
-                  h('option', { value: 'tokens' }, '免费 token 额度'),
-                ),
-                h('input', {
-                  type: 'number',
-                  className: 'ac-sub-input ac-gift-amount',
-                  value: draft.amount,
-                  placeholder: draft.kind === 'credit' ? '金额' : '数量',
-                  min: 0,
-                  step: 'any',
-                  disabled: busy,
-                  onChange: (e) => patchDraft({ amount: e.target.value }),
-                  onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
-                }),
-                h(
-                  'select',
-                  {
-                    className: 'ac-sub-select ac-sub-cur',
-                    disabled: busy,
-                    value: draft.unit,
-                    onChange: (e) => patchDraft({ unit: e.target.value }),
-                  },
-                  draft.kind === 'credit'
-                    ? [h('option', { key: 'CNY', value: 'CNY' }, '¥'), h('option', { key: 'USD', value: 'USD' }, '$')]
-                    : [
-                        h('option', { key: 'raw', value: 'raw' }, '个'),
-                        h('option', { key: 'K', value: 'K' }, 'K 千'),
-                        h('option', { key: 'M', value: 'M' }, 'M 百万'),
-                        h('option', { key: 'B', value: 'B' }, 'B 十亿'),
-                      ],
-                ),
-                h('input', {
-                  type: 'text',
-                  className: 'ac-sub-input ac-gift-note',
-                  value: draft.note,
-                  placeholder: '备注（来源 / 活动名，可空）',
-                  maxLength: 80,
-                  disabled: busy,
-                  onChange: (e) => patchDraft({ note: e.target.value }),
-                  onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
-                }),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'ac-chip',
-                    disabled: busy || !(Number(draft.amount) > 0),
-                    title: '记一条：每输入一条就存一条，落在后台 billing.json',
-                    onClick: addOne,
-                  },
-                  '记一条',
-                ),
-              ),
-              gifts.length > 0
-                ? h(
-                    'div',
-                    { className: 'ac-gift-list' },
-                    ...gifts.map((g, idx) =>
-                      h(
-                        'div',
-                        { className: 'ac-gift-row', key: String(g.at) + '-' + idx },
-                        h(
-                          'span',
-                          { className: 'ac-gift-kind', 'data-kind': g.kind },
-                          g.kind === 'credit' ? '赠金' : '免费token',
-                        ),
-                        h(
-                          'b',
-                          { className: 'ac-gift-amount' },
-                          g.kind === 'credit'
-                            ? (g.unit === 'USD' ? '$' : '¥') + g.amount
-                            : g.amount + (g.unit === 'raw' ? ' 个' : ' ' + g.unit),
-                        ),
-                        g.note ? h('span', { className: 'ac-gift-note-text' }, g.note) : null,
-                        h('span', { className: 'ac-gift-at' }, (() => { const d = new Date(g.at); return (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') })()),
-                        h(
-                          'button',
-                          {
-                            type: 'button',
-                            className: 'ac-gift-del',
-                            disabled: busy,
-                            title: '删掉这条记录',
-                            onClick: () => removeOne(idx),
-                          },
-                          '✕',
-                        ),
-                      ),
-                    ),
-                  )
-                : null,
-              totals !== null
-                ? h(
-                    'div',
-                    { className: 'ac-gift-total' },
-                    '已记 ',
-                    h('b', null, String(totals.count)),
-                    ' 条',
-                    totals.creditCount > 0 ? ' · 赠金合计 ' + fmtPrice(totals.creditCNY, 'CNY') : '',
-                    totals.tokenCount > 0 ? ' · 免费 token 合计 ' + fmtTokens(totals.tokensRaw) + ' 个' : '',
-                    '（只记账，不参与「值不值」折算）',
-                  )
-                : h('div', { className: 'ac-bill-auto-hint' }, '领到的赠金 / 免费 token 额度在这里逐条记，不参与折算'),
             )
           })()
 
@@ -3171,7 +3153,7 @@ window.__ModuleLoader__.load({
                           '按 OpenCode 官方额度表填：' + goSug.tierLabel + ' 档基础价 $' + goSug.basePrice +
                           '，' + goSug.pools.length + ' 个模型各自的月度额度。来源 ' + goSug.snapshotAt + ' 快照',
                         onClick: () =>
-                          setBilling(route.id, {
+                          setEntry({
                             basePrice: goSug.basePrice,
                             baseCurrency: 'USD',
                             quotaPools: goSug.pools,
@@ -3300,7 +3282,7 @@ window.__ModuleLoader__.load({
                       if (value !== null && (!Number.isFinite(value) || value <= 0)) return
                       const current = cfg && cfg.basePrice !== null && cfg.basePrice !== undefined ? cfg.basePrice : null
                       if (value === current) return
-                      setBilling(route.id, { basePrice: value })
+                      setEntry({ basePrice: value })
                     },
                   }),
                   h(
@@ -3309,7 +3291,7 @@ window.__ModuleLoader__.load({
                       className: 'ac-sub-select ac-sub-cur',
                       disabled: busy,
                       value: baseCur,
-                      onChange: (event) => setBilling(route.id, { baseCurrency: event.target.value }),
+                      onChange: (event) => setEntry({ baseCurrency: event.target.value }),
                     },
                     h('option', { value: 'USD' }, '$'),
                     h('option', { value: 'CNY' }, '¥'),
@@ -3344,7 +3326,7 @@ window.__ModuleLoader__.load({
                     }
                     const nextText = rows.map((p) => p.model + ':' + p.quota).join('\n')
                     if (nextText === poolsText) return
-                    setBilling(route.id, { quotaPools: rows.length > 0 ? rows : null })
+                    setEntry({ quotaPools: rows.length > 0 ? rows : null })
                   },
                 }),
               ),
@@ -3414,7 +3396,7 @@ window.__ModuleLoader__.load({
                   className: 'ac-sub-select',
                   disabled: busy,
                   value: bill.planType === null ? '' : bill.planType,
-                  onChange: (event) => setBilling(route.id, { planType: event.target.value === '' ? null : event.target.value }),
+                  onChange: (event) => setEntry({ planType: event.target.value === '' ? null : event.target.value }),
                 },
                 h('option', { value: '' }, '未指定'),
                 planTypes.map((t) => h('option', { key: t, value: t }, planTypeLabels[t] || t)),
@@ -3473,7 +3455,7 @@ window.__ModuleLoader__.load({
                             }
                           }
                         }
-                        setBilling(route.id, patch)
+                        setEntry(patch)
                       },
                     },
                     h('option', { value: '' }, '未指定'),
@@ -3521,7 +3503,7 @@ window.__ModuleLoader__.load({
                 title: '最开始订阅是哪天 —— 填一次就够：选了月付/季付/年付后，有效期自动对齐到包含今天的最新一期，不用每期手改',
                 onChange: (event) => {
                   const v = String(event.target.value || '').trim()
-                  setBilling(route.id, { subscribedAt: v === '' ? null : v })
+                  setEntry({ subscribedAt: v === '' ? null : v })
                 },
               }),
               // 这一次订阅了多久（2.7.1）：年付要按 12 个月摊，周期也按 12 个月推
@@ -3546,7 +3528,7 @@ window.__ModuleLoader__.load({
                     if (value !== null && (!Number.isFinite(value) || value < 1 || value > 120)) return
                     const current = bill.termMonths === null || bill.termMonths === undefined ? null : bill.termMonths
                     if (value === current) return
-                    setBilling(route.id, { termMonths: value })
+                    setEntry({ termMonths: value })
                   },
                 }),
                 h('span', { className: 'ac-sub-unit' }, '个月'),
@@ -3562,7 +3544,7 @@ window.__ModuleLoader__.load({
                     'data-on': (bill.termMonths || 1) === n ? '' : undefined,
                     disabled: busy,
                     title: n === 2 ? '限时优惠一次买俩月 —— 仍归月付挡，不是季付' : undefined,
-                    onClick: () => setBilling(route.id, { termMonths: n }),
+                    onClick: () => setEntry({ termMonths: n }),
                   },
                   n === 1 ? '月付' : n === 2 ? '两月优惠' : n === 3 ? '季付' : '年付',
                 ),
@@ -3599,7 +3581,7 @@ window.__ModuleLoader__.load({
                   'data-on': bill.autoRenew !== false ? '' : undefined,
                   disabled: busy,
                   title: '连续包月 / 包季 / 包年：有效期自动对齐到包含今天的这一期，到期日跟着滚，不用手改日期',
-                  onClick: () => setBilling(route.id, { autoRenew: true }),
+                  onClick: () => setEntry({ autoRenew: true }),
                 },
                 '连续订阅 · 自动对齐',
               ),
@@ -3611,7 +3593,7 @@ window.__ModuleLoader__.load({
                   'data-on': bill.autoRenew === false ? '' : undefined,
                   disabled: busy,
                   title: '一次买 N 个月、到期不续：到期日 = 首次订阅 + 时长，过期就标过期',
-                  onClick: () => setBilling(route.id, { autoRenew: false }),
+                  onClick: () => setEntry({ autoRenew: false }),
                 },
                 '一次买断',
               ),
@@ -3661,7 +3643,7 @@ window.__ModuleLoader__.load({
                     if (value !== null && (!Number.isFinite(value) || value <= 0)) return
                     const current = bill.paid && bill.paid.total !== null && bill.paid.total !== undefined ? bill.paid.total : null
                     if (value === current) return
-                    setBilling(route.id, { paidTotal: value })
+                    setEntry({ paidTotal: value })
                   },
                 }),
                 h(
@@ -3670,7 +3652,7 @@ window.__ModuleLoader__.load({
                     className: 'ac-sub-select ac-sub-cur',
                     disabled: busy,
                     value: (bill.paid && bill.paid.currency) || 'CNY',
-                    onChange: (event) => setBilling(route.id, { paidCurrency: event.target.value }),
+                    onChange: (event) => setEntry({ paidCurrency: event.target.value }),
                   },
                   h('option', { value: 'CNY' }, '¥'),
                   h('option', { value: 'USD' }, '$'),
@@ -3701,7 +3683,7 @@ window.__ModuleLoader__.load({
                   const v = String(event.target.value || '').trim()
                   const next = v === '' ? null : v.slice(0, 80)
                   if (next === (bill.promoNote || null)) return
-                  setBilling(route.id, { promoNote: next })
+                  setEntry({ promoNote: next })
                 },
               }),
               firstPeriod && bill.promoNote !== null
@@ -3737,7 +3719,7 @@ window.__ModuleLoader__.load({
                         if (value !== null && (!Number.isFinite(value) || value <= 0)) return
                         const current = bill.monthlyCNY === null || bill.monthlyCNY === undefined ? null : bill.monthlyCNY
                         if (value === current) return
-                        setBilling(route.id, { monthlyCNY: value })
+                        setEntry({ monthlyCNY: value })
                       },
                     }),
                   ),
@@ -3755,9 +3737,9 @@ window.__ModuleLoader__.load({
                       type: 'button',
                       className: 'ac-chip',
                       disabled: busy,
-                      title: '清掉这条线路的订阅信息：首次订阅时间 / 时长 / 实付 / 优惠 / 官方档位 / 账户快照。计费口径（订阅/折算）不动',
+                      title: '清掉订阅信息：首次订阅时间 / 时长 / 实付 / 优惠 / 官方档位 / 账户快照。计费口径（订阅/折算）与赠送记录不动',
                       onClick: () =>
-                        setBilling(route.id, {
+                        setEntry({
                           subscribedAt: null,
                           termMonths: null,
                           paidTotal: null,
@@ -3775,7 +3757,228 @@ window.__ModuleLoader__.load({
                 )
               : null,
             quotaPoolRow,
-            giftsRow,
+          )
+        })()
+
+        /**
+         * 「赠送」记账（2.7.6 起，2.7.7 改名并扩到全渠道）：每输入一条就记一条。
+         *
+         * 一条 = { kind: credit 赠金 / points 赠送积分 / tokens 免费Token, amount, unit, note, at }。
+         * 只记账不参与「值不值」折算。整表替换式提交：加/删一条都发全量 gifts。
+         * 2.7.7 起从订阅详情里挪出来，**所有渠道**（按量/套餐/订阅/未确认）都有这一栏；
+         * 选中某个账号时记进那个账号自己的账（setEntry 分流）。
+         */
+        const giftsRow = (() => {
+          if (bill === null) return null
+          const busy = billingBusy === route.id
+          const gifts = Array.isArray(bill.gifts) ? bill.gifts : []
+          const totals = bill.giftTotals || null
+          const draft = giftDraft[route.id] || { kind: 'credit', amount: '', unit: 'CNY', note: '' }
+          const patchDraft = (p) => setGiftDraft((prev) => ({ ...prev, [route.id]: { ...draft, ...p } }))
+          const fmtTokens = (n) => {
+            if (typeof n !== 'number' || !Number.isFinite(n)) return '—'
+            if (n >= 1e9) return (n / 1e9).toFixed(n % 1e9 === 0 ? 0 : 2) + 'B'
+            if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 2) + 'M'
+            if (n >= 1e3) return (n / 1e3).toFixed(n % 1e3 === 0 ? 0 : 1) + 'K'
+            return String(n)
+          }
+          const addOne = () => {
+            const amount = Number(draft.amount)
+            if (!Number.isFinite(amount) || amount <= 0) return
+            const unit =
+              draft.kind === 'credit'
+                ? draft.unit === 'USD' ? 'USD' : 'CNY'
+                : draft.kind === 'points'
+                  ? 'raw'
+                  : ['raw', 'K', 'M', 'B'].includes(draft.unit) ? draft.unit : 'raw'
+            const row = {
+              kind: draft.kind,
+              amount,
+              unit,
+              note: String(draft.note || '').trim().slice(0, 80) || null,
+              at: Date.now(),
+            }
+            setEntry({ gifts: [...gifts, row].slice(0, 60) })
+            patchDraft({ amount: '', note: '' })
+          }
+          const removeOne = (idx) => {
+            const next = gifts.filter((_, i) => i !== idx)
+            setEntry({ gifts: next.length > 0 ? next : null })
+          }
+          return h(
+            'div',
+            { className: 'ac-gifts' },
+            h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '赠送'),
+              h(
+                'select',
+                {
+                  className: 'ac-sub-select',
+                  disabled: busy,
+                  value: draft.kind,
+                  title: '赠金 = 送的钱（¥/$）；赠送积分 = 各家送的积分；免费 Token 额度 = 送的 token（个/K/M/B）',
+                  onChange: (e) => patchDraft({ kind: e.target.value, unit: e.target.value === 'credit' ? 'CNY' : e.target.value === 'points' ? 'raw' : 'M' }),
+                },
+                h('option', { value: 'credit' }, '赠金'),
+                h('option', { value: 'points' }, '赠送积分'),
+                h('option', { value: 'tokens' }, '免费Token额度'),
+              ),
+              h('input', {
+                type: 'number',
+                className: 'ac-sub-input ac-gift-amount',
+                value: draft.amount,
+                placeholder: draft.kind === 'credit' ? '金额' : '数量',
+                min: 0,
+                step: 'any',
+                disabled: busy,
+                onChange: (e) => patchDraft({ amount: e.target.value }),
+                onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
+              }),
+              h(
+                'select',
+                {
+                  className: 'ac-sub-select ac-sub-cur',
+                  disabled: busy,
+                  value: draft.unit,
+                  onChange: (e) => patchDraft({ unit: e.target.value }),
+                },
+                draft.kind === 'credit'
+                  ? [h('option', { key: 'CNY', value: 'CNY' }, '¥'), h('option', { key: 'USD', value: 'USD' }, '$')]
+                  : draft.kind === 'points'
+                    ? [h('option', { key: 'raw', value: 'raw' }, '分')]
+                    : [
+                        h('option', { key: 'raw', value: 'raw' }, '个'),
+                        h('option', { key: 'K', value: 'K' }, 'K 千'),
+                        h('option', { key: 'M', value: 'M' }, 'M 百万'),
+                        h('option', { key: 'B', value: 'B' }, 'B 十亿'),
+                      ],
+              ),
+              h('input', {
+                type: 'text',
+                className: 'ac-sub-input ac-gift-note',
+                value: draft.note,
+                placeholder: '备注（来源 / 活动名，可空）',
+                maxLength: 80,
+                disabled: busy,
+                onChange: (e) => patchDraft({ note: e.target.value }),
+                onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
+              }),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-chip',
+                  disabled: busy || !(Number(draft.amount) > 0),
+                  title: '记一条：每输入一条就存一条，落在后台 billing.json',
+                  onClick: addOne,
+                },
+                '记一条',
+              ),
+            ),
+            gifts.length > 0
+              ? h(
+                  'div',
+                  { className: 'ac-gift-list' },
+                  ...gifts.map((g, idx) =>
+                    h(
+                      'div',
+                      { className: 'ac-gift-row', key: String(g.at) + '-' + idx },
+                      h(
+                        'span',
+                        { className: 'ac-gift-kind', 'data-kind': g.kind },
+                        g.kind === 'credit' ? '赠金' : g.kind === 'points' ? '赠送积分' : '免费Token',
+                      ),
+                      h(
+                        'b',
+                        { className: 'ac-gift-amount' },
+                        g.kind === 'credit'
+                          ? (g.unit === 'USD' ? '$' : '¥') + g.amount
+                          : g.kind === 'points'
+                            ? g.amount + ' 分'
+                            : g.amount + (g.unit === 'raw' ? ' 个' : ' ' + g.unit),
+                      ),
+                      g.note ? h('span', { className: 'ac-gift-note-text' }, g.note) : null,
+                      h('span', { className: 'ac-gift-at' }, (() => { const d = new Date(g.at); return (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') })()),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'ac-gift-del',
+                          disabled: busy,
+                          title: '删掉这条记录',
+                          onClick: () => removeOne(idx),
+                        },
+                        '✕',
+                      ),
+                    ),
+                  ),
+                )
+              : null,
+            totals !== null
+              ? h(
+                  'div',
+                  { className: 'ac-gift-total' },
+                  '已记 ',
+                  h('b', null, String(totals.count)),
+                  ' 条',
+                  totals.creditCount > 0 ? ' · 赠金合计 ' + fmtPrice(totals.creditCNY, 'CNY') : '',
+                  totals.pointsCount > 0 ? ' · 赠送积分合计 ' + totals.pointsRaw + ' 分' : '',
+                  totals.tokenCount > 0 ? ' · 免费Token合计 ' + fmtTokens(totals.tokensRaw) + ' 个' : '',
+                  '（只记账，不参与「值不值」折算）',
+                )
+              : h('div', { className: 'ac-bill-auto-hint' }, '领到的赠金 / 赠送积分 / 免费Token额度在这里逐条记，不参与折算'),
+          )
+        })()
+        /**
+         * 多账户设置选择器（2.7.7）：这条渠道有多个账号时，选「给哪个账号记设置」。
+         * 选中后订阅表单 / 赠送记录读写那个账号自己的账（accountEntries），
+         * 「整条渠道」是线路级记录。计费口径按钮不随账号变。
+         */
+        const accountSelector = (() => {
+          if (accountsInfo === null || accountsInfo.count <= 1) return null
+          const entries = (rawBill && rawBill.accountEntries) || {}
+          const nameOf = (id) => {
+            const a = accountsInfo.accounts.find((x) => x.id === id)
+            return a && a.name ? a.name : id
+          }
+          return h(
+            'div',
+            { className: 'ac-acc-edit' },
+            h('span', { className: 'ac-bill-label' }, '设置记给'),
+            h(
+              'select',
+              {
+                className: 'ac-sub-select ac-acc-select',
+                value: activeAcc === null ? '' : activeAcc,
+                title: '选一个账号：下面的订阅信息 / 赠送记录就记到那个账号名下；「整条渠道」记给线路本身',
+                onChange: (e) =>
+                  setAccountEdit((prev) => ({ ...prev, [route.id]: e.target.value === '' ? null : e.target.value })),
+              },
+              h('option', { value: '' }, '整条渠道（' + route.name + '）'),
+              accountsInfo.accounts.map((a) =>
+                h(
+                  'option',
+                  { key: a.id, value: a.id },
+                  (a.name || a.id) +
+                    (a.id === accountsInfo.currentId ? ' · 当前在用' : '') +
+                    (entries[a.id] ? ' · 已记' : ''),
+                ),
+              ),
+            ),
+            activeAcc !== null
+              ? h(
+                  'span',
+                  { className: 'ac-acc-edit-hint' },
+                  '正在给「',
+                  h('b', null, nameOf(activeAcc)),
+                  '」记设置 —— 订阅信息 / 赠送都进这个账号自己的账',
+                  accEntry
+                    ? null
+                    : '（还没记过，填一条就有）',
+                )
+              : h('span', { className: 'ac-bill-auto-hint' }, '多账号可以分开记：选一个账号，下面的设置就记到它名下'),
           )
         })()
 
@@ -4026,8 +4229,10 @@ window.__ModuleLoader__.load({
           accountsPanel,
           billingRow,
           cliNote,
+          accountSelector,
           subscriptionRow,
           worthRow,
+          giftsRow,
           route.models.length > 0
             ? h(
                 'div',

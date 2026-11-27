@@ -58,7 +58,7 @@ function normalizeBillingEntry(value) {
       mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
       subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
       basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
-      autoRenew: null, accountPlan: null, accountSyncedAt: null, gifts: null,
+      autoRenew: null, accountPlan: null, accountSyncedAt: null, gifts: null, accountEntries: null,
     }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -126,16 +126,16 @@ function normalizeBillingEntry(value) {
     typeof value.accountSyncedAt === 'number' && Number.isFinite(value.accountSyncedAt) && value.accountSyncedAt > 0
       ? value.accountSyncedAt
       : null
-  // 赠金 / 免费 token 记录（2.7.6）—— 必须和 usage.js 的 normalizeGifts 镜像
+  // 「赠送」记录（2.7.6 起，2.7.7 加 points）—— 必须和 usage.js 的 normalizeGifts 镜像
   let gifts = null
   if (Array.isArray(value.gifts)) {
     const rows = []
     for (const row of value.gifts) {
       if (!row || typeof row !== 'object') continue
-      const kind = row.kind === 'credit' || row.kind === 'tokens' ? row.kind : null
+      const kind = row.kind === 'credit' || row.kind === 'points' || row.kind === 'tokens' ? row.kind : null
       const amount = typeof row.amount === 'number' && Number.isFinite(row.amount) && row.amount > 0 ? row.amount : null
       if (kind === null || amount === null) continue
-      const units = kind === 'credit' ? ['CNY', 'USD'] : ['raw', 'K', 'M', 'B']
+      const units = kind === 'credit' ? ['CNY', 'USD'] : kind === 'points' ? ['raw'] : ['raw', 'K', 'M', 'B']
       const unit = units.includes(row.unit) ? row.unit : units[0]
       const note = typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null
       const at = typeof row.at === 'number' && Number.isFinite(row.at) && row.at > 0 ? row.at : Date.now()
@@ -144,16 +144,32 @@ function normalizeBillingEntry(value) {
     }
     if (rows.length > 0) gifts = rows
   }
+  // 逐账户设置（2.7.7）：{ 账户id: 同构记录 } —— 必须和 usage.js 镜像
+  let accountEntries = null
+  if (value.accountEntries && typeof value.accountEntries === 'object' && !Array.isArray(value.accountEntries)) {
+    const out = {}
+    let n = 0
+    for (const [accId, raw] of Object.entries(value.accountEntries)) {
+      if (typeof accId !== 'string' || accId === '' || accId.length > 80) continue
+      const sub = normalizeBillingEntry(raw)
+      if (sub === null) continue
+      out[accId] = sub
+      n += 1
+      if (n >= 20) break
+    }
+    if (n > 0) accountEntries = out
+  }
   const empty =
     mode === null && estimate === false && monthlyCNY === null && planType === null &&
     subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
     basePrice === null && quotaPools === null && planTier === null &&
-    autoRenew === null && accountPlan === null && accountSyncedAt === null && gifts === null
+    autoRenew === null && accountPlan === null && accountSyncedAt === null && gifts === null &&
+    accountEntries === null
   if (empty) return null
   return {
     mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
     termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
-    autoRenew, accountPlan, accountSyncedAt, gifts,
+    autoRenew, accountPlan, accountSyncedAt, gifts, accountEntries,
   }
 }
 
@@ -204,6 +220,7 @@ function saveBillingOverrides(overrides) {
     if (entry.accountPlan && typeof entry.accountPlan === 'object') value.accountPlan = entry.accountPlan
     if (entry.accountSyncedAt !== null && entry.accountSyncedAt !== undefined) value.accountSyncedAt = entry.accountSyncedAt
     if (Array.isArray(entry.gifts) && entry.gifts.length > 0) value.gifts = entry.gifts
+    if (entry.accountEntries && typeof entry.accountEntries === 'object') value.accountEntries = entry.accountEntries
     if (Object.keys(value).length > 0) compact[provider] = value
   }
   const tmp = BILLING_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
@@ -248,6 +265,7 @@ function reconcileBillingOverrides(overrides) {
         accountPlan: entry.accountPlan === undefined ? null : entry.accountPlan,
         accountSyncedAt: entry.accountSyncedAt === undefined ? null : entry.accountSyncedAt,
         gifts: entry.gifts === undefined ? null : entry.gifts,
+        accountEntries: entry.accountEntries === undefined ? null : entry.accountEntries,
       }
       if (
         kept.estimate === false &&
@@ -263,7 +281,8 @@ function reconcileBillingOverrides(overrides) {
         kept.autoRenew === null &&
         kept.accountPlan === null &&
         kept.accountSyncedAt === null &&
-        kept.gifts === null
+        kept.gifts === null &&
+        kept.accountEntries === null
       ) {
         continue
       }
@@ -1860,17 +1879,17 @@ export function apply(ctx, config) {
           for (const row of gifts) {
             const kind = row && row.kind
             const amount = row ? Number(row.amount) : NaN
-            if (kind !== 'credit' && kind !== 'tokens') {
-              sendJson(res, 400, { ok: false, error: 'gifts 每条 kind 要 credit（赠金）/ tokens（免费 token）' })
+            if (kind !== 'credit' && kind !== 'points' && kind !== 'tokens') {
+              sendJson(res, 400, { ok: false, error: 'gifts 每条 kind 要 credit（赠金）/ points（赠送积分）/ tokens（免费 Token）' })
               return
             }
             if (!Number.isFinite(amount) || amount <= 0) {
               sendJson(res, 400, { ok: false, error: 'gifts 每条 amount 要正数' })
               return
             }
-            const units = kind === 'credit' ? ['CNY', 'USD'] : ['raw', 'K', 'M', 'B']
+            const units = kind === 'credit' ? ['CNY', 'USD'] : kind === 'points' ? ['raw'] : ['raw', 'K', 'M', 'B']
             if (row.unit !== undefined && row.unit !== null && !units.includes(row.unit)) {
-              sendJson(res, 400, { ok: false, error: 'gifts unit：赠金 CNY/USD，token raw/K/M/B' })
+              sendJson(res, 400, { ok: false, error: 'gifts unit：赠金 CNY/USD，积分 raw，token raw/K/M/B' })
               return
             }
           }

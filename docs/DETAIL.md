@@ -175,12 +175,20 @@ plans.js 的 Qoder / WorkBuddy 条目是**国际版 USD 价**，国内账号拿�
 - **`accountPlan` / `accountSyncedAt`**：账户订阅快照 `{ name, planName, planTier, expiresAt, periodStart, source, atMs }`。页面同源读连接器：Qoder `credits.planExpiresAtMs`；WorkBuddy `credits.packages` 里 `monthly:true` 的包名（「CodeBuddy个人体验版」）+ `cycleRefreshMs`；**CodeArts 走 `/api/codearts/status` 的 `credits.credits`（planName / periodStart / periodEnd，最全）**；Trae 只给账号列表，读不到就明说。⚠ **金额（首次订阅时间 / 实付）账户里没有**，永远手填；有效期靠 subscriptionPeriod 从首订日推算对齐。「对齐到账户」按钮把快照 POST 进 billing.json，`matchTierByName` 按关键词（体验版→free、专业→pro…）对上官方档位时顺手选 planTier。
 - 新字段全链路：normalize（usage.js + index.js 两份必须镜像）/ saveBillingOverrides 紧凑写 / reconcile 保留 / POST 校验（autoRenew 认布尔、accountPlan 认对象、accountSyncedAt 认正毫秒）。
 
-### 订阅形式排序与赠金记账（2.7.6）
+### 订阅形式排序与「赠送」记账（2.7.6 起，2.7.7 扩充）
 
 - **`PLAN_TYPES` 顺序即下拉顺序**：`agent-plan → coding-plan → token-plan → quota-pool → token-pack → other`（「未指定」是前端单独加的第一项）。改顺序要同步 `test-subscription.mjs` 的枚举断言。
-- **`gifts`**：`[{ kind: 'credit'|'tokens', amount>0, unit, note≤80, at }]`，最多 60 条。赠金 unit ∈ CNY/USD（缺省 CNY），token unit ∈ raw/K/M/B（缺省 raw）。`normalizeGifts`（usage.js）与 index.js 的镜像归一**必须同步改**。POST /billing **整表替换**：前端加/删一条都发全量数组。
-- **`giftTotals(gifts)`**（usage.js 导出 + describeBilling 贯通）：赠金折 CNY（USD×7.2）、token 折「个」（K=1e3/M=1e6/B=1e9），返回 `{creditCNY, tokensRaw, creditCount, tokenCount, count}`。
-- **只记账不参与折算**：gifts 不进 effectiveMonthlyCNY / subscriptionWorth，也不影响 resettable。界面 `giftsRow` 在 subscriptionRow 里（quotaPoolRow 之后），草稿态按线路 id 存 `giftDraft`。
+- **`gifts`**：`[{ kind: 'credit'|'points'|'tokens', amount>0, unit, note≤80, at }]`，最多 60 条。赠金 unit ∈ CNY/USD（缺省 CNY），积分 unit ∈ raw（分），token unit ∈ raw/K/M/B（缺省 raw）。`normalizeGifts`（usage.js）与 index.js 的镜像归一**必须同步改**。POST /billing **整表替换**：前端加/删一条都发全量数组。
+- **`giftTotals(gifts)`**（usage.js 导出 + describeBilling 贯通）：赠金折 CNY（USD×7.2）、积分直接加、token 折「个」（K=1e3/M=1e6/B=1e9），返回 `{creditCNY, pointsRaw, tokensRaw, creditCount, pointsCount, tokenCount, count}`。
+- **只记账不参与折算**：gifts 不进 effectiveMonthlyCNY / subscriptionWorth，也不影响 resettable。
+- **2.7.7 全渠道**：`giftsRow` 从 subscriptionRow 里挪到 **routeCard 作用域**（所有渠道都渲染，bill 非 null 即可）。⚠ 挪动时注意作用域：giftsRow 引用的 `setEntry`/`giftDraft` 都在 routeCard/CreditsPage 层，放在 subscriptionRow 内部会让非订阅渠道渲染时 `giftsRow is not defined` 整页消失（坑 #1 同款）。
+
+### 多账户设置选择 `accountEntries`（2.7.7）
+
+- **存储**：线路记录里多一个 `accountEntries: { 账户id: 同构记录 }`（最多 20 个账户），每个账户一份自己的订阅/赠送账。归一在 normalizeOverrideEntry / normalizeBillingEntry 里递归调用自身（⚠ 递归深度：账户记录里不再嵌 accountEntries，归一时子记录的 accountEntries 会被当普通字段——实际前端不往子记录写它，宿主校验也不收）。
+- **前端投影**：routeCard 里 `accountEdit[route.id]` 存选中的账户 id；选中后把 `accountEntries[id]` 投影成 bill 的形状（period/giftTotals/effectiveMonthlyCNY 用前端镜像函数 `periodOf`/`giftTotalsOf` 现算，口径与宿主一致），表单代码不用改。`setEntry(patch)` 分流：选了账号就整份替换那个账户的记录（清空 null/false 字段），否则走线路级 setBilling。
+- **计费口径不随账号变**：billingRow 的三个模式按钮 + 「自动」仍直接 setBilling（线路级）；worthRow 的月费输入也是线路级（折算比较是线路口径）。
+- **选择器**：`accountSelector` 只在 accountsInfo.count > 1 时出现，选项标「当前在用」「已记」；probe-click 用 `CHANGE_CLASS=ac-acc-select CHANGE_VALUE=<id> CHANGE_INDEX=<n>` 模拟换值。
 
 ⚠ `accountsPanel` 在 routeCard 里（约 2497 行），**不能引用用量栏的 `fmtCredits`**（3655 行才声明，const 箭头函数不提升 → TDZ → 整页消失，坑 #1）。面板内自带 `fmtAccCredits`。
 

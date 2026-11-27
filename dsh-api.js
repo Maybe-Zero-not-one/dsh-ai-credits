@@ -259,10 +259,13 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         // 从连接器账户读到的订阅信息（档位名 / 到期 / 同步时间），没同步过 null
         accountPlan: billingInfo.accountPlan(id),
         accountSyncedAt: billingInfo.accountSyncedAt(id),
-        // ---- 赠金 / 免费 token 记录（2.7.6）----
-        // 逐条记账（kind/amount/unit/note/at），只记不参与折算；没记过 null
+        // ---- 「赠送」记录（2.7.6 起，2.7.7 全渠道）----
+        // 逐条记账（kind: credit 赠金 / points 赠送积分 / tokens 免费Token），只记不参与折算
         gifts: billingInfo.gifts(id),
         giftTotals: billingInfo.giftTotals(id),
+        // ---- 逐账户设置（2.7.7）----
+        // { 账户id: 同构记录 }：多账号渠道可以给每个账号单独记订阅/赠送账
+        accountEntries: billingInfo.accountEntries(id),
         // 这条订阅线路有没有积分查询端点（没有就只能报 token）
         creditEndpoint: billingInfo.creditEndpoint(id),
       },
