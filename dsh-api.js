@@ -166,9 +166,7 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
     const planSuggestion = billingInfo.planSuggestion(id)
     // 这一次订阅了多久（月）：年付要按 12 个月摊，周期也按 12 个月推
     const termMonths = billingInfo.termMonths(id)
-    // 自动续费（2.7.5）：null 按 true —— 周期自动对齐到包含今天的最新一期
-    const autoRenew = billingInfo.autoRenew(id)
-    const period = subscribedAt !== null ? subscriptionPeriod(subscribedAt, Date.now(), termMonths, autoRenew) : null
+    const period = subscribedAt !== null ? subscriptionPeriod(subscribedAt, Date.now(), termMonths) : null
     const paid = billingInfo.paid(id)
     const quotaPoolCfg = billingInfo.quotaPool(id)
 
@@ -220,10 +218,8 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         label: billingInfo.label(id),
         // 手选过、且和自动判定不一样 —— 界面提示「已按你的选择」
         changed: override !== null && override !== autoMode,
-        // 表里有没有这一条（老口径，保留兼容）
+        // 表里有没有这一条（「自动」按钮要不要显示）
         touched: billingInfo.touched(id),
-        // 「自动」按钮要不要出现（2.7.5）：只有口径覆盖（手选模式 / 订阅+折算）才算
-        resettable: billingInfo.resettable(id),
         // 你手填的参考月费（人民币），没有就是 null
         monthlyCNY: billingInfo.monthlyCNY(id),
         // ---- 订阅三件套：形式 / 订阅时间 / 优惠说明（都只在 credits 线路有意义）----
@@ -246,26 +242,6 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         quotaPoolConfig: quotaPoolCfg,
         // opencode-go 的官方额度池建议（一键填进 quotaPools）
         goPoolSuggestion: goPool,
-        // ---- 官方档位与计费挡位（2.7.4）----
-        // 选定的国内官方档位 id；下拉选项在 cnTiers
-        planTier: billingInfo.planTier(id),
-        // 这条线路的国内官方档位表（Qoder CN / TRAE / WorkBuddy / 码道），没有 null
-        cnTiers: billingInfo.cnTiers(id),
-        // 月付挡 / 多月包挡 / 年付挡 —— 一次买俩月的限时优惠仍归月付挡
-        billingClass: billingInfo.billingClass(id),
-        // ---- 自动续费与账户订阅快照（2.7.5）----
-        // null = 没设置（按自动续费算）；false = 一次买 N 个月，到期如实标过期
-        autoRenew,
-        // 从连接器账户读到的订阅信息（档位名 / 到期 / 同步时间），没同步过 null
-        accountPlan: billingInfo.accountPlan(id),
-        accountSyncedAt: billingInfo.accountSyncedAt(id),
-        // ---- 「赠送」记录（2.7.6 起，2.7.7 全渠道）----
-        // 逐条记账（kind: credit 赠金 / points 赠送积分 / tokens 免费Token），只记不参与折算
-        gifts: billingInfo.gifts(id),
-        giftTotals: billingInfo.giftTotals(id),
-        // ---- 逐账户设置（2.7.7）----
-        // { 账户id: 同构记录 }：多账号渠道可以给每个账号单独记订阅/赠送账
-        accountEntries: billingInfo.accountEntries(id),
         // 这条订阅线路有没有积分查询端点（没有就只能报 token）
         creditEndpoint: billingInfo.creditEndpoint(id),
       },

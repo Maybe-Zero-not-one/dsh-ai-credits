@@ -26,7 +26,6 @@ import { promisify } from 'node:util'
 import { PRICE_PROVIDERS } from './prices.js'
 import { PROVIDER_KEY_MAP } from './official-usage.js'
 import { goUsageUSD, goModelLimit, buildGoPool, OPENCODE_GO_SNAPSHOT_AT } from './opencode-go.js'
-import { cnTiersOf, cnTierById, billingClassOfTerm, CN_TIERS_SNAPSHOT_AT } from './cn-tiers.js'
 import { CODING_PLANS, PLAN_SNAPSHOT_AT } from './plans.js'
 import { MEDIA_PRICE_SNAPSHOT_AT, imageUnitPrice, videoCost, shortProvider } from './media-prices.js'
 import { readCloudMediaLedger } from './media-ledger.js'
@@ -1023,29 +1022,10 @@ const SUBSCRIPTION_PLAN_HINTS = {
 const USD_TO_CNY = 7.2
 
 /**
- * 这条订阅线路的参考月费（人民币）。
- *
- * 优先级（2.7.4）：
- *   1. 用户选定的**国内官方档位**（planTier）→ 该档官方月付原价（CNY），单点不是区间
- *   2. plans.js 套餐表候选（老路，国际版 USD 折 ¥7.2）
- * 都没有 → null，界面退回手填。
+ * 这条订阅线路在套餐表里的参考月费（人民币，取最低档到最高档）。
+ * 套餐表里没有对得上的 → null，界面退回手填。
  */
-function subscriptionPlanRef(provider, planTierId) {
-  // 官方档位优先：国内账号按国内价，别拿国际版美元价折
-  if (typeof planTierId === 'string' && planTierId !== '') {
-    const tier = cnTierById(planTierId)
-    if (tier !== null && typeof tier.monthlyCNY === 'number') {
-      return {
-        minCNY: tier.monthlyCNY,
-        maxCNY: tier.monthlyCNY,
-        plans: [{ id: tier.id, title: tier.providerLabel + ' ' + tier.official, price: tier.monthlyCNY, currency: 'CNY' }],
-        snapshotAt: CN_TIERS_SNAPSHOT_AT,
-        usdToCny: USD_TO_CNY,
-        tierSource: 'cn-official',
-        tier,
-      }
-    }
-  }
+function subscriptionPlanRef(provider) {
   const ids = SUBSCRIPTION_PLAN_HINTS[provider]
   if (!Array.isArray(ids) || ids.length === 0) return null
   const picked = CODING_PLANS.filter((plan) => ids.includes(plan.id) && typeof plan.price === 'number')
@@ -1065,7 +1045,6 @@ function subscriptionPlanRef(provider, planTierId) {
     plans: names,
     snapshotAt: PLAN_SNAPSHOT_AT,
     usdToCny: USD_TO_CNY,
-    tierSource: 'plans-snapshot',
   }
 }
 
@@ -1111,14 +1090,14 @@ const BILLING_LABEL_FOLDED = '订阅 · 折算'
  * 单独留一档；`quota-pool` 是**额度池订阅**（OpenCode Go 那种：付 $10，各家模型
  * 各给一笔美元额度，用掉的按比例折回那 $10 上扣）；`other` 兜住没归进上面几类的。
  */
-const PLAN_TYPES = ['agent-plan', 'coding-plan', 'token-plan', 'quota-pool', 'token-pack', 'other']
+const PLAN_TYPES = ['agent-plan', 'token-plan', 'coding-plan', 'token-pack', 'quota-pool', 'other']
 
 const PLAN_TYPE_LABELS = {
   'agent-plan': 'Agent Plan',
-  'coding-plan': 'Coding Plan',
   'token-plan': 'Token Plan',
-  'quota-pool': '额度池订阅',
+  'coding-plan': 'Coding Plan',
   'token-pack': '特价 token 包',
+  'quota-pool': '额度池订阅',
   other: '其他订阅',
 }
 
@@ -1137,13 +1116,12 @@ const PLAN_TYPE_KEYWORDS = {
  * 给一条订阅线路挑参考套餐档（「订阅形式」和套餐表联动的那一步）。
  * @returns {{ planType:string|null, plans:Array, minCNY:number|null, maxCNY:number|null, matched:boolean }|null}
  */
-function suggestPlanRef(provider, planType, planTierId) {
-  const base = subscriptionPlanRef(provider, planTierId)
+function suggestPlanRef(provider, planType) {
+  const base = subscriptionPlanRef(provider)
   if (base === null) return null
   const keywords = planType ? PLAN_TYPE_KEYWORDS[planType] : null
-  if (!Array.isArray(keywords) || keywords.length === 0 || base.tierSource === 'cn-official') {
-    // 选了官方档位就不再按关键词过滤 —— 用户已经明确指定了哪一档
-    return { planType: planType || null, plans: base.plans, minCNY: base.minCNY, maxCNY: base.maxCNY, matched: base.tierSource === 'cn-official', snapshotAt: base.snapshotAt, tierSource: base.tierSource }
+  if (!Array.isArray(keywords) || keywords.length === 0) {
+    return { planType: planType || null, plans: base.plans, minCNY: base.minCNY, maxCNY: base.maxCNY, matched: false, snapshotAt: base.snapshotAt }
   }
   const picked = base.plans.filter((p) => {
     const hay = (String(p.id || '') + ' ' + String(p.title || '')).toLowerCase()
@@ -1251,26 +1229,19 @@ export function quotaPoolSpend(pool, usedByModel) {
 }
 
 /**
- * 订阅周期账：从**首次订阅日**算到今天，第几个计费周期、当前周期从哪天到哪天。
+ * 订阅周期账：从订阅日算到今天，第几个计费周期、当前周期从哪天到哪天。
  * 用来判断「首月优惠」还在不在第一期：subscribedAt + paidPrice + promoNote 三件套齐了才有意义。
  *
- * **termMonths = 一个付费周期几个月**（2.7.1）。不填按 1 个月算（老行为）；
- * 填 12 就是年付：一个周期跨 12 个月，年费要除以 12 才是「等价月付金额」，
+ * **termMonths = 这一次订阅了多久**（2.7.1）。不填按 1 个月算（老行为）；
+ * 填 12 就是年付：一个周期跨 12 个月，年费要除以 12 才是「折合月费」，
  * 拿年费直接跟等价月费比会得出「贵了 12 倍」的假结论。
- *
- * **autoRenew（2.7.5）= 到期自动对齐到最新一期**：
- *   true（默认）  连续包月/包季/包年、一直续着的订阅 —— 本期 = 包含今天的这一期，
- *                 到期日 = 本期结束，永远不用手改日期；
- *   false         一次买 N 个月、到期不续的 —— 到期日 = 首次订阅 + N 个月（老口径），
- *                 过期就如实标过期。
  *
  * 月末订阅（1-31）各期钳到当月最后一天（2-28、4-30…）。**从起点按月数直接算**，
  * 不做「逐月 +1 推进」—— 推进式在钳过月末后 day 变了（31→28），下一轮再钳会原地踏步死循环。
  * @returns {{ periodIndex:number, periodStart:string, periodEnd:string, daysSince:number,
- *             termMonths:number, expiresAt:string, daysLeft:number, expired:boolean,
- *             autoRenew:boolean }|null}
+ *             termMonths:number, expiresAt:string, daysLeft:number, expired:boolean }|null}
  */
-export function subscriptionPeriod(subscribedAt, nowMs, termMonths, autoRenew) {
+export function subscriptionPeriod(subscribedAt, nowMs, termMonths) {
   if (typeof subscribedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(subscribedAt)) return null
   const start = new Date(subscribedAt + 'T00:00:00')
   if (Number.isNaN(start.getTime())) return null
@@ -1281,7 +1252,6 @@ export function subscriptionPeriod(subscribedAt, nowMs, termMonths, autoRenew) {
     typeof termMonths === 'number' && Number.isFinite(termMonths) && termMonths >= 1 && termMonths <= 120
       ? Math.floor(termMonths)
       : 1
-  const renew = autoRenew !== false
   /** 起点 + n 个月，日期钳到目标月最后一天 */
   const addMonths = (n) => {
     const d = new Date(start.getFullYear(), start.getMonth() + n, 1)
@@ -1292,85 +1262,17 @@ export function subscriptionPeriod(subscribedAt, nowMs, termMonths, autoRenew) {
   let idx = 0
   while (idx < 1200 && addMonths((idx + 1) * term) <= now) idx += 1
   const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-  // 自动续费：到期 = 当前这一期结束；一次性购买：到期 = 首次订阅 + term（第 1 期结束）
-  const termEnd = renew ? addMonths((idx + 1) * term) : addMonths(term)
+  const termEnd = addMonths(term)
   return {
     periodIndex: idx + 1, // 第 1 期 = 首次订阅那一期
     periodStart: fmt(addMonths(idx * term)),
     periodEnd: fmt(addMonths((idx + 1) * term)),
     daysSince: Math.floor((now - start) / 86400000),
     termMonths: term,
-    // 本期到哪天为止 + 还剩几天（负数 = 已过期几天）
+    // 本次订阅到哪天为止 + 还剩几天（负数 = 已过期几天）
     expiresAt: fmt(termEnd),
     daysLeft: Math.ceil((termEnd - now) / 86400000),
     expired: termEnd <= now,
-    autoRenew: renew,
-  }
-}
-
-/**
- * 「赠送」记录（2.7.6 起，2.7.7 改名并扩到全渠道）。
- *
- * 主人要「每输入一条就记一条」：一条 = { kind, amount, unit, note, at }。
- *   kind   'credit' 赠金（钱，¥/$）| 'points' 赠送积分（各家积分）| 'tokens' 免费 Token 额度
- *   unit   赠金：CNY / USD；积分：raw 分；token：raw 个 / K 千 / M 百万 / B 十亿
- *   amount 正数（按 unit 的原值，不做换算存储，展示时再折）
- *   note   备注（来源 / 活动名），≤80 字
- *   at     记录时间戳（毫秒）
- * 只记账不参与折算 —— 赠送不是订阅费，别混进「值不值」的比较里。
- * 一条记录最多记 60 条，防滥用。**所有渠道都能记**（不限订阅档）。
- */
-const GIFT_KINDS = ['credit', 'points', 'tokens']
-const GIFT_UNITS = { credit: ['CNY', 'USD'], points: ['raw'], tokens: ['raw', 'K', 'M', 'B'] }
-
-function normalizeGifts(value) {
-  if (!Array.isArray(value)) return null
-  const rows = []
-  for (const row of value) {
-    if (!row || typeof row !== 'object') continue
-    const kind = GIFT_KINDS.includes(row.kind) ? row.kind : null
-    const amount = typeof row.amount === 'number' && Number.isFinite(row.amount) && row.amount > 0 ? row.amount : null
-    if (kind === null || amount === null) continue
-    const unit = GIFT_UNITS[kind].includes(row.unit) ? row.unit : GIFT_UNITS[kind][0]
-    const note = typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null
-    const at = typeof row.at === 'number' && Number.isFinite(row.at) && row.at > 0 ? row.at : Date.now()
-    rows.push({ kind, amount, unit, note, at })
-    if (rows.length >= 60) break
-  }
-  return rows.length > 0 ? rows : null
-}
-
-/** 赠送记录汇总：赠金折 CNY + 赠送积分合计 + 免费 token 折「个」（展示用） */
-export function giftTotals(gifts) {
-  if (!Array.isArray(gifts) || gifts.length === 0) return null
-  let creditCNY = 0
-  let pointsRaw = 0
-  let tokensRaw = 0
-  let creditCount = 0
-  let pointsCount = 0
-  let tokenCount = 0
-  const TOKEN_SCALE = { raw: 1, K: 1e3, M: 1e6, B: 1e9 }
-  for (const g of gifts) {
-    if (!g || typeof g.amount !== 'number') continue
-    if (g.kind === 'credit') {
-      creditCNY += g.unit === 'USD' ? g.amount * USD_TO_CNY : g.amount
-      creditCount += 1
-    } else if (g.kind === 'points') {
-      pointsRaw += g.amount
-      pointsCount += 1
-    } else if (g.kind === 'tokens') {
-      tokensRaw += g.amount * (TOKEN_SCALE[g.unit] || 1)
-      tokenCount += 1
-    }
-  }
-  return {
-    creditCNY: Number(creditCNY.toFixed(2)),
-    pointsRaw: Number(pointsRaw.toFixed(2)),
-    tokensRaw,
-    creditCount,
-    pointsCount,
-    tokenCount,
-    count: gifts.length,
   }
 }
 
@@ -1389,8 +1291,7 @@ function normalizeOverrideEntry(value) {
     return {
       mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
       subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
-      basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
-      autoRenew: null, accountPlan: null, accountSyncedAt: null, gifts: null, accountEntries: null,
+      basePrice: null, baseCurrency: null, quotaPools: null,
     }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -1437,67 +1338,14 @@ function normalizeOverrideEntry(value) {
     }
     if (rows.length > 0) quotaPools = rows
   }
-  // 官方档位（2.7.4）：国内官方档位表的 id（cn-tiers.js），选了它参考价就按官方月付原价
-  const planTier =
-    typeof value.planTier === 'string' && cnTierById(value.planTier) !== null ? value.planTier : null
-  // 自动续费（2.7.5）：true = 连续包月/包年，周期自动对齐到最新一期；false = 一次买 N 个月。
-  // null = 没设置，按 true 算（大多数订阅是续着的）
-  const autoRenew = typeof value.autoRenew === 'boolean' ? value.autoRenew : null
-  // 从账户读到的订阅快照（2.7.5）：{ name, planName, planTier, expiresAt, source, atMs }
-  // 只留展示要用的公开字段，金额账户里没有 —— 实付永远手填
-  let accountPlan = null
-  if (value.accountPlan && typeof value.accountPlan === 'object' && !Array.isArray(value.accountPlan)) {
-    const ap = value.accountPlan
-    const str = (v, max) => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null)
-    const name = str(ap.name, 60)
-    const planName = str(ap.planName, 60)
-    const expiresAt =
-      typeof ap.expiresAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.expiresAt) ? ap.expiresAt : null
-    if (name !== null || planName !== null || expiresAt !== null) {
-      accountPlan = {
-        name,
-        planName,
-        planTier: str(ap.planTier, 60),
-        expiresAt,
-        periodStart: typeof ap.periodStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.periodStart) ? ap.periodStart : null,
-        source: str(ap.source, 40) || 'connector',
-        atMs: typeof ap.atMs === 'number' && Number.isFinite(ap.atMs) ? ap.atMs : null,
-      }
-    }
-  }
-  // 账户对齐的时间戳（毫秒）
-  const accountSyncedAt =
-    typeof value.accountSyncedAt === 'number' && Number.isFinite(value.accountSyncedAt) && value.accountSyncedAt > 0
-      ? value.accountSyncedAt
-      : null
-  // 「赠送」记录（2.7.6 起）：逐条记账，不参与折算
-  const gifts = normalizeGifts(value.gifts)
-  // 逐账户设置（2.7.7）：{ 账户id: 同构记录 }，最多 20 个账户；每个账户一份自己的订阅/赠送账
-  let accountEntries = null
-  if (value.accountEntries && typeof value.accountEntries === 'object' && !Array.isArray(value.accountEntries)) {
-    const out = {}
-    let n = 0
-    for (const [accId, raw] of Object.entries(value.accountEntries)) {
-      if (typeof accId !== 'string' || accId === '' || accId.length > 80) continue
-      const sub = normalizeOverrideEntry(raw)
-      if (sub === null) continue
-      out[accId] = sub
-      n += 1
-      if (n >= 20) break
-    }
-    if (n > 0) accountEntries = out
-  }
   const empty =
     mode === null && estimate === false && monthlyCNY === null && planType === null &&
     subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
-    basePrice === null && quotaPools === null && planTier === null &&
-    autoRenew === null && accountPlan === null && accountSyncedAt === null && gifts === null &&
-    accountEntries === null
+    basePrice === null && quotaPools === null
   if (empty) return null
   return {
     mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
-    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
-    autoRenew, accountPlan, accountSyncedAt, gifts, accountEntries,
+    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools,
   }
 }
 
@@ -1611,60 +1459,6 @@ function billingRules(overrides) {
         pools: entry.quotaPools.slice(),
       }
     },
-    /** 选定的官方档位 id（2.7.4），没选 null */
-    planTier: (provider) => {
-      const entry = entryOf(provider)
-      return entry === null ? null : entry.planTier
-    },
-    /** 自动续费开关（2.7.5）：null = 没设置（按自动续费算） */
-    autoRenew: (provider) => {
-      const entry = entryOf(provider)
-      return entry === null ? null : entry.autoRenew
-    },
-    /** 从账户读到的订阅快照（2.7.5），没同步过 null */
-    accountPlan: (provider) => {
-      const entry = entryOf(provider)
-      return entry === null ? null : entry.accountPlan
-    },
-    /** 上次账户对齐时间（毫秒），没同步过 null */
-    accountSyncedAt: (provider) => {
-      const entry = entryOf(provider)
-      return entry === null ? null : entry.accountSyncedAt
-    },
-    /** 「赠送」记录（2.7.6 起），没记过 null */
-    gifts: (provider) => {
-      const entry = entryOf(provider)
-      return entry === null ? null : entry.gifts
-    },
-    /** 逐账户设置（2.7.7）：{ 账户id: 记录 }，没记过 null */
-    accountEntries: (provider) => {
-      const entry = entryOf(provider)
-      return entry === null ? null : entry.accountEntries
-    },
-    /**
-     * 「自动」按钮要不要出现（2.7.5）：有**用户意图**才出现。
-     *
-     * 老口径 touched = 表里有没有这一条 —— 于是只点过「一键填额度」/ 快捷时长的
-     * opencode-go / ark / qoder，记录里只有额度池 / termMonths，跟自动判定完全一致，
-     * 「自动」按钮却赖着不走。新口径：
-     *   · 手选了模式（mode 非空）→ 出现（点它退回自动判定）
-     *   · 订阅档开了折算 → 出现（点它连折算一起清）
-     *   · 只有订阅信息（时间 / 实付 / 档位 / 额度池 / 账户快照）→ 不出现 ——
-     *     那些不是「口径覆盖」，没有可退的；要清信息用订阅行里的「清空订阅信息」。
-     */
-    resettable: (provider) => {
-      const entry = entryOf(provider)
-      if (entry === null) return false
-      if (entry.mode !== null) return true
-      return effective(provider) === 'credits' && entry.estimate === true
-    },
-    /** 计费挡位：月付 / 多月包 / 年付。一次买俩月的限时优惠仍归月付挡 */
-    billingClass: (provider) => {
-      const entry = entryOf(provider)
-      return billingClassOfTerm(entry === null ? null : entry.termMonths)
-    },
-    /** 这条线路的国内官方档位表（下拉用），没有 null */
-    cnTiers: (provider) => cnTiersOf(provider),
     /** 整条覆盖记录（所有字段都要时用） */
     entry: (provider) => entryOf(provider),
     /** 要不要查价、要不要算钱（按量 / 套餐折算 / 订阅+折算 三种都算） */
@@ -1743,22 +1537,8 @@ export function describeBilling(overrides) {
     paid: (provider) => rules.paid(provider),
     effectiveMonthlyCNY: (provider) => rules.effectiveMonthlyCNY(provider),
     quotaPool: (provider) => rules.quotaPool(provider),
-    /** 按订阅形式从套餐表挑的参考档（联动 plans.js / 国内官方档位） */
-    planSuggestion: (provider) => suggestPlanRef(provider, rules.planType(provider), rules.planTier(provider)),
-    /** 官方档位 / 计费挡位 / 国内档位表（2.7.4） */
-    planTier: (provider) => rules.planTier(provider),
-    billingClass: (provider) => rules.billingClass(provider),
-    cnTiers: (provider) => rules.cnTiers(provider),
-    /** 自动续费 / 账户订阅快照 / 上次对齐时间 / 「自动」按钮条件（2.7.5） */
-    autoRenew: (provider) => rules.autoRenew(provider),
-    accountPlan: (provider) => rules.accountPlan(provider),
-    accountSyncedAt: (provider) => rules.accountSyncedAt(provider),
-    resettable: (provider) => rules.resettable(provider),
-    /** 「赠送」记录与汇总（2.7.6 起） */
-    gifts: (provider) => rules.gifts(provider),
-    giftTotals: (provider) => giftTotals(rules.gifts(provider)),
-    /** 逐账户设置（2.7.7） */
-    accountEntries: (provider) => rules.accountEntries(provider),
+    /** 按订阅形式从套餐表挑的参考档（联动 plans.js） */
+    planSuggestion: (provider) => suggestPlanRef(provider, rules.planType(provider)),
     /** 本地 CLI agent 的本机登录态（2.7.2）；不是这类线路返回 null */
     localCli: (provider) => {
       if (!isLocalCliAgent(provider)) return null
@@ -2522,16 +2302,13 @@ export async function collectUsage(ctx, options) {
   const subscriptionWorth = [...worthAgg.values()]
     .map((agg) => {
       const monthlyCNY = Number(((agg.costCNY + agg.costUSD * USD_TO_CNY) * monthlyScale).toFixed(2))
-      const planTierId = billing.planTier(agg.provider)
-      const planRef = subscriptionPlanRef(agg.provider, planTierId)
-      // 参考月费（2.7.4 优先级）：官方档位（国内价）> 本次实付÷月数 > 手填月费 > plans.js 候选
+      const planRef = subscriptionPlanRef(agg.provider)
+      // 参考月费：优先用「本次实付 ÷ 订阅月数」（年付要摊到月），退回老的手填月费，再退回套餐表
       const manualMonthly = billing.effectiveMonthlyCNY(agg.provider)
       const paid = billing.paid(agg.provider)
-      const officialTier = planRef !== null && planRef.tierSource === 'cn-official' ? planRef : null
-      const refMin = officialTier !== null ? officialTier.minCNY : manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.minCNY
-      const refMax = officialTier !== null ? officialTier.maxCNY : manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.maxCNY
-      const refSource =
-        officialTier !== null ? 'tier' : manualMonthly !== null ? (paid !== null ? 'paid' : 'manual') : planRef === null ? null : 'plan'
+      const refMin = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.minCNY
+      const refMax = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.maxCNY
+      const refSource = manualMonthly !== null ? (paid !== null ? 'paid' : 'manual') : planRef === null ? null : 'plan'
       /**
        * 额度池订阅（quota-pool）：按「用掉的额度 / 该模型额度」的比例，从基础价里扣。
        *
@@ -2614,9 +2391,6 @@ export async function collectUsage(ctx, options) {
         // 订阅时长 / 到期（界面「本期」那行用）
         termMonths: billing.termMonths(agg.provider),
         paid,
-        // 官方档位与计费挡位（2.7.4）：月付挡含「一次买俩月」的限时优惠
-        planTier: planTierId,
-        billingClass: billing.billingClass(agg.provider),
         // 展开明细：每个模型的等价金额（统一折成人民币）+ 折合月
         modelRows: agg.modelRows
           .slice()
