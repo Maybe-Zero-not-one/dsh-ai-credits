@@ -118,6 +118,7 @@ window.__ModuleLoader__.load({
         ).filter((x) => typeof x === 'string'),
       )
       const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+      const nowMs = Date.now()
       const rows = []
       for (const item of payload.accounts) {
         if (!item || typeof item !== 'object') continue
@@ -128,13 +129,22 @@ window.__ModuleLoader__.load({
         let member = null
         if (pool && typeof pool.member === 'boolean') member = pool.member
         else if (memberIds.size > 0) member = memberIds.has(id)
+        /**
+         * 套餐到期核查（2.7.3）：member 标记可能是缓存的旧状态 ——
+         * planExpiresAtMs 已经过了就**不算已订阅**（标「已过期」），
+         * 免得把过期账号当成还在订阅、把它的旧积分当成可用额度。
+         */
+        const planExp = pool ? num(pool.planExpiresAtMs) : null
+        const planExpired = member === true && planExp !== null && planExp <= nowMs
+        if (planExpired) member = false
         rows.push({
           id,
           name: typeof item.accountName === 'string' && item.accountName !== '' ? item.accountName : null,
           selected: item.selected === true,
           member,
+          planExpired,
           credits: pool ? num(pool.credits) : null,
-          planExpiresAtMs: pool ? num(pool.planExpiresAtMs) : null,
+          planExpiresAtMs: planExp,
           nearestExpiryMs: pool ? num(pool.nearestExpiryMs) : null,
           checkedInToday: pool && typeof pool.checkedInToday === 'boolean' ? pool.checkedInToday : null,
           tokenExpiresAtMs: num(item.tokenExpiresAtMs),
@@ -151,8 +161,9 @@ window.__ModuleLoader__.load({
         currentId = marked ? marked.id : null
       }
       const memberCount = rows.filter((r) => r.member === true).length
+      const expiredCount = rows.filter((r) => r.planExpired === true).length
       const anyMemberKnown = rows.some((r) => r.member !== null)
-      return { count: rows.length, currentId, accounts: rows, memberCount, anyMemberKnown }
+      return { count: rows.length, currentId, accounts: rows, memberCount, expiredCount, anyMemberKnown }
     }
 
     const fetchCreditBalances = async () => {
@@ -692,6 +703,8 @@ window.__ModuleLoader__.load({
 .ac-account-member[data-member="no"] { color: var(--dsw-alias-label-secondary, #8a8f98);
   border: 1px dashed var(--dsw-alias-border-l1, rgba(128,128,128,.34)); }
 .ac-account-member[data-member="unknown"] { color: var(--dsw-alias-label-secondary, #8a8f98); opacity: .7; }
+.ac-account-member[data-member="expired"] { color: var(--dsw-alias-state-danger-primary, #d9534f);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-danger-primary, #d9534f) 40%, transparent); }
 .ac-account-fact { color: var(--dsw-alias-label-secondary, #8a8f98); }
 .ac-account-fact b { color: var(--dsw-alias-label-primary, inherit); }
 .ac-account-cur { margin-left: auto; font-size: 9.5px; padding: 1px 5px; border-radius: 4px;
@@ -703,9 +716,30 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, #8a8f98);
   border: 1px dashed var(--dsw-alias-border-l1, rgba(128,128,128,.34)); }
 .ac-cli-note b { color: var(--dsw-alias-label-primary, inherit); }
-/* Go 官方额度一键填（2.7.2） */
+/* Go 官方额度一键填（2.7.2）+ 全表检索（2.7.3） */
 .ac-go-fill { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 .ac-go-src { font-size: 10px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-go-table { margin-top: 7px; padding: 8px 10px; border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
+.ac-go-table-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.ac-go-table-search { flex: 1; min-width: 150px; max-width: 260px; }
+.ac-go-table-rows { max-height: 320px; overflow-y: auto; }
+.ac-go-table-row { display: grid; grid-template-columns: minmax(160px, 1.6fr) repeat(5, minmax(52px, .7fr));
+  gap: 6px; align-items: center; font-size: 10.5px; padding: 3px 2px;
+  border-top: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.12)); }
+.ac-go-table-th { border-top: none; font-weight: 600; font-size: 10px;
+  color: var(--dsw-alias-label-secondary, #8a8f98); position: sticky; top: 0;
+  background: var(--dsw-alias-bg-layer-1, #f4f5f7); }
+.ac-go-table-row[data-inroute] { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 6%, transparent); }
+.ac-go-table-model { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.ac-go-table-model code { font-size: 10px; }
+.ac-go-inroute { font-style: normal; font-size: 9px; padding: 0 4px; border-radius: 4px;
+  color: var(--dsw-alias-brand-primary, #4d7cfe);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 12%, transparent); }
+.ac-go-peak { font-style: normal; font-size: 9px; padding: 0 4px; border-radius: 4px;
+  color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 35%, transparent); }
+.ac-go-free { color: var(--dsw-alias-state-ok-primary, #2e9e5b); font-size: 10px; }
 /* 未配置线路的收起开关（2.7.1） */
 .ac-unconf-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 2px; }
 .ac-unconf-note { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
@@ -1061,6 +1095,9 @@ window.__ModuleLoader__.load({
       const [showUnconfigured, setShowUnconfigured] = React.useState(false)
       // 多账号明细展开的线路 id（2.7.2）：null = 都收着
       const [accountsOpen, setAccountsOpen] = React.useState(null)
+      // Go 官方额度全表展开 + 表内检索词（2.7.3）
+      const [goTableOpen, setGoTableOpen] = React.useState(false)
+      const [goTableQuery, setGoTableQuery] = React.useState('')
 
       const load = React.useCallback(async () => {
         try {
@@ -1363,7 +1400,13 @@ window.__ModuleLoader__.load({
               payload.usage === undefined || payload.usage === null
                 ? prev.usage
                 : { ...payload.usage, creditBalances: balances }
-            return { ...prev, dshApi: payload.dshApi, usage: nextUsage }
+            return {
+              ...prev,
+              dshApi: payload.dshApi,
+              usage: nextUsage,
+              // 「重新读」也带回 Go 官方额度表（2.7.3）
+              opencodeGo: payload.opencodeGo !== undefined ? payload.opencodeGo : prev.opencodeGo,
+            }
           })
           // 刷新时宿主可能把几条手选的口径退回订阅了 —— 说出来，别让人以为点坏了
           const cleared =
@@ -2491,6 +2534,8 @@ window.__ModuleLoader__.load({
           : searchedRoutes.filter((route) => route.unconfigured !== true)
       // 多账号（2.7.1）：页面问连接器 /usage 拿的账号列表，按线路 id 索引
       const usageCreditBooks = (data && data.usage && data.usage.creditBalances) || {}
+      // Go 官方额度全表（2.7.3）：宿主实时拉官方端点、快照兜底；线路里有的排前面
+      const goCatalog = data && data.opencodeGo ? data.opencodeGo : null
       // 订阅线路：卡片标蓝，汇总里也能直接把名字列出来
       const dshSubscribed = dshRoutes.filter((route) => route.billing && route.billing.mode === 'credits')
       const dshSubscribedNames = dshSubscribed.map((route) => route.name || route.id).join('、')
@@ -2776,10 +2821,99 @@ window.__ModuleLoader__.load({
                     h(
                       'span',
                       { className: 'ac-go-src' },
-                      'OpenCode ' + goSug.tierLabel + ' $' + goSug.basePrice + '/月 · 官方快照 ' + goSug.snapshotAt,
+                      'OpenCode ' + goSug.tierLabel + ' $' + goSug.basePrice + '/月 · ',
+                      goCatalog !== null && goCatalog.source === 'live'
+                        ? '官方实时表 ' + (goCatalog.count || '') + ' 个模型'
+                        : '官方快照 ' + goSug.snapshotAt,
                       goSug.unmatched.length > 0 ? ' · ' + goSug.unmatched.length + ' 个模型官方表里没有' : '',
                     ),
+                    // 全表检索（2.7.3）：不止本线路的 18 个，官方全部模型都能查
+                    goCatalog !== null && Array.isArray(goCatalog.models) && goCatalog.models.length > 0
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'ac-chip',
+                            'data-on': goTableOpen ? '' : undefined,
+                            onClick: () => setGoTableOpen(!goTableOpen),
+                          },
+                          goTableOpen ? '收起额度表 ▴' : '查全部模型额度（' + goCatalog.models.length + '）▾',
+                        )
+                      : null,
                   )
+                : null,
+              // 官方额度全表：可检索、三档额度 + 官方单价，本线路有的标出来
+              goTableOpen && goCatalog !== null && Array.isArray(goCatalog.models)
+                ? (() => {
+                    const q = goTableQuery.trim().toLowerCase()
+                    const rows =
+                      q === ''
+                        ? goCatalog.models
+                        : goCatalog.models.filter(
+                            (r) => r.model.includes(q) || (r.name || '').toLowerCase().includes(q),
+                          )
+                    return h(
+                      'div',
+                      { className: 'ac-go-table' },
+                      h(
+                        'div',
+                        { className: 'ac-go-table-head' },
+                        h('input', {
+                          className: 'ac-sub-input ac-go-table-search',
+                          type: 'search',
+                          placeholder: '检索模型 id / 名称…',
+                          value: goTableQuery,
+                          onChange: (event) => setGoTableQuery(event.target.value),
+                        }),
+                        h(
+                          'span',
+                          { className: 'ac-go-src' },
+                          goCatalog.source === 'live'
+                            ? '官方实时表 · ' + fmtTime(goCatalog.at) + (goCatalog.stale ? '（上次成功值）' : '')
+                            : '离线快照 ' + (goCatalog.snapshotAt || '') + (goCatalog.error ? ' · ' + goCatalog.error : ''),
+                          ' · 命中 ' + rows.length + ' / ' + goCatalog.models.length,
+                        ),
+                      ),
+                      h(
+                        'div',
+                        { className: 'ac-go-table-rows' },
+                        h(
+                          'div',
+                          { className: 'ac-go-table-row ac-go-table-th' },
+                          h('span', null, '模型'),
+                          h('span', null, 'Go $10'),
+                          h('span', null, 'Plus $40'),
+                          h('span', null, 'Teams $20/人'),
+                          h('span', null, '输入 $/M'),
+                          h('span', null, '输出 $/M'),
+                        ),
+                        ...rows.slice(0, 60).map((r) =>
+                          h(
+                            'div',
+                            { className: 'ac-go-table-row', key: r.model, 'data-inroute': r.inRoute ? '' : undefined },
+                            h(
+                              'span',
+                              { className: 'ac-go-table-model' },
+                              h('code', null, r.model),
+                              r.inRoute ? h('i', { className: 'ac-go-inroute' }, '本线路') : null,
+                              r.peakFactor ? h('i', { className: 'ac-go-peak' }, '高峰×' + r.peakFactor) : null,
+                            ),
+                            r.free
+                              ? h('span', { className: 'ac-go-free' }, '限时免费')
+                              : r.limits
+                                ? h('span', null, '$' + (r.limits.go !== undefined ? r.limits.go : '—'))
+                                : h('span', null, '—'),
+                            r.limits && r.limits['go-plus'] !== undefined ? h('span', null, '$' + r.limits['go-plus']) : h('span', null, r.free ? '' : '—'),
+                            r.limits && r.limits['go-teams'] !== undefined ? h('span', null, '$' + r.limits['go-teams']) : h('span', null, r.free ? '' : '—'),
+                            h('span', null, r.input !== null ? '$' + r.input : '—'),
+                            h('span', null, r.output !== null ? '$' + r.output : '—'),
+                          ),
+                        ),
+                        rows.length > 60 ? h('div', { className: 'ac-go-src' }, '只摆前 60 条，检索词再收窄一点') : null,
+                        rows.length === 0 ? h('div', { className: 'ac-go-src' }, '没有匹配「' + goTableQuery.trim() + '」的模型') : null,
+                      ),
+                    )
+                  })()
                 : null,
               h(
                 'div',
@@ -3267,7 +3401,9 @@ window.__ModuleLoader__.load({
               h('b', null, String(accountsInfo.count)),
               ' 个账号',
               accountsInfo.anyMemberKnown
-                ? '，其中 ' + String(accountsInfo.memberCount) + ' 个开了订阅'
+                ? '，其中 ' + String(accountsInfo.memberCount) + ' 个在订阅中' +
+                  (accountsInfo.expiredCount > 0 ? '、' + String(accountsInfo.expiredCount) + ' 个订阅已过期' : '') +
+                  (accountsInfo.memberCount < accountsInfo.count ? '（未订阅的账号没有套餐额度，只有免费/签到积分）' : '')
                 : '（这家连接器没给会员状态，只能看账号本身）',
             ),
             ...accountsInfo.accounts.map((acc) => {
@@ -3282,9 +3418,15 @@ window.__ModuleLoader__.load({
                   'span',
                   {
                     className: 'ac-account-member',
-                    'data-member': acc.member === true ? 'yes' : acc.member === false ? 'no' : 'unknown',
+                    'data-member': acc.planExpired ? 'expired' : acc.member === true ? 'yes' : acc.member === false ? 'no' : 'unknown',
                   },
-                  acc.member === true ? '已订阅' : acc.member === false ? '未订阅' : '订阅未知',
+                  acc.planExpired
+                    ? '订阅已过期'
+                    : acc.member === true
+                      ? '已订阅'
+                      : acc.member === false
+                        ? '未订阅'
+                        : '订阅未知',
                 ),
                 acc.credits !== null
                   ? h('span', { className: 'ac-account-fact' }, '积分 ', h('b', null, fmtAccCredits(acc.credits)))
@@ -3349,7 +3491,7 @@ window.__ModuleLoader__.load({
                   },
                   String(accountsInfo.count) + ' 个账号',
                   accountsInfo.anyMemberKnown
-                    ? ' · ' + String(accountsInfo.memberCount) + ' 个已订阅'
+                    ? ' · ' + String(accountsInfo.memberCount) + '/' + String(accountsInfo.count) + ' 已订阅'
                     : '',
                   accountsOpen === route.id ? ' ▴' : ' ▾',
                 )

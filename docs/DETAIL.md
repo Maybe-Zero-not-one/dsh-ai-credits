@@ -118,6 +118,38 @@ OpenCode Go 那种：付一笔**基础价**（$10），各家模型各给一笔�
 - **`looksTokenBilled(provider)`**：白名单 `TOKEN_BILLED` 之外，按 id 形状补判 `<家族>-<后缀>`（家族 = volcengine / ark / siliconflow / deepseek / tokenplus）算按量；但**含 plan/subscription/member/vip 字样的一律不算**（`ark-agent-plan-cn` 是套餐）。修的是 `volcengine-live` 这类新通道掉进「安全默认=订阅」的问题。
 - **`route.unconfigured`**：`credential.configured === false`，或「没有密钥位 + 没有 settings 位 + 零模型」（空挂的壳）。自带登录的连接器（trae/qoder/workbuddy/本地 CLI）没有密钥位但**有模型**，不算未配置。界面默认收起这些，给「显示未配置（N）」开关；**搜索时不藏**。
 
+### 本地 CLI agent：`unknown` 档（2.7.2）
+
+`local-claude-code` / `local-codex-cli` 原来**硬编码在 `CREDIT_ROUTES`** 里，无条件判成订阅。但这些 id 是 **ds-bot 注册的本地命令行 agent**（见 `ds-bot/src/host/local-agents/engines.js`），不是 DSH 买的订阅 —— 它可能 OAuth + Pro/Max 订阅、可能 API key 按量、也可能没登录。
+
+改法：
+- `LOCAL_CLI_AGENTS` 表记各家凭据文件与 API key 环境变量名（照 ds-bot 的 `signedIn` 口径）。`probeLocalCliAuth()` **只 `existsSync` 看文件在不在，绝不读内容**。
+- `auto()` 对 `local-*`：探到 → `credits`，探不到 → **`unknown`**（新档，标签「未确认」）。
+- `unknown` **不在 `BILLING_MODES` 里**（不是手选档位，只是自动判定的一个出口），但要贯通：宿主+前端 `BILLING_LABELS`、`byBilling`/`byMode`、用量聚合的 `creditTokens` 累加（两处都要排除）。
+- ⚠ **`priced()` 必须改成白名单式**（`mode === 'token' || mode === 'estimate' || foldCredit`）。原来是 `!== 'credits'` 排除法，加了 unknown 后会把它当成要折钱，凭空多出假花费。
+
+### OpenCode Go 官方额度表（2.7.2）
+
+`opencode-go.js` 是官方快照，来源 **`https://opencode.ai/inference/go/v1/models`（公开端点，不用鉴权）**，文档 <https://opencode.ai/docs/console/go>。
+
+官方口径（文档原话）：「$1.50 of usage on a model with a $15 limit uses **10%** of your monthly allowance. So does $6 on a model with a $60 limit.」→ 各模型额度是**同一个月度额度池的百分比刻度**。
+
+- `OPENCODE_GO_MODELS`：37 个模型 × 三档额度（`go` / `go-plus` / `go-teams`）+ 官方单价（`input` / `output` / `cacheRead` / `peakFactor`）
+- `normalizeGoModel()`：去 provider 前缀（`opencode-go/kimi-k3`）、去日期后缀（`-261017`）、大小写归一
+- `goUsageUSD()`：按**这家自己的官方单价**把 token 折美元。没有 `cacheRead` 单价的按输入价算（保守，不虚低）
+- `buildGoPool(modelIds, tier)`：拿线路实际模型逐个对官方表，生成 `{basePrice, pools, unmatched}` 供界面一键填
+- 折算时 `priceSource: 'opencode-official'` → `estimated: false`；其他家仍走 `vendor-estimate`
+
+⚠ **别再拿原厂价折 Go 的用量**：2.7.1 用 DeepSeek 原厂价算出 $15.69，官方单价实际 $14.73，偏差 6.5%。
+
+更准的路子（还没接）：官方响应头 `opencode.allowance` 报每次请求吃掉多少额度；`/inference/go/v1/usage` 给 rolling/weekly/monthly 三个限额的已用百分比。都需要 Go 的 API key。
+
+### 多账号逐账号订阅状态（2.7.2）
+
+连接器 `/usage` 的 **`pool.accounts[]`** 带 `member`（是否会员）、`credits`、`planExpiresAtMs`、`current`、`checkedInToday`；`pool.memberAccountIds` / `effectiveMemberAccountIds` 兜底。`readAccounts()` 按 accountId 关联，会员判定优先 `pool.member`，退回落名单，两样都没有 → `null`（界面标「订阅未知」，不瞎猜）。
+
+⚠ `accountsPanel` 在 routeCard 里（约 2497 行），**不能引用用量栏的 `fmtCredits`**（3655 行才声明，const 箭头函数不提升 → TDZ → 整页消失，坑 #1）。面板内自带 `fmtAccCredits`。
+
 ## 用量花费怎么算
 
 分三类，因为不是所有线路都在花现金：

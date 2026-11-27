@@ -96,30 +96,31 @@ export function normalizeGoModel(id) {
   let s = id.trim().toLowerCase()
   const at = s.lastIndexOf('/')
   if (at >= 0) s = s.slice(at + 1) // opencode-go/kimi-k3 → kimi-k3
-  if (OPENCODE_GO_MODELS[s]) return s
+  const table = currentGoModels()
+  if (table[s]) return s
   // 去掉尾部的日期 / 版本后缀再试：-261017 / -1017 / -20261017
   const trimmed = s.replace(/-\d{4,8}$/, '')
-  if (OPENCODE_GO_MODELS[trimmed]) return trimmed
+  if (table[trimmed]) return trimmed
   return null
 }
 
-/** 这个模型在某个档位的月度额度（美元）；免费模型 / 不认识返回 null */
+/** 这个模型在某个档位的月度额度（美元）；免费模型 / 不认识返回 null。实时缓存优先 */
 export function goModelLimit(modelId, tier) {
   const key = normalizeGoModel(modelId)
   if (key === null) return null
-  const row = OPENCODE_GO_MODELS[key]
-  if (row.free === true || !row.limits) return null
+  const row = currentGoModels()[key]
+  if (row === undefined || row.free === true || !row.limits) return null
   const t = tier === 'go-plus' || tier === 'go-teams' ? tier : 'go'
   const v = row.limits[t]
   return typeof v === 'number' && v > 0 ? v : null
 }
 
-/** 这个模型的官方单价（美元 / 1M tokens）；不认识返回 null */
+/** 这个模型的官方单价（美元 / 1M tokens）；不认识返回 null。实时缓存优先 */
 export function goModelPrice(modelId) {
   const key = normalizeGoModel(modelId)
   if (key === null) return null
-  const row = OPENCODE_GO_MODELS[key]
-  if (typeof row.input !== 'number') return null
+  const row = currentGoModels()[key]
+  if (row === undefined || typeof row.input !== 'number') return null
   return {
     input: row.input,
     output: typeof row.output === 'number' ? row.output : 0,
@@ -161,7 +162,8 @@ export function buildGoPool(modelIds, tier) {
     if (limit === null) {
       const key = normalizeGoModel(id)
       // 免费模型不算「对不上」，它本来就不占额度
-      if (key === null || OPENCODE_GO_MODELS[key].free !== true) unmatched.push(String(id))
+      const row = key === null ? null : currentGoModels()[key]
+      if (key === null || (row && row.free !== true)) unmatched.push(String(id))
       continue
     }
     pools.push({ model: String(id), quota: limit })
@@ -175,4 +177,167 @@ export function buildGoPool(modelIds, tier) {
     unmatched,
     snapshotAt: OPENCODE_GO_SNAPSHOT_AT,
   }
+}
+
+/* ============================================================================
+ * 实时检索（2.7.3）—— 直接问官方公开端点，快照只当兜底
+ *
+ * 主人问「opencode 的各个模型额度检索不到相关信息吗」：能检索，端点公开、
+ * 不用鉴权。这里照 pricing-sync.js 的规矩做：拉不到 / 解析不出可信结果 →
+ * 返回 ok:false 并保留上次成功值，绝不用半截数据覆盖快照。
+ * ==========================================================================*/
+
+const MODELS_URL = 'https://opencode.ai/inference/go/v1/models'
+const LIVE_CACHE_MS = 6 * 60 * 60 * 1000 // 6 小时，别每次开页面都打人家端点
+const LIVE_TIMEOUT_MS = 15000
+
+let liveCache = null
+
+/**
+ * 把端点返回的 data[] 解析成与快照同构的表。
+ *  sanity：至少 10 个模型、额度都是正数且 < 100000 —— 越界当解析失败。
+ */
+function extractLive(json) {
+  const list = json && Array.isArray(json.data) ? json.data : null
+  if (list === null || list.length < 10) return null
+  const models = {}
+  let withLimits = 0
+  for (const row of list) {
+    if (!row || typeof row.id !== 'string' || row.id === '') continue
+    const id = row.id.trim().toLowerCase()
+    const cost = row.cost && row.cost.text ? row.cost.text : {}
+    const input = cost.input && typeof cost.input.price === 'number' ? cost.input.price : null
+    const output = cost.output && typeof cost.output.price === 'number' ? cost.output.price : 0
+    const cacheRead =
+      cost.input && cost.input.cache && typeof cost.input.cache.read === 'number' ? cost.input.cache.read : null
+    // 分时倍率：取 multipliers 里最大的 factor（只记有没有、多大，具体条件随官方变）
+    let peakFactor = null
+    if (Array.isArray(cost.multipliers)) {
+      for (const m of cost.multipliers) {
+        if (m && typeof m.factor === 'number' && m.factor > 1) {
+          peakFactor = peakFactor === null ? m.factor : Math.max(peakFactor, m.factor)
+        }
+      }
+    }
+    const mu = row.go && row.go.monthly_usage ? row.go.monthly_usage : null
+    if (mu && typeof mu.go === 'number') {
+      const limits = {}
+      for (const key of ['go', 'go-plus', 'go-teams']) {
+        const v = mu[key]
+        if (typeof v === 'number' && v > 0 && v < 100000) limits[key] = v
+      }
+      if (limits.go !== undefined) {
+        models[id] = { limits, input, output, cacheRead, peakFactor, name: typeof row.name === 'string' ? row.name : null }
+        withLimits += 1
+        continue
+      }
+    }
+    // 没有 monthly_usage 的：免费模型（单价 0）或决策/向量以外的新类型
+    if (input === 0 && output === 0) {
+      models[id] = { free: true, input: 0, output: 0, name: typeof row.name === 'string' ? row.name : null }
+    } else if (input !== null) {
+      // 有价但没额度信息：只记价，额度当未知（界面标「官方表没给额度」）
+      models[id] = { limits: null, input, output, cacheRead, peakFactor, name: typeof row.name === 'string' ? row.name : null }
+    }
+  }
+  if (withLimits < 10) return null
+  return models
+}
+
+/**
+ * 实时拉官方模型表。失败保留上次成功值（stale），再不行退回快照。
+ * @returns {{ ok, at, source:'live'|'snapshot', models, count, error? }}
+ */
+export async function fetchGoModels({ force = false } = {}) {
+  const now = Date.now()
+  if (!force && liveCache !== null && now - liveCache.atMs < LIVE_CACHE_MS) {
+    return { ...liveCache.value, cached: true }
+  }
+  let json
+  try {
+    const response = await fetch(MODELS_URL, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(LIVE_TIMEOUT_MS),
+    })
+    if (!response.ok) throw new Error('HTTP ' + response.status)
+    json = await response.json()
+  } catch (error) {
+    const stale = liveCache !== null ? { ...liveCache.value, cached: true, stale: true } : null
+    return {
+      ok: false,
+      at: new Date().toISOString(),
+      source: stale ? 'live' : 'snapshot',
+      error: '拉官方模型表失败：' + String((error && error.message) || error),
+      models: stale ? stale.models : OPENCODE_GO_MODELS,
+      count: Object.keys(stale ? stale.models : OPENCODE_GO_MODELS).length,
+      snapshotAt: OPENCODE_GO_SNAPSHOT_AT,
+    }
+  }
+  const models = extractLive(json)
+  if (models === null) {
+    const stale = liveCache !== null ? { ...liveCache.value, cached: true, stale: true } : null
+    return {
+      ok: false,
+      at: new Date().toISOString(),
+      source: stale ? 'live' : 'snapshot',
+      error: '官方端点结构变了，解析不出可信额度表（没动快照）',
+      models: stale ? stale.models : OPENCODE_GO_MODELS,
+      count: Object.keys(stale ? stale.models : OPENCODE_GO_MODELS).length,
+      snapshotAt: OPENCODE_GO_SNAPSHOT_AT,
+    }
+  }
+  const value = {
+    ok: true,
+    at: new Date().toISOString(),
+    source: 'live',
+    url: MODELS_URL,
+    models,
+    count: Object.keys(models).length,
+  }
+  liveCache = { atMs: now, value }
+  return value
+}
+
+/** 同步读「当前最好的表」：有实时缓存用实时，没有用快照。给折算用，不发网络请求 */
+export function currentGoModels() {
+  return liveCache !== null ? liveCache.value.models : OPENCODE_GO_MODELS
+}
+
+/**
+ * 全表检索（给界面「各模型额度」可展开表用）。
+ * @param {string|null} query 关键词（模型 id / 名称，大小写不敏感）
+ * @param {object|null} models 表（默认当前最好的表）
+ * @returns {Array<{model,name,limits,free,input,output,cacheRead,peakFactor,inRoute}>}
+ */
+export function searchGoModels(query, models, routeModelIds) {
+  const table = models && typeof models === 'object' ? models : currentGoModels()
+  const needle = typeof query === 'string' ? query.trim().toLowerCase() : ''
+  const routeSet = new Set(
+    (Array.isArray(routeModelIds) ? routeModelIds : []).map((id) => normalizeGoModel(id)).filter(Boolean),
+  )
+  const rows = []
+  for (const [id, row] of Object.entries(table)) {
+    const name = typeof row.name === 'string' ? row.name : ''
+    if (needle !== '' && !id.includes(needle) && !name.toLowerCase().includes(needle)) continue
+    rows.push({
+      model: id,
+      name: name || null,
+      limits: row.limits || null,
+      free: row.free === true,
+      input: typeof row.input === 'number' ? row.input : null,
+      output: typeof row.output === 'number' ? row.output : null,
+      cacheRead: typeof row.cacheRead === 'number' ? row.cacheRead : null,
+      peakFactor: typeof row.peakFactor === 'number' ? row.peakFactor : null,
+      inRoute: routeSet.has(id),
+    })
+  }
+  // 线路里有的排前面，其余按 Go 额度从大到小
+  rows.sort((a, b) => {
+    if (a.inRoute !== b.inRoute) return a.inRoute ? -1 : 1
+    const la = a.limits ? a.limits.go || 0 : 0
+    const lb = b.limits ? b.limits.go || 0 : 0
+    if (la !== lb) return lb - la
+    return a.model.localeCompare(b.model)
+  })
+  return rows
 }

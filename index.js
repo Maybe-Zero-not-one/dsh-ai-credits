@@ -26,6 +26,7 @@ import {
 import { collectDshApi } from './dsh-api.js'
 import { collectUsage, describeBilling } from './usage.js'
 import { fetchOfficialPricing } from './pricing-sync.js'
+import { fetchGoModels, searchGoModels, OPENCODE_GO_TIERS, OPENCODE_GO_SNAPSHOT_AT } from './opencode-go.js'
 import { collectOfficialUsage, resolveKeyMap, importOfficialFiles } from './official-usage.js'
 
 export const inject = ['webServer', 'timer']
@@ -1340,12 +1341,16 @@ export function apply(ctx, config) {
     })
   }
 
-  function currentPayload(dshApi, usage, official, officialUsage) {
+  function currentPayload(dshApi, usage, official, officialUsage, goLive) {
     const state = mergeSeeds(loadState() || blankState())
     const sources = publicSources(state)
     const prices = publicPrices(state)
     const plans = publicPlans(state)
     const removedList = publicRemoved(state)
+    // opencode-go 官方额度表（2.7.3）：实时优先、快照兜底；全表给界面检索
+    const goRoute = dshApi && Array.isArray(dshApi.routes) ? dshApi.routes.find((r) => r.id === 'opencode-go') : null
+    const goRouteModels = goRoute && Array.isArray(goRoute.models) ? goRoute.models.map((m) => m.id) : []
+    const goTable = goLive && goLive.models ? goLive.models : null
     return {
       ok: true,
       now: nowIso(),
@@ -1361,6 +1366,19 @@ export function apply(ctx, config) {
       usage: usage || null,
       // 官网实时价核对结果（拉到 / 拉不到 / 与本地快照有没有差）
       officialPricing: official || null,
+      // OpenCode Go 官方额度表：全表可检索（2.7.3）。source=live 实时 / snapshot 兜底
+      opencodeGo: {
+        ok: goLive ? goLive.ok === true : false,
+        source: goLive ? goLive.source : 'snapshot',
+        stale: goLive ? goLive.stale === true : false,
+        at: goLive ? goLive.at : null,
+        error: goLive && goLive.error ? goLive.error : null,
+        snapshotAt: OPENCODE_GO_SNAPSHOT_AT,
+        tiers: OPENCODE_GO_TIERS,
+        count: goLive ? goLive.count : null,
+        // 全表（线路里有的排前面）；界面搜索在前端本地过滤
+        models: searchGoModels('', goTable, goRouteModels),
+      },
       // 官方导出的用量账单（CSV）—— 权威口径，用来跟日志折算对账
       officialUsage: officialUsage || null,
       counts: {
@@ -1445,9 +1463,11 @@ export function apply(ctx, config) {
           const billing = loadBillingOverrides()
           const dshApi = await collectDshApi(ctx, { billing }).catch(() => null)
           const official = await fetchOfficialPricing().catch(() => null)
+          // Go 官方额度表：先拉（有 6h 缓存），让折算能用上新价，再算用量
+          const goLive = await fetchGoModels().catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
           const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
-          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage, goLive))
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
@@ -1480,9 +1500,23 @@ export function apply(ctx, config) {
           }
           const dshApi = await collectDshApi(ctx, { force: true, billing })
           const official = await fetchOfficialPricing({ force: true }).catch(() => null)
+          const goLive = await fetchGoModels({ force: refreshRequested(req) }).catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR, { force: true }).catch(() => null)
           const usage = await collectUsage(ctx, { force: true, window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
-          sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage, billingRefresh })
+          // 「重新读」也带全表（界面额度检索表就在这栏）
+          const goRoute = dshApi && Array.isArray(dshApi.routes) ? dshApi.routes.find((r) => r.id === 'opencode-go') : null
+          const opencodeGo = {
+            ok: goLive ? goLive.ok === true : false,
+            source: goLive ? goLive.source : 'snapshot',
+            stale: goLive ? goLive.stale === true : false,
+            at: goLive ? goLive.at : null,
+            error: goLive && goLive.error ? goLive.error : null,
+            snapshotAt: OPENCODE_GO_SNAPSHOT_AT,
+            tiers: OPENCODE_GO_TIERS,
+            count: goLive ? goLive.count : null,
+            models: searchGoModels('', goLive && goLive.models ? goLive.models : null, goRoute && Array.isArray(goRoute.models) ? goRoute.models.map((m) => m.id) : []),
+          }
+          sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage, billingRefresh, opencodeGo })
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
@@ -1581,9 +1615,10 @@ export function apply(ctx, config) {
           const billing = loadBillingOverrides()
           const dshApi = await collectDshApi(ctx, { billing }).catch(() => null)
           const official = await fetchOfficialPricing().catch(() => null)
+          const goLive = await fetchGoModels().catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
           const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
-          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage, goLive))
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
