@@ -58,6 +58,7 @@ function normalizeBillingEntry(value) {
       mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
       subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
       basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
+      autoRenew: null, accountPlan: null, accountSyncedAt: null,
     }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
@@ -98,14 +99,43 @@ function normalizeBillingEntry(value) {
   }
   // 官方档位（2.7.4）：只认 cn-tiers.js 里存在的 id
   const planTier = typeof value.planTier === 'string' && cnTierById(value.planTier) !== null ? value.planTier : null
+  // 自动续费（2.7.5）：true 连续订阅自动对齐周期 / false 一次买 N 个月 / null 没设置
+  const autoRenew = typeof value.autoRenew === 'boolean' ? value.autoRenew : null
+  // 账户订阅快照（2.7.5）：只留公开字段，金额账户里没有
+  let accountPlan = null
+  if (value.accountPlan && typeof value.accountPlan === 'object' && !Array.isArray(value.accountPlan)) {
+    const ap = value.accountPlan
+    const str = (v, max) => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null)
+    const name = str(ap.name, 60)
+    const planName = str(ap.planName, 60)
+    const expiresAt =
+      typeof ap.expiresAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.expiresAt) ? ap.expiresAt : null
+    if (name !== null || planName !== null || expiresAt !== null) {
+      accountPlan = {
+        name,
+        planName,
+        planTier: str(ap.planTier, 60),
+        expiresAt,
+        periodStart: typeof ap.periodStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.periodStart) ? ap.periodStart : null,
+        source: str(ap.source, 40) || 'connector',
+        atMs: typeof ap.atMs === 'number' && Number.isFinite(ap.atMs) ? ap.atMs : null,
+      }
+    }
+  }
+  const accountSyncedAt =
+    typeof value.accountSyncedAt === 'number' && Number.isFinite(value.accountSyncedAt) && value.accountSyncedAt > 0
+      ? value.accountSyncedAt
+      : null
   const empty =
     mode === null && estimate === false && monthlyCNY === null && planType === null &&
     subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
-    basePrice === null && quotaPools === null && planTier === null
+    basePrice === null && quotaPools === null && planTier === null &&
+    autoRenew === null && accountPlan === null && accountSyncedAt === null
   if (empty) return null
   return {
     mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
     termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
+    autoRenew, accountPlan, accountSyncedAt,
   }
 }
 
@@ -152,6 +182,9 @@ function saveBillingOverrides(overrides) {
     }
     if (Array.isArray(entry.quotaPools) && entry.quotaPools.length > 0) value.quotaPools = entry.quotaPools
     if (entry.planTier) value.planTier = entry.planTier
+    if (typeof entry.autoRenew === 'boolean') value.autoRenew = entry.autoRenew
+    if (entry.accountPlan && typeof entry.accountPlan === 'object') value.accountPlan = entry.accountPlan
+    if (entry.accountSyncedAt !== null && entry.accountSyncedAt !== undefined) value.accountSyncedAt = entry.accountSyncedAt
     if (Object.keys(value).length > 0) compact[provider] = value
   }
   const tmp = BILLING_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
@@ -177,7 +210,7 @@ function reconcileBillingOverrides(overrides) {
   for (const [provider, entry] of Object.entries(overrides)) {
     if (entry.mode && entry.mode !== 'credits' && auto(provider) === 'credits') {
       cleared.push(provider)
-      // 只退 mode；其余字段（折算 / 月费 / 订阅形式 / 时间 / 时长 / 实付 / 额度池）都不动
+      // 只退 mode；其余字段（折算 / 月费 / 订阅形式 / 时间 / 时长 / 实付 / 额度池 / 账户快照）都不动
       const kept = {
         mode: null,
         estimate: entry.estimate,
@@ -192,6 +225,9 @@ function reconcileBillingOverrides(overrides) {
         baseCurrency: entry.baseCurrency,
         quotaPools: entry.quotaPools,
         planTier: entry.planTier === undefined ? null : entry.planTier,
+        autoRenew: entry.autoRenew === undefined ? null : entry.autoRenew,
+        accountPlan: entry.accountPlan === undefined ? null : entry.accountPlan,
+        accountSyncedAt: entry.accountSyncedAt === undefined ? null : entry.accountSyncedAt,
       }
       if (
         kept.estimate === false &&
@@ -203,7 +239,10 @@ function reconcileBillingOverrides(overrides) {
         kept.paidTotal === null &&
         kept.basePrice === null &&
         kept.quotaPools === null &&
-        kept.planTier === null
+        kept.planTier === null &&
+        kept.autoRenew === null &&
+        kept.accountPlan === null &&
+        kept.accountSyncedAt === null
       ) {
         continue
       }
@@ -1765,6 +1804,27 @@ export function apply(ctx, config) {
           sendJson(res, 400, { ok: false, error: 'planTier 不是已知的官方档位 id，或 null' })
           return
         }
+        // autoRenew（2.7.5）：true / false / null（null = 清掉，按自动续费算）
+        const autoRenew = parsed.autoRenew
+        if (autoRenew !== undefined && autoRenew !== null && typeof autoRenew !== 'boolean') {
+          sendJson(res, 400, { ok: false, error: 'autoRenew 只能 true / false / null' })
+          return
+        }
+        // accountPlan（2.7.5）：从账户读到的订阅快照；对象或 null
+        const accountPlan = parsed.accountPlan
+        if (accountPlan !== undefined && accountPlan !== null && (typeof accountPlan !== 'object' || Array.isArray(accountPlan))) {
+          sendJson(res, 400, { ok: false, error: 'accountPlan 要对象 { name, planName, expiresAt… }，或 null' })
+          return
+        }
+        // accountSyncedAt（2.7.5）：对齐时间戳（毫秒）；null = 清掉
+        const accountSyncedAt = parsed.accountSyncedAt
+        if (accountSyncedAt !== undefined && accountSyncedAt !== null) {
+          const v = Number(accountSyncedAt)
+          if (!Number.isFinite(v) || v <= 0) {
+            sendJson(res, 400, { ok: false, error: 'accountSyncedAt 要正的毫秒时间戳，或 null' })
+            return
+          }
+        }
         try {
           const overrides = loadBillingOverrides()
           const current = overrides[provider] || {}
@@ -1782,6 +1842,9 @@ export function apply(ctx, config) {
             baseCurrency: current.baseCurrency === undefined ? null : current.baseCurrency,
             quotaPools: current.quotaPools === undefined ? null : current.quotaPools,
             planTier: current.planTier === undefined ? null : current.planTier,
+            autoRenew: current.autoRenew === undefined ? null : current.autoRenew,
+            accountPlan: current.accountPlan === undefined ? null : current.accountPlan,
+            accountSyncedAt: current.accountSyncedAt === undefined ? null : current.accountSyncedAt,
           }
           if (touchMode) next.mode = mode
           if (estimate !== undefined) next.estimate = estimate
@@ -1825,24 +1888,18 @@ export function apply(ctx, config) {
             if (Array.isArray(next.quotaPools) && next.quotaPools.length === 0) next.quotaPools = null
           }
           if (planTier !== undefined) next.planTier = planTier === null ? null : String(planTier)
-          // 所有字段都空了就把这条删掉，别留一个空壳
-          if (
-            next.mode === null &&
-            next.estimate === false &&
-            next.monthlyCNY === null &&
-            next.planType === null &&
-            next.subscribedAt === null &&
-            next.promoNote === null &&
-            next.termMonths === null &&
-            next.paidTotal === null &&
-            next.basePrice === null &&
-            next.quotaPools === null &&
-            next.planTier === null
-          ) {
-            delete overrides[provider]
-          } else {
-            overrides[provider] = next
+          if (autoRenew !== undefined) next.autoRenew = autoRenew
+          if (accountPlan !== undefined) {
+            // 归一在 normalizeBillingEntry 里做（load 时），这里先原样收，落盘前过一遍
+            next.accountPlan = accountPlan === null ? null : accountPlan
           }
+          if (accountSyncedAt !== undefined) {
+            next.accountSyncedAt = accountSyncedAt === null ? null : Number(accountSyncedAt)
+          }
+          // 落盘前归一：accountPlan 里的脏字段在这一步被裁掉；全空就整条删掉
+          const normalized = normalizeBillingEntry(next)
+          if (normalized === null) delete overrides[provider]
+          else overrides[provider] = normalized
           saveBillingOverrides(overrides)
           sendJson(res, 200, {
             ok: true,

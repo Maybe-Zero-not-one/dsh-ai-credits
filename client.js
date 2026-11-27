@@ -41,10 +41,13 @@ window.__ModuleLoader__.load({
      * ⚠️ 这些是**累计值**，跟时间窗（今天 / 7 天 / 30 天）无关 —— 官方没给按天明细。
      */
     const CREDIT_ENDPOINTS = [
-      { route: 'trae', endpoint: 'dsh-connect-trae' },
-      { route: 'qoder', endpoint: 'dsh-connect-qoder' },
-      { route: 'qoder-global', endpoint: 'dsh-connect-qoder' },
-      { route: 'workbuddy', endpoint: 'dsh-connect-workbuddy' },
+      { route: 'trae', url: '/plugins/dsh-connect-trae/usage' },
+      { route: 'qoder', url: '/plugins/dsh-connect-qoder/usage' },
+      { route: 'qoder-global', url: '/plugins/dsh-connect-qoder/usage' },
+      { route: 'workbuddy', url: '/plugins/dsh-connect-workbuddy/usage' },
+      // CodeArts 的连接器是 dsh-codearts，订阅信息（planName / periodStart / periodEnd）
+      // 在它自己的 /api/codearts/status 里（2.7.5）
+      { route: 'codearts', url: '/api/codearts/status' },
     ]
 
     /** 从 /usage 的 credits 块里抠出「已消耗」「剩余」「总额度」 */
@@ -166,12 +169,105 @@ window.__ModuleLoader__.load({
       return { count: rows.length, currentId, accounts: rows, memberCount, expiredCount, anyMemberKnown }
     }
 
+    /**
+     * 从账户 /usage 里读「这条渠道的订阅信息」（2.7.5）。
+     *
+     * 各家连接器给的东西不一样，能拿多少拿多少：
+     *   Qoder      credits.planExpiresAtMs → 当前套餐到期日（没有档位名）
+     *   WorkBuddy  credits.packages 里 monthly:true 的包 → 包名带官方档位名
+     *              （「CodeBuddy个人体验版」），cycleRefreshMs → 本期刷新日
+     *   CodeArts   /api/codearts/status 的 credits.credits：planName（体验版…）、
+     *              periodStart / periodEnd —— 最全的一家
+     *   Trae       只给账号列表，订阅信息拿不到（null）
+     *
+     * ⚠ 金额（订阅时间 / 实付）账户里**没有** —— 首次订阅时间和实付永远手填，
+     *   这里只对齐「档位名 + 当前有效期」。
+     */
+    const readAccountPlan = (route, payload) => {
+      if (!payload || typeof payload !== 'object') return null
+      const dayOf = (ms) => {
+        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null
+        const d = new Date(ms)
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      }
+      // CodeArts：planName + periodStart/periodEnd 直接给
+      if (route === 'codearts') {
+        const c = payload.credits && payload.credits.credits ? payload.credits.credits : null
+        if (!c) return null
+        const expiresAt = typeof c.periodEnd === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(c.periodEnd) ? c.periodEnd : null
+        if (c.planName === undefined && expiresAt === null) return null
+        return {
+          name: typeof payload.accountName === 'string' && payload.accountName !== '' ? payload.accountName : null,
+          planName: typeof c.planName === 'string' && c.planName !== '' ? c.planName : null,
+          expiresAt,
+          periodStart: typeof c.periodStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(c.periodStart) ? c.periodStart : null,
+          source: 'codearts-status',
+          atMs: typeof c.fetchedAt === 'number' ? c.fetchedAt : Date.now(),
+        }
+      }
+      // Qoder：只有套餐到期时间
+      if (route === 'qoder' || route === 'qoder-global') {
+        const exp = payload.credits ? payload.credits.planExpiresAtMs : null
+        const day = dayOf(exp)
+        if (day === null) return null
+        return {
+          name: typeof payload.accountName === 'string' && payload.accountName !== '' ? payload.accountName : null,
+          planName: null,
+          expiresAt: day,
+          periodStart: null,
+          source: 'connector-usage',
+          atMs: typeof payload.creditsAtMs === 'number' ? payload.creditsAtMs : Date.now(),
+        }
+      }
+      // WorkBuddy：monthly 包的名字就是官方档位名
+      if (route === 'workbuddy') {
+        const packs = payload.credits && Array.isArray(payload.credits.packages) ? payload.credits.packages : []
+        const monthly = packs.filter((p) => p && p.monthly === true)
+        if (monthly.length === 0) return null
+        const named = monthly.find((p) => typeof p.packageName === 'string' && p.packageName !== '') || null
+        return {
+          name: typeof payload.accountName === 'string' && payload.accountName !== '' ? payload.accountName : null,
+          planName: named ? named.packageName : null,
+          expiresAt: dayOf(named ? named.cycleRefreshMs : null),
+          periodStart: null,
+          source: 'connector-usage',
+          atMs: Date.now(),
+        }
+      }
+      return null
+    }
+
+    /**
+     * 账户档位名 → 官方档位 id 的关键词匹配（2.7.5）。
+     * 匹配不上就 null —— 宁可不填也不瞎猜（体验版/免费 这种同义词列全）。
+     */
+    const TIER_NAME_HINTS = [
+      { re: /体验版|免费版|免费|trial|free/i, suffix: 'free' },
+      { re: /旗舰|ultra|flagship/i, suffix: 'ultra' },
+      { re: /高级|advanced/i, suffix: 'advanced' },
+      { re: /专业|pro\b/i, suffix: 'pro' },
+      { re: /标准|standard/i, suffix: 'standard' },
+      { re: /轻量|lite/i, suffix: 'lite' },
+    ]
+    const matchTierByName = (cnTiers, planName) => {
+      if (!cnTiers || !Array.isArray(cnTiers.tiers) || typeof planName !== 'string' || planName === '') return null
+      for (const hint of TIER_NAME_HINTS) {
+        if (!hint.re.test(planName)) continue
+        // 先找 id 以该后缀结尾的（codearts-doer-free / wb-cn-free / qoder-cn-pro…）
+        const byId = cnTiers.tiers.find((t) => t.id.endsWith('-' + hint.suffix))
+        if (byId) return byId.id
+        const byName = cnTiers.tiers.find((t) => hint.re.test(t.official))
+        if (byName) return byName.id
+      }
+      return null
+    }
+
     const fetchCreditBalances = async () => {
       const out = {}
       await Promise.all(
         CREDIT_ENDPOINTS.map(async (item) => {
           try {
-            const response = await fetch('/plugins/' + item.endpoint + '/usage', {
+            const response = await fetch(item.url, {
               cache: 'no-store',
               credentials: 'same-origin',
             })
@@ -182,7 +278,9 @@ window.__ModuleLoader__.load({
             const accounts = readAccounts(payload)
             // 积分：只有登录态才有意义
             const book = payload.status === 'signed-in' ? readCreditBook(payload.credits) : null
-            if (book === null && accounts === null) return
+            // 账户订阅信息（2.7.5）：CodeArts 的 status 没有 signed-in 字段，单独放行
+            const plan = payload.status === 'signed-in' || item.route === 'codearts' ? readAccountPlan(item.route, payload) : null
+            if (book === null && accounts === null && plan === null) return
             const prev = out[item.route]
             out[item.route] = {
               consumed: book === null ? (prev ? prev.consumed : null) : book.consumed,
@@ -190,6 +288,7 @@ window.__ModuleLoader__.load({
               total: book === null ? (prev ? prev.total : null) : book.total,
               accountName: payload.accountName || (prev ? prev.accountName : null),
               accounts,
+              plan,
             }
           } catch (error) {
             // 没这家连接器就算了
@@ -2703,7 +2802,10 @@ window.__ModuleLoader__.load({
                 },
                 busy ? '…' : BILLING_SHORT.estimate,
               ),
-              bill.touched
+              // 「自动」按钮（2.7.5 改条件）：只有**口径覆盖**才出现 ——
+              // 手选了模式，或订阅档开了折算。只填过订阅信息 / 额度池 / 快捷时长的
+              // （opencode-go / ark / qoder 那种）记录跟自动判定一致，按钮不赖着不走。
+              bill.resettable
                 ? h(
                     'button',
                     {
@@ -2711,18 +2813,13 @@ window.__ModuleLoader__.load({
                       className: 'ac-bill-btn',
                       disabled: busy,
                       title:
-                        '全清掉：退回白名单自动判定（现在是「' +
+                        '退回白名单自动判定（现在是「' +
                         autoLabel(bill.auto) +
-                        '」），订阅形式 / 时间 / 优惠 / 月费也一起清',
+                        '」）并关掉折算；订阅时间 / 实付 / 额度池这些信息保留，要清用订阅行里的「清空订阅信息」',
                       onClick: () =>
                         setBilling(route.id, {
                           mode: null,
                           estimate: false,
-                          monthlyCNY: null,
-                          planType: null,
-                          subscribedAt: null,
-                          promoNote: null,
-                          planTier: null,
                         }),
                     },
                     '自动',
@@ -2781,6 +2878,74 @@ window.__ModuleLoader__.load({
           const suggestion = bill.planSuggestion || null
           const period = bill.period || null
           const firstPeriod = period !== null && period.periodIndex === 1
+
+          /**
+           * 账户订阅对齐行（2.7.5）：连接器 /usage（CodeArts 是 /api/codearts/status）
+           * 能读到「档位名 + 当前有效期」，但**读不到首次订阅时间和实付金额** ——
+           * 那两样永远手填。这里把读到的摆出来，一键记进本条订阅（后台 billing.json）。
+           */
+          const accountPlanRow = (() => {
+            const live = accountBook && accountBook.plan ? accountBook.plan : null
+            const saved = bill.accountPlan || null
+            const shown = live || saved
+            if (shown === null) {
+              // 有连接器但没读到订阅信息：说清楚为什么（Trae 登出 / 没开会员）
+              if (route.id === 'trae' || route.id === 'qoder' || route.id === 'workbuddy' || route.id === 'codearts') {
+                return h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h('span', { className: 'ac-bill-label' }, '账户订阅'),
+                  h('span', { className: 'ac-bill-auto-hint' }, '连接器没读到订阅信息（没登录 / 体验版没有套餐字段）—— 首次订阅时间和实付自己填'),
+                )
+              }
+              return null
+            }
+            const matchedTier = shown.planName && bill.cnTiers ? matchTierByName(bill.cnTiers, shown.planName) : null
+            const alreadySame =
+              saved !== null &&
+              live !== null &&
+              saved.planName === live.planName &&
+              saved.expiresAt === live.expiresAt &&
+              (matchedTier === null || bill.planTier === matchedTier)
+            const syncNow = () => {
+              const patch = {
+                accountPlan: { ...live, planTier: matchedTier, atMs: Date.now() },
+                accountSyncedAt: Date.now(),
+              }
+              // 档位没选过且名字对得上 → 顺手把官方档位也选上
+              if (matchedTier !== null && (bill.planTier === null || bill.planTier === undefined)) patch.planTier = matchedTier
+              setBilling(route.id, patch)
+            }
+            return h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '账户订阅'),
+              h(
+                'span',
+                { className: 'ac-sub-suggest' },
+                shown.name ? shown.name + ' · ' : '',
+                shown.planName ? h('b', null, shown.planName) : '（连接器没给档位名）',
+                shown.expiresAt ? ' · 账户有效期到 ' + shown.expiresAt : '',
+                live === null && saved !== null ? '（上次同步的快照）' : '',
+              ),
+              live !== null
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: busy || alreadySame,
+                      title: '把账户读到的档位名 / 有效期记进这条订阅（后台 billing.json）。首次订阅时间和实付金额账户里没有，仍要手填',
+                      onClick: syncNow,
+                    },
+                    alreadySame ? '已对齐' : '对齐到账户',
+                  )
+                : null,
+              matchedTier !== null && bill.planTier !== matchedTier
+                ? h('span', { className: 'ac-bill-auto-hint' }, '名字对上官方档位「' + matchedTier + '」，点对齐会一起选上')
+                : null,
+            )
+          })()
 
           /**
            * 额度池订阅（2.7.1）—— OpenCode Go 那种：
@@ -3099,7 +3264,31 @@ window.__ModuleLoader__.load({
                       disabled: busy,
                       value: bill.planTier === null || bill.planTier === undefined ? '' : bill.planTier,
                       title: '按官方页面给出的版本选（' + bill.cnTiers.label + '）。参考价按这一档的月付原价（国内价）算',
-                      onChange: (event) => setBilling(route.id, { planTier: event.target.value === '' ? null : event.target.value }),
+                      onChange: (event) => {
+                        const id = event.target.value === '' ? null : event.target.value
+                        const patch = { planTier: id }
+                        // 选了档位顺手把付费周期对到这一档（月付 1 / 包年 12），
+                        // 没填实付时按官方周期价预填 —— 之后改实付就是真实账单
+                        if (id !== null && bill.cnTiers) {
+                          const tier = bill.cnTiers.tiers.find((t) => t.id === id) || null
+                          if (tier !== null) {
+                            const cycle = typeof tier.cycleMonths === 'number' && tier.cycleMonths >= 1 ? tier.cycleMonths : 1
+                            if ((bill.termMonths || 1) !== cycle) patch.termMonths = cycle
+                            // 周期价兜底：表里没写 cycleCNY 就按 月价×周期
+                            const cyclePrice =
+                              typeof tier.cycleCNY === 'number'
+                                ? tier.cycleCNY
+                                : typeof tier.monthlyCNY === 'number'
+                                  ? Number((tier.monthlyCNY * cycle).toFixed(2))
+                                  : null
+                            if (!bill.paid && cyclePrice !== null && cyclePrice > 0) {
+                              patch.paidTotal = cyclePrice
+                              patch.paidCurrency = 'CNY'
+                            }
+                          }
+                        }
+                        setBilling(route.id, patch)
+                      },
                     },
                     h('option', { value: '' }, '未指定'),
                     bill.cnTiers.tiers.map((t) =>
@@ -3136,14 +3325,14 @@ window.__ModuleLoader__.load({
             h(
               'div',
               { className: 'ac-sub-detail-row' },
-              h('span', { className: 'ac-bill-label' }, '订阅时间'),
+              h('span', { className: 'ac-bill-label' }, '首次订阅'),
               h('input', {
                 type: 'date',
                 className: 'ac-sub-input',
                 key: 'sub-' + (bill.subscribedAt || ''),
                 defaultValue: bill.subscribedAt === null ? '' : bill.subscribedAt,
                 disabled: busy,
-                title: '这次订阅是哪天开通 / 续费的 —— 用来算现在处于第几个计费周期',
+                title: '最开始订阅是哪天 —— 填一次就够：选了月付/季付/年付后，有效期自动对齐到包含今天的最新一期，不用每期手改',
                 onChange: (event) => {
                   const v = String(event.target.value || '').trim()
                   setBilling(route.id, { subscribedAt: v === '' ? null : v })
@@ -3161,7 +3350,7 @@ window.__ModuleLoader__.load({
                   max: 120,
                   step: 1,
                   disabled: busy,
-                  title: '这一次订阅了几个月：月付填 1、季付 3、年付 12。留空按 1 个月算',
+                  title: '一个付费周期几个月：月付 1、季付 3、年付 12。不论哪种，实付都 ÷ 时长折成等价月付金额。留空按 1 个月算',
                   onKeyDown: (event) => {
                     if (event.key === 'Enter') event.target.blur()
                   },
@@ -3208,25 +3397,60 @@ window.__ModuleLoader__.load({
                     ' 期 · 本期 ' + period.periodStart + ' ~ ' + period.periodEnd + ' · 已订 ' + String(period.daysSince) + ' 天',
                   )
                 : bill.subscribedAt === null
-                  ? h('span', { className: 'ac-bill-auto-hint' }, '填了订阅时间就能算周期')
+                  ? h('span', { className: 'ac-bill-auto-hint' }, '填了首次订阅时间就能自动对齐有效期')
                   : null,
             ),
-            // 本次订阅到期提醒（2.7.1）：快到期 / 已过期都点出来，免得忘了续费
+            // 续费方式（2.7.5）：连续订阅自动对齐到最新一期；一次买 N 个月到期如实标过期
+            h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '续费方式'),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-chip',
+                  'data-on': bill.autoRenew !== false ? '' : undefined,
+                  disabled: busy,
+                  title: '连续包月 / 包季 / 包年：有效期自动对齐到包含今天的这一期，到期日跟着滚，不用手改日期',
+                  onClick: () => setBilling(route.id, { autoRenew: true }),
+                },
+                '连续订阅 · 自动对齐',
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-chip',
+                  'data-on': bill.autoRenew === false ? '' : undefined,
+                  disabled: busy,
+                  title: '一次买 N 个月、到期不续：到期日 = 首次订阅 + 时长，过期就标过期',
+                  onClick: () => setBilling(route.id, { autoRenew: false }),
+                },
+                '一次买断',
+              ),
+              period !== null && period.autoRenew && period.periodIndex > 1
+                ? h('span', { className: 'ac-bill-auto-hint' }, '已自动对齐到第 ' + String(period.periodIndex) + ' 期（按首次订阅日 + 周期推算）')
+                : null,
+            ),
+            // 有效期（2.7.5 改名）：自动续费 = 本期结束；一次买断 = 首订 + 时长
             period !== null && period.expiresAt
               ? h(
                   'div',
                   { className: 'ac-sub-detail-row' },
-                  h('span', { className: 'ac-bill-label' }, '本次到期'),
+                  h('span', { className: 'ac-bill-label' }, '当前有效期'),
                   h(
                     'span',
                     { className: 'ac-sub-expire', 'data-soon': !period.expired && period.daysLeft <= 7 ? '' : undefined, 'data-expired': period.expired ? '' : undefined },
-                    period.expiresAt,
+                    period.periodStart + ' ~ ' + period.expiresAt,
                     period.expired
-                      ? ' · 已过期 ' + String(Math.abs(period.daysLeft)) + ' 天（若已续费，把订阅时间改成续费那天）'
+                      ? ' · 已过期 ' + String(Math.abs(period.daysLeft)) + ' 天（若已续费，把续费方式改成「连续订阅」或更新首次订阅日）'
                       : ' · 还剩 ' + String(period.daysLeft) + ' 天',
                   ),
                 )
               : null,
+            // 账户订阅对齐（2.7.5）：从连接器读到的档位名 / 到期，一键记进本条订阅
+            accountPlanRow,
             h(
               'div',
               { className: 'ac-sub-detail-row' },
@@ -3241,7 +3465,7 @@ window.__ModuleLoader__.load({
                   min: 0,
                   step: 1,
                   disabled: busy,
-                  title: '这一次订阅总共付了多少（年付就填年费，不是月费）。除以订阅月数得到「折合月费」，再跟等价月费比',
+                  title: '一个付费周期总共付了多少（季付填季费、年付填年费，不是月费）。不论月付/季付/年付，都 ÷ 时长折成「等价月付金额」再跟等价用量比',
                   onKeyDown: (event) => {
                     if (event.key === 'Enter') event.target.blur()
                   },
@@ -3266,14 +3490,13 @@ window.__ModuleLoader__.load({
                   h('option', { value: 'USD' }, '$'),
                 ),
               ),
-              // 折合月费：实付 ÷ 月数（年付 ¥120/12 = ¥10/月）
+              // 折合月费：实付 ÷ 月数（年付 ¥120/12 = ¥10/月）—— 统一叫「等价月付」
               bill.effectiveMonthlyCNY !== null && bill.effectiveMonthlyCNY !== undefined
                 ? h(
                     'span',
                     { className: 'ac-sub-monthly' },
-                    '折合 ',
+                    '等价月付 ',
                     h('b', null, fmtPrice(bill.effectiveMonthlyCNY, 'CNY')),
-                    ' / 月',
                     bill.paid && bill.termMonths ? '（' + fmtPrice(bill.paid.total, bill.paid.currency) + ' ÷ ' + String(bill.termMonths) + ' 个月）' : '',
                   )
                 : null,
@@ -3301,12 +3524,13 @@ window.__ModuleLoader__.load({
                   ? h('span', { className: 'ac-sub-promo-hint' }, '已过首期 —— 首月优惠类的说明只适用第一期，续费价以实际扣款为准')
                   : null,
             ),
-            // 老的「按月填月费」入口：没填本次实付总额时保留，填了就以总额÷月数为准
+            // 「按月」入口（2.7.5 起不论月付/季付/年付都统一折成等价月付金额）：
+            // 没填「本次实付」时保留 —— 填的就是等价月付，直接跟等价用量比
             !bill.paid
               ? h(
                   'div',
                   { className: 'ac-sub-detail-row' },
-                  h('span', { className: 'ac-bill-label' }, '或按月'),
+                  h('span', { className: 'ac-bill-label' }, '按月'),
                   h('span', { className: 'ac-sub-price-wrap' },
                     h('input', {
                       type: 'number',
@@ -3317,7 +3541,7 @@ window.__ModuleLoader__.load({
                       min: 0,
                       step: 1,
                       disabled: busy,
-                      title: '按月付的话直接填每月多少（等价于「本次实付」填同样的数、时长填 1）',
+                      title: '直接填等价月付金额（不论你实际是月付/季付/年付，这里都填折算到每月的数）。等价于「本次实付」填 月额×时长',
                       onKeyDown: (event) => {
                         if (event.key === 'Enter') event.target.blur()
                       },
@@ -3331,7 +3555,37 @@ window.__ModuleLoader__.load({
                       },
                     }),
                   ),
-                  h('span', { className: 'ac-bill-auto-hint' }, '月付直接填这里；季付 / 年付填上面「本次实付」+ 时长'),
+                  h('span', { className: 'ac-bill-auto-hint' }, '不论月付/季付/年付，这里都填等价月付金额；要记真实账单就填上面「本次实付」+ 时长'),
+                )
+              : null,
+            // 清空订阅信息（2.7.5）：「自动」按钮不再顺手清这些，单独给一个入口
+            bill.subscribedAt !== null || bill.paid || bill.monthlyCNY !== null || bill.planTier !== null || bill.accountPlan
+              ? h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: busy,
+                      title: '清掉这条线路的订阅信息：首次订阅时间 / 时长 / 实付 / 优惠 / 官方档位 / 账户快照。计费口径（订阅/折算）不动',
+                      onClick: () =>
+                        setBilling(route.id, {
+                          subscribedAt: null,
+                          termMonths: null,
+                          paidTotal: null,
+                          paidCurrency: null,
+                          monthlyCNY: null,
+                          promoNote: null,
+                          planTier: null,
+                          autoRenew: null,
+                          accountPlan: null,
+                          accountSyncedAt: null,
+                        }),
+                    },
+                    '清空订阅信息',
+                  ),
                 )
               : null,
             quotaPoolRow,

@@ -27,6 +27,11 @@ export const CN_TIERS_SNAPSHOT_AT = '2026-11-27'
  * provider → 官方档位数组（从低到高）。
  * `official` 是官方页面上的名称原样；`promoCNY` 是当前限时/首月价（没有就 null）；
  * `promoNote` 说明促销口径；`credits` 每月基础积分。
+ *
+ * `cycleMonths`（2.7.5）：这一档的**付费周期** —— 1 月付 / 3 季付 / 12 年付。
+ * 月付价 `monthlyCNY` 始终是「等价月付金额」；季付/年付档另给 `cycleCNY`
+ * （一次付多少）—— 界面选档后自动把「订阅时长」对到这一档的周期，
+ * 实付没填时按官方价预填，折算一律 ÷ cycleMonths 得等价月付。
  */
 export const CN_PLAN_TIERS = {
   qoder: {
@@ -75,10 +80,13 @@ export const CN_PLAN_TIERS = {
     label: '华为云码道 CodeArts',
     url: 'https://codearts.huaweicloud.com/pricing.html',
     tiers: [
-      { id: 'codearts-doer-free', official: '个人体验版', monthlyCNY: 0, promoCNY: null, promoNote: '每月 500 积分；限时每日签到领 100 积分', credits: 500 },
-      { id: 'codearts-doer-standard', official: '个人标准版', monthlyCNY: 98, promoCNY: null, promoNote: '包年 ¥823.2（约 ¥68.6/月）；每日签到 150 积分', credits: 2000 },
-      { id: 'codearts-doer-advanced', official: '个人高级版', monthlyCNY: 198, promoCNY: null, promoNote: '包年 ¥1,663.2；每日签到 200 积分', credits: 4000 },
-      { id: 'codearts-doer-flagship', official: '个人旗舰版', monthlyCNY: 498, promoCNY: null, promoNote: '包年 ¥4,183.2；每日签到 200 积分', credits: 10000 },
+      { id: 'codearts-doer-free', official: '个人体验版', monthlyCNY: 0, cycleMonths: 1, cycleCNY: 0, promoCNY: null, promoNote: '每月 500 积分；限时每日签到领 100 积分', credits: 500 },
+      { id: 'codearts-doer-standard', official: '个人标准版', monthlyCNY: 98, cycleMonths: 1, cycleCNY: 98, promoCNY: null, promoNote: '每日签到 150 积分', credits: 2000 },
+      { id: 'codearts-doer-standard-year', official: '个人标准版（包年）', monthlyCNY: 68.6, cycleMonths: 12, cycleCNY: 823.2, promoCNY: null, promoNote: '包年 ¥823.2，等价 ¥68.6/月；每日签到 150 积分', credits: 2000 },
+      { id: 'codearts-doer-advanced', official: '个人高级版', monthlyCNY: 198, cycleMonths: 1, cycleCNY: 198, promoCNY: null, promoNote: '每日签到 200 积分', credits: 4000 },
+      { id: 'codearts-doer-advanced-year', official: '个人高级版（包年）', monthlyCNY: 138.6, cycleMonths: 12, cycleCNY: 1663.2, promoCNY: null, promoNote: '包年 ¥1,663.2，等价 ¥138.6/月；每日签到 200 积分', credits: 4000 },
+      { id: 'codearts-doer-flagship', official: '个人旗舰版', monthlyCNY: 498, cycleMonths: 1, cycleCNY: 498, promoCNY: null, promoNote: '每日签到 200 积分', credits: 10000 },
+      { id: 'codearts-doer-flagship-year', official: '个人旗舰版（包年）', monthlyCNY: 348.6, cycleMonths: 12, cycleCNY: 4183.2, promoCNY: null, promoNote: '包年 ¥4,183.2，等价 ¥348.6/月；每日签到 200 积分', credits: 10000 },
     ],
   },
 }
@@ -94,7 +102,17 @@ export function cnTierById(tierId) {
   if (typeof tierId !== 'string' || tierId === '') return null
   for (const [provider, entry] of Object.entries(CN_PLAN_TIERS)) {
     const tier = entry.tiers.find((t) => t.id === tierId)
-    if (tier !== undefined) return { ...tier, provider, providerLabel: entry.label, url: entry.url }
+    if (tier !== undefined) {
+      // 周期兜底：没写 cycleMonths 的档位按月付；cycleCNY 没写就按 月价×周期
+      const cycleMonths = typeof tier.cycleMonths === 'number' && tier.cycleMonths >= 1 ? Math.floor(tier.cycleMonths) : 1
+      const cycleCNY =
+        typeof tier.cycleCNY === 'number'
+          ? tier.cycleCNY
+          : typeof tier.monthlyCNY === 'number'
+            ? Number((tier.monthlyCNY * cycleMonths).toFixed(2))
+            : null
+      return { ...tier, cycleMonths, cycleCNY, provider, providerLabel: entry.label, url: entry.url }
+    }
   }
   return null
 }

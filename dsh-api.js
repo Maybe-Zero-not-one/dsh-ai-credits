@@ -166,7 +166,9 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
     const planSuggestion = billingInfo.planSuggestion(id)
     // 这一次订阅了多久（月）：年付要按 12 个月摊，周期也按 12 个月推
     const termMonths = billingInfo.termMonths(id)
-    const period = subscribedAt !== null ? subscriptionPeriod(subscribedAt, Date.now(), termMonths) : null
+    // 自动续费（2.7.5）：null 按 true —— 周期自动对齐到包含今天的最新一期
+    const autoRenew = billingInfo.autoRenew(id)
+    const period = subscribedAt !== null ? subscriptionPeriod(subscribedAt, Date.now(), termMonths, autoRenew) : null
     const paid = billingInfo.paid(id)
     const quotaPoolCfg = billingInfo.quotaPool(id)
 
@@ -218,8 +220,10 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         label: billingInfo.label(id),
         // 手选过、且和自动判定不一样 —— 界面提示「已按你的选择」
         changed: override !== null && override !== autoMode,
-        // 表里有没有这一条（「自动」按钮要不要显示）
+        // 表里有没有这一条（老口径，保留兼容）
         touched: billingInfo.touched(id),
+        // 「自动」按钮要不要出现（2.7.5）：只有口径覆盖（手选模式 / 订阅+折算）才算
+        resettable: billingInfo.resettable(id),
         // 你手填的参考月费（人民币），没有就是 null
         monthlyCNY: billingInfo.monthlyCNY(id),
         // ---- 订阅三件套：形式 / 订阅时间 / 优惠说明（都只在 credits 线路有意义）----
@@ -249,6 +253,12 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         cnTiers: billingInfo.cnTiers(id),
         // 月付挡 / 多月包挡 / 年付挡 —— 一次买俩月的限时优惠仍归月付挡
         billingClass: billingInfo.billingClass(id),
+        // ---- 自动续费与账户订阅快照（2.7.5）----
+        // null = 没设置（按自动续费算）；false = 一次买 N 个月，到期如实标过期
+        autoRenew,
+        // 从连接器账户读到的订阅信息（档位名 / 到期 / 同步时间），没同步过 null
+        accountPlan: billingInfo.accountPlan(id),
+        accountSyncedAt: billingInfo.accountSyncedAt(id),
         // 这条订阅线路有没有积分查询端点（没有就只能报 token）
         creditEndpoint: billingInfo.creditEndpoint(id),
       },

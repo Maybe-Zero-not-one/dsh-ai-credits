@@ -80,15 +80,15 @@ https://codingplan.fyi/config.json      汇率 / 更新日期
 线路标成「订阅」后多一行小表单，记三样东西：
 
 - **订阅形式** `planType`：`agent-plan` / `token-plan` / `coding-plan` / `token-pack`（特价 token 包）/ `other`。选定后从 `plans.js` 套餐快照里挑「建议价」——按关键词对套餐 **id + 标题** 一起匹配（`agent-plan` 匹配 id 含 "agent" 的档；只匹配标题不够，火山的 id 是 `volcengine-agent-*` 而标题写「Token Plan」）。匹配不上就把全部候选档摆出来标 `matched:false`，套餐表没这条线路的直接提示手填。
-- **订阅时间** `subscribedAt`（`YYYY-MM-DD`）：`subscriptionPeriod()` 按自然月推进算「现在第 N 期 + 本期起止 + 已订天数」。月末订阅（1-31）各期钳到当月最后一天。实现用「起点 + 月数直接算」而非逐月 +1 推进——推进式钳过月末后 day 变了（31→28）会原地踏步死循环，单测 `test-subscription.mjs` 专门盯着这条。过了首期还挂着优惠说明，界面提醒「续费价以实际扣款为准」。
+- **首次订阅** `subscribedAt`（`YYYY-MM-DD`，2.7.5 改口径）：`subscriptionPeriod(subscribedAt, now, termMonths, autoRenew)` 按自然月推进算「现在第 N 期 + 本期起止 + 已订天数」。月末订阅（1-31）各期钳到当月最后一天。实现用「起点 + 月数直接算」而非逐月 +1 推进——推进式钳过月末后 day 变了（31→28）会原地踏步死循环，单测 `test-subscription.mjs` 专门盯着这条。**autoRenew=true（默认）= 连续订阅：到期日 = 包含今天的这一期结束，自动对齐不用手改；false = 一次买断：到期 = 首订 + term，过期如实标**（`test-renew-align.mjs` 盯着这条）。过了首期还挂着优惠说明，界面提醒「续费价以实际扣款为准」。
 - **本期实付** `monthlyCNY` + **优惠说明** `promoNote`（如「首月半价」「40元抵80元」，纯备忘不参与计算）。
 
 三个字段都向后兼容：老记录没有它们就是 `null`，界面照常工作。校验都在 `/billing` POST 路由（planType 认枚举、subscribedAt 认日期格式、promoNote 截断 80 字）。
 
 ### 订阅时长与本次实付（2.7.1 起）
 
-- **`termMonths`**（1~120 月）：`subscriptionPeriod(subscribedAt, now, termMonths)` 的第三参。周期按 `idx * term` 推进，年付一个周期跨 12 个月；另返回 `expiresAt` / `daysLeft` / `expired` 供界面做到期提醒。不填按 1 个月算（老行为）。
-- **`paidTotal` + `paidCurrency`**：本次实付**总额**。`effectiveMonthlyCNY = 总额 ÷ termMonths`（美元先乘汇率），这才是跟等价月费比的数 —— 拿年费直接比会得出「贵 12 倍」的假结论。没填总额就退回老的 `monthlyCNY`。
+- **`termMonths`**（1~120 月）：`subscriptionPeriod(subscribedAt, now, termMonths, autoRenew)` 的第三参。周期按 `idx * term` 推进，年付一个周期跨 12 个月；另返回 `expiresAt` / `daysLeft` / `expired` / `autoRenew` 供界面做到期提醒。不填按 1 个月算（老行为）。
+- **`paidTotal` + `paidCurrency`**：一个周期实付**总额**。`effectiveMonthlyCNY = 总额 ÷ termMonths`（美元先乘汇率），这才是跟等价用量比的**等价月付金额** —— 拿年费直接比会得出「贵 12 倍」的假结论。没填总额就退回老的 `monthlyCNY`（界面「按月」框，不论月付/季付/年付都填等价月付）。
 - `subscriptionWorth[].refSource` 因此多一档 **`paid`**（原只有 `manual` / `plan`）。⚠ 前端有 4 处按 refSource 分支显示文案，加新档时**四处都要接**，否则来源会被显示成「套餐表」、折算明细里手填参考价的 chip 会消失（2.7.1 开发时踩到，回归探针的 chip 计数从 4 掉到 0 才发现）。
 
 ### 额度池订阅 `quota-pool`（2.7.1 起）
@@ -158,6 +158,22 @@ OpenCode Go 那种：付一笔**基础价**（$10），各家模型各给一笔�
 连接器 `/usage` 的 **`pool.accounts[]`** 带 `member`（是否会员）、`credits`、`planExpiresAtMs`、`current`、`checkedInToday`；`pool.memberAccountIds` / `effectiveMemberAccountIds` 兜底。`readAccounts()` 按 accountId 关联，会员判定优先 `pool.member`，退回落名单，两样都没有 → `null`（界面标「订阅未知」，不瞎猜）。
 
 **过期核查（2.7.3）**：`member === true` 但 `planExpiresAtMs <= now` → member 降为 false、标 `planExpired`（连接器的会员标记可能是缓存旧状态）。界面红色「订阅已过期」，徽标「M/N 已订阅」的 M 不含过期账号。
+
+### 国内官方档位 `cn-tiers.js`（2.7.4）
+
+plans.js 的 Qoder / WorkBuddy 条目是**国际版 USD 价**，国内账号拿它折 ¥7.2 当参考是错的。`cn-tiers.js` 只收国内官方口径（CNY，2026-11-27 核对）：Qoder CN（0/59/169/559）、TRAE（0/49/99/239/699）、WorkBuddy（0/99/199/999）、码道（0/98/198/498），每档带官方名称、促销价与说明、每月积分。
+
+- **`planTier`** 字段：只认表里存在的档位 id（`cnTierById` 校验），全链路贯通（normalize / save / reconcile / POST / 自动清空）。
+- **参考价优先级**：官方档位（`refSource='tier'`，单点国内价）> 实付÷月数（paid）> 手填（manual）> plans.js（plan）。⚠ 前端 refSource 分支**三处**都要接新档（坑 #20）。
+- **`billingClassOfTerm(termMonths)`**：1~2 → monthly（**两月限时优惠仍归月付挡**）、3~11 → quarterly、12+ → yearly。`billingClass` 透出到 route.billing 与 subscriptionWorth。
+- 国际版账号走 `qoder-global` 的 USD 档（表里单列），本机国内账号默认不走。
+- **档位付费周期（2.7.5）**：每档带 `cycleMonths`（1 月付 / 12 包年）与 `cycleCNY`（一次付多少）；`cnTierById` 对没写的档兜底成月付、cycleCNY=月价×周期。码道拆出月付/包年共 7 档（包年 823.2/1663.2/4183.2，等价 68.6/138.6/348.6 每月）。界面选档自动把 termMonths 对到该档周期，没填实付时按 cycleCNY 预填。
+
+### 「自动」按钮条件与账户订阅对齐（2.7.5）
+
+- **`resettable`**（usage.js billingRules → describeBilling → dsh-api → client）：「自动」按钮只在**手选了模式**（mode 非空）或**订阅档开了折算**时出现。老条件 `touched`（表里有没有记录）会让只填过额度池/快捷时长的 opencode-go / ark / qoder 一直挂着按钮。按钮语义收窄为「退 mode + 关折算」，订阅信息另给「清空订阅信息」chips。`touched` 字段保留兼容但界面不再用它。
+- **`accountPlan` / `accountSyncedAt`**：账户订阅快照 `{ name, planName, planTier, expiresAt, periodStart, source, atMs }`。页面同源读连接器：Qoder `credits.planExpiresAtMs`；WorkBuddy `credits.packages` 里 `monthly:true` 的包名（「CodeBuddy个人体验版」）+ `cycleRefreshMs`；**CodeArts 走 `/api/codearts/status` 的 `credits.credits`（planName / periodStart / periodEnd，最全）**；Trae 只给账号列表，读不到就明说。⚠ **金额（首次订阅时间 / 实付）账户里没有**，永远手填；有效期靠 subscriptionPeriod 从首订日推算对齐。「对齐到账户」按钮把快照 POST 进 billing.json，`matchTierByName` 按关键词（体验版→free、专业→pro…）对上官方档位时顺手选 planTier。
+- 新字段全链路：normalize（usage.js + index.js 两份必须镜像）/ saveBillingOverrides 紧凑写 / reconcile 保留 / POST 校验（autoRenew 认布尔、accountPlan 认对象、accountSyncedAt 认正毫秒）。
 
 ⚠ `accountsPanel` 在 routeCard 里（约 2497 行），**不能引用用量栏的 `fmtCredits`**（3655 行才声明，const 箭头函数不提升 → TDZ → 整页消失，坑 #1）。面板内自带 `fmtAccCredits`。
 
