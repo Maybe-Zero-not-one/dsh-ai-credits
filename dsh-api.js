@@ -18,7 +18,7 @@
 /** 缓存 30 秒：页面每 60 秒轮询一次，而 listModels 对某些线路会碰网络 */
 const CACHE_MS = 30000
 
-import { describeBilling } from './usage.js'
+import { describeBilling, subscriptionPeriod } from './usage.js'
 
 const isStr = (value) => typeof value === 'string' && value.length > 0
 
@@ -159,6 +159,38 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
     const mode = billingInfo.effective(id)
     const override = billingInfo.override(id)
     const folded = billingInfo.foldCredit(id)
+    // 订阅三件套（形式 / 订阅时间 / 优惠说明）+ 套餐表建议档 + 当前计费周期
+    const planType = billingInfo.planType(id)
+    const subscribedAt = billingInfo.subscribedAt(id)
+    const promoNote = billingInfo.promoNote(id)
+    const planSuggestion = billingInfo.planSuggestion(id)
+    // 这一次订阅了多久（月）：年付要按 12 个月摊，周期也按 12 个月推
+    const termMonths = billingInfo.termMonths(id)
+    // 自动续费（2.7.5）：null 按 true —— 周期自动对齐到包含今天的最新一期
+    const autoRenew = billingInfo.autoRenew(id)
+    const period = subscribedAt !== null ? subscriptionPeriod(subscribedAt, Date.now(), termMonths, autoRenew) : null
+    const paid = billingInfo.paid(id)
+    const quotaPoolCfg = billingInfo.quotaPool(id)
+
+    /**
+     * 「这条线路在本机是不是还没配起来」（2.7.1）。
+     *
+     * 两种没配：
+     *   1. 有密钥位但没填（credential.configured === false）—— 火山方舟那几个没加 API 的通道；
+     *   2. 压根没有密钥位、也没有 settings 位、且一个模型都列不出来 —— 空挂的壳（volcengine-live）。
+     *
+     * 自带登录的连接器（trae / qoder / workbuddy / 本地 CLI）没有密钥位但**有模型**，
+     * 不算没配；deepseek-account / siliconflow 这类有模型的也不算。
+     * 界面默认把这些没配的收起来，别拿一堆点不动的空通道占屏。
+     */
+    const unconfigured =
+      (credential !== null && credential.configured === false) ||
+      (credential === null && entry === null && models.length === 0)
+
+    // 本地 CLI agent（2.7.2）：本机有没有登录凭据 —— 没登录就不该算订阅
+    const localCli = billingInfo.localCli(id)
+    // opencode-go：拿这条线路实际有的模型对官方额度表，给界面「一键填额度」用
+    const goPool = id === 'opencode-go' ? billingInfo.goPoolSuggestion(models.map((m) => m.id), 'go') : null
 
     routes.push({
       id,
@@ -171,6 +203,10 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
       models,
       modelCount: models.length,
       modelsError,
+      // 本机还没配起来（界面默认隐藏，可展开查看）
+      unconfigured,
+      // 本地 CLI agent 的登录态（不是这类线路就是 null）
+      localCli,
       // ---- 计费分类 ----
       billing: {
         mode,
@@ -184,10 +220,52 @@ async function collectRoutes(ctx, llm, directory, settingsIndex, billingInfo) {
         label: billingInfo.label(id),
         // 手选过、且和自动判定不一样 —— 界面提示「已按你的选择」
         changed: override !== null && override !== autoMode,
-        // 表里有没有这一条（「自动」按钮要不要显示）
+        // 表里有没有这一条（老口径，保留兼容）
         touched: billingInfo.touched(id),
+        // 「自动」按钮要不要出现（2.7.5）：只有口径覆盖（手选模式 / 订阅+折算）才算
+        resettable: billingInfo.resettable(id),
         // 你手填的参考月费（人民币），没有就是 null
         monthlyCNY: billingInfo.monthlyCNY(id),
+        // ---- 订阅三件套：形式 / 订阅时间 / 优惠说明（都只在 credits 线路有意义）----
+        planType,
+        planTypeLabel: planType !== null && billingInfo.planTypeLabels ? billingInfo.planTypeLabels[planType] || null : null,
+        subscribedAt,
+        promoNote,
+        // 从套餐表按订阅形式挑的参考档（plans 数组 + 最低/最高价 + 是否精确命中）
+        planSuggestion,
+        // 当前计费周期：第几期、本期起止、距订阅多少天（订阅时间没填就是 null）
+        period,
+        // ---- 订阅时长与实付（2.7.1）----
+        // 这一次订阅了多久（月）；null = 没填，周期账按 1 个月算
+        termMonths,
+        // 本次实付总额 + 币种（年付就是年费）
+        paid,
+        // 折合月费 = 实付 ÷ 月数；没填实付就退回手填月费
+        effectiveMonthlyCNY: billingInfo.effectiveMonthlyCNY(id),
+        // 额度池订阅的配置（基础价 + 每模型额度）；实际折算在 usage 那边按用量算
+        quotaPoolConfig: quotaPoolCfg,
+        // opencode-go 的官方额度池建议（一键填进 quotaPools）
+        goPoolSuggestion: goPool,
+        // ---- 官方档位与计费挡位（2.7.4）----
+        // 选定的国内官方档位 id；下拉选项在 cnTiers
+        planTier: billingInfo.planTier(id),
+        // 这条线路的国内官方档位表（Qoder CN / TRAE / WorkBuddy / 码道），没有 null
+        cnTiers: billingInfo.cnTiers(id),
+        // 月付挡 / 多月包挡 / 年付挡 —— 一次买俩月的限时优惠仍归月付挡
+        billingClass: billingInfo.billingClass(id),
+        // ---- 自动续费与账户订阅快照（2.7.5）----
+        // null = 没设置（按自动续费算）；false = 一次买 N 个月，到期如实标过期
+        autoRenew,
+        // 从连接器账户读到的订阅信息（档位名 / 到期 / 同步时间），没同步过 null
+        accountPlan: billingInfo.accountPlan(id),
+        accountSyncedAt: billingInfo.accountSyncedAt(id),
+        // ---- 「赠送」记录（2.7.6 起，2.7.7 全渠道）----
+        // 逐条记账（kind: credit 赠金 / points 赠送积分 / tokens 免费Token），只记不参与折算
+        gifts: billingInfo.gifts(id),
+        giftTotals: billingInfo.giftTotals(id),
+        // ---- 逐账户设置（2.7.7）----
+        // { 账户id: 同构记录 }：多账号渠道可以给每个账号单独记订阅/赠送账
+        accountEntries: billingInfo.accountEntries(id),
         // 这条订阅线路有没有积分查询端点（没有就只能报 token）
         creditEndpoint: billingInfo.creditEndpoint(id),
       },
@@ -252,8 +330,10 @@ export async function collectDshApi(ctx, options) {
         modes: billingInfo.modes,
         labels: billingInfo.labels,
         foldedLabel: billingInfo.foldedLabel,
+        planTypes: billingInfo.planTypes,
+        planTypeLabels: billingInfo.planTypeLabels,
         overrides: overrides || {},
-        byMode: { token: 0, estimate: 0, credits: 0 },
+        byMode: { token: 0, estimate: 0, credits: 0, unknown: 0 },
         manual: 0,
         folded: 0,
       },
@@ -272,9 +352,12 @@ export async function collectDshApi(ctx, options) {
   const totalModels = ordered.reduce((sum, route) => sum + route.modelCount, 0)
   const configured = ordered.filter((route) => route.credential !== null && route.credential.configured === true).length
   const missing = ordered.filter((route) => route.credential !== null && route.credential.configured === false).length
+  // 本机还没配起来的（缺密钥 / 空挂的壳）—— 界面默认收起来，这个数告诉用户藏了几条
+  const unconfigured = ordered.filter((route) => route.unconfigured === true).length
 
   // 按计费方式分组统计：订阅几条、按量几条、等价几条；订阅里开了折算的单独数
-  const byBilling = { token: 0, estimate: 0, credits: 0 }
+  // unknown（2.7.2）：本地 CLI agent 没探到登录凭据，既不算订阅也不折钱，单独一格
+  const byBilling = { token: 0, estimate: 0, credits: 0, unknown: 0 }
   let manualCount = 0
   let foldedCount = 0
   for (const route of ordered) {
@@ -290,11 +373,13 @@ export async function collectDshApi(ctx, options) {
     defaultSelection,
     defaultModel,
     routes: ordered,
-    totals: { routes: ordered.length, models: totalModels, configured, missing },
+    totals: { routes: ordered.length, models: totalModels, configured, missing, unconfigured },
     billing: {
       modes: billingInfo.modes,
       labels: billingInfo.labels,
       foldedLabel: billingInfo.foldedLabel,
+      planTypes: billingInfo.planTypes,
+      planTypeLabels: billingInfo.planTypeLabels,
       overrides: overrides || {},
       byMode: byBilling,
       manual: manualCount,

@@ -17,6 +17,7 @@
  */
 
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { zstdDecompress } from 'node:zlib'
@@ -24,6 +25,8 @@ import { promisify } from 'node:util'
 
 import { PRICE_PROVIDERS } from './prices.js'
 import { PROVIDER_KEY_MAP } from './official-usage.js'
+import { goUsageUSD, goModelLimit, buildGoPool, OPENCODE_GO_SNAPSHOT_AT } from './opencode-go.js'
+import { cnTiersOf, cnTierById, billingClassOfTerm, CN_TIERS_SNAPSHOT_AT } from './cn-tiers.js'
 import { CODING_PLANS, PLAN_SNAPSHOT_AT } from './plans.js'
 import { MEDIA_PRICE_SNAPSHOT_AT, imageUnitPrice, videoCost, shortProvider } from './media-prices.js'
 import { readCloudMediaLedger } from './media-ledger.js'
@@ -888,6 +891,28 @@ const TOKEN_BILLED = new Set([
 ])
 
 /**
+ * 按量家族的**兜底识别**（2.7.1）。
+ *
+ * 白名单是写死的，同一家新开的通道（火山方舟 live、byteplus 的别的区、
+ * 以后再加的 ark-xxx）不在名单里就会掉进「安全默认 = 订阅」，
+ * 于是一条直接按量扣费的生图通道被显示成订阅。
+ *
+ * 这里按 id 的形状 + 已知的按量家族补一层判断：
+ *   · 精确在 TOKEN_BILLED 里 → 按量
+ *   · `<已知按量家族>-<后缀>`（volcengine-live / ark-cn-jp / siliconflow-xx）→ 按量
+ *   · 但**带 plan 字样的一律不算**（ark-agent-plan-cn / ark-coding-plan-cn 是套餐）
+ *
+ * 只影响「自动判定」，用户手选永远优先。
+ */
+const TOKEN_BILLED_FAMILIES = ['volcengine', 'ark', 'siliconflow', 'deepseek', 'tokenplus']
+function looksTokenBilled(provider) {
+  if (typeof provider !== 'string' || provider === '') return false
+  if (TOKEN_BILLED.has(provider)) return true
+  if (/plan|subscription|member|vip/i.test(provider)) return false
+  return TOKEN_BILLED_FAMILIES.some((family) => provider.startsWith(family + '-'))
+}
+
+/**
  * 订阅 / 套餐制，但仍然**折一个等价金额**给人看。
  *
  * 这些渠道卖的也是 DeepSeek 模型，按月付 / 积分包，不按 token 扣现金 ——
@@ -898,6 +923,54 @@ const ESTIMATE_ROUTES = new Set([
   'qwen-token-plan', // 阿里云百炼 Token Plan（积分套餐）
   'opencode-go', // OpenCode Go 订阅（$10/$40 三档，按模型月度额度）
 ])
+
+/**
+ * 本地 CLI agent（2.7.2）—— Claude Code / Codex CLI / Gemini CLI 这类。
+ *
+ * ⚠ 这些**不是 DSH 买的订阅**，是「本机装了某个命令行 agent，DSH 能驱动它」。
+ * 它自己怎么认证、有没有订阅，DSH 一概不知道：
+ *   · 可能是 OAuth 登录 + Pro/Max 订阅（那才算订阅）
+ *   · 可能是 ANTHROPIC_API_KEY / OPENAI_API_KEY 按量付费
+ *   · 也可能压根没登录（本机就是这种：~/.claude/.credentials.json 和
+ *     ~/.codex/auth.json 都不存在）
+ *
+ * 2.7.2 之前这些 id 被硬编码进 CREDIT_ROUTES，于是**没订阅也显示成「订阅」**。
+ * 现在改成：先探本机有没有登录凭据，探不到就不当订阅（也不当未配置以外的任何计费身份），
+ * 由用户自己确认订阅后再手标。
+ *
+ * `credFiles` 是各家 CLI 存登录态的地方（照 ds-bot 的 engines.js 口径），
+ * **只看文件在不在，绝不读内容**。
+ */
+const LOCAL_CLI_AGENTS = {
+  'local-claude-code': { label: 'Claude Code', credFiles: [['.claude', '.credentials.json']], envKeys: ['ANTHROPIC_API_KEY'] },
+  'local-codex-cli': { label: 'Codex CLI', credFiles: [['.codex', 'auth.json']], envKeys: ['OPENAI_API_KEY'] },
+  'local-gemini-cli': { label: 'Gemini CLI', credFiles: [['.gemini', 'oauth_creds.json']], envKeys: ['GEMINI_API_KEY'] },
+  'local-qwen-code': { label: 'Qwen Code', credFiles: [['.qwen', 'oauth_creds.json']], envKeys: ['DASHSCOPE_API_KEY'] },
+}
+
+/** id 是不是本地 CLI agent（含没在上表里登记的新 agent） */
+const isLocalCliAgent = (provider) =>
+  typeof provider === 'string' && (provider.startsWith('local-') || LOCAL_CLI_AGENTS[provider] !== undefined)
+
+/**
+ * 探本机这个 CLI 有没有登录凭据 / API key。
+ * @returns {{ signedIn:boolean|null, via:string|null }} signedIn=null 表示探不出来
+ */
+function probeLocalCliAuth(provider) {
+  const meta = LOCAL_CLI_AGENTS[provider]
+  if (meta === undefined) return { signedIn: null, via: null }
+  const home = homedir()
+  for (const parts of meta.credFiles) {
+    try {
+      if (existsSync(join(home, ...parts))) return { signedIn: true, via: 'credfile' }
+    } catch (error) {}
+  }
+  for (const key of meta.envKeys) {
+    if (typeof process.env[key] === 'string' && process.env[key] !== '') return { signedIn: true, via: 'apikey' }
+  }
+  // 上表登记过的、文件和 env 都没有 → 明确没登录（不是「探不出来」）
+  return { signedIn: false, via: null }
+}
 
 /**
  * 套餐 / 订阅制线路。
@@ -917,8 +990,7 @@ const CREDIT_ROUTES = {
   'ark-coding-plan-byteplus': { endpoint: null, label: 'Ark Coding Plan (BytePlus)' },
   'opencode-go': { endpoint: null, label: 'opencode-go' },
   tokenplus: { endpoint: null, label: 'TokenPlus' },
-  'local-claude-code': { endpoint: null, label: 'Claude Code' },
-  'local-codex-cli': { endpoint: null, label: 'Codex CLI' },
+  // 本地 CLI agent 不在这里写死了 —— 见 LOCAL_CLI_AGENTS，按本机登录态动态判定
 }
 
 /**
@@ -951,10 +1023,29 @@ const SUBSCRIPTION_PLAN_HINTS = {
 const USD_TO_CNY = 7.2
 
 /**
- * 这条订阅线路在套餐表里的参考月费（人民币，取最低档到最高档）。
- * 套餐表里没有对得上的 → null，界面退回手填。
+ * 这条订阅线路的参考月费（人民币）。
+ *
+ * 优先级（2.7.4）：
+ *   1. 用户选定的**国内官方档位**（planTier）→ 该档官方月付原价（CNY），单点不是区间
+ *   2. plans.js 套餐表候选（老路，国际版 USD 折 ¥7.2）
+ * 都没有 → null，界面退回手填。
  */
-function subscriptionPlanRef(provider) {
+function subscriptionPlanRef(provider, planTierId) {
+  // 官方档位优先：国内账号按国内价，别拿国际版美元价折
+  if (typeof planTierId === 'string' && planTierId !== '') {
+    const tier = cnTierById(planTierId)
+    if (tier !== null && typeof tier.monthlyCNY === 'number') {
+      return {
+        minCNY: tier.monthlyCNY,
+        maxCNY: tier.monthlyCNY,
+        plans: [{ id: tier.id, title: tier.providerLabel + ' ' + tier.official, price: tier.monthlyCNY, currency: 'CNY' }],
+        snapshotAt: CN_TIERS_SNAPSHOT_AT,
+        usdToCny: USD_TO_CNY,
+        tierSource: 'cn-official',
+        tier,
+      }
+    }
+  }
   const ids = SUBSCRIPTION_PLAN_HINTS[provider]
   if (!Array.isArray(ids) || ids.length === 0) return null
   const picked = CODING_PLANS.filter((plan) => ids.includes(plan.id) && typeof plan.price === 'number')
@@ -974,13 +1065,14 @@ function subscriptionPlanRef(provider) {
     plans: names,
     snapshotAt: PLAN_SNAPSHOT_AT,
     usdToCny: USD_TO_CNY,
+    tierSource: 'plans-snapshot',
   }
 }
 
 
 
-/** 这条线路要不要按「真实花费」折钱 */
-const isTokenBilled = (provider) => TOKEN_BILLED.has(provider)
+/** 这条线路要不要按「真实花费」折钱（白名单 + 按量家族兜底，2.7.1 起） */
+const isTokenBilled = (provider) => looksTokenBilled(provider)
 
 /** 这条线路要不要折一个等价金额（套餐渠道，标「等价」） */
 const isEstimateBilled = (provider) => ESTIMATE_ROUTES.has(provider)
@@ -996,13 +1088,291 @@ const isEstimateBilled = (provider) => ESTIMATE_ROUTES.has(provider)
 const BILLING_MODES = ['token', 'estimate', 'credits']
 
 const BILLING_LABELS = {
-  token: '按量计费',
+  token: 'API 按量',
   estimate: '套餐 · 折算',
   credits: '订阅 · 不折钱',
+  /**
+   * 2.7.2：本地 CLI agent 没探到登录凭据 —— **既不算订阅也不折钱**。
+   * 它不是手选档位（BILLING_MODES 里没有），只是自动判定的一个「未确认」出口。
+   */
+  unknown: '未确认',
 }
 
 /** 订阅线路也打开折算时的那一档 —— 它不是第四种模式，是「订阅 + 折钱」的组合 */
 const BILLING_LABEL_FOLDED = '订阅 · 折算'
+
+/**
+ * 订阅形式（planType）：只在「订阅 / credits」这条线路上有意义，是个**描述性标签**，
+ * 不改计费判定（判定还是 mode 那一套）。记下来是为了：
+ *   1. 知道这条订阅到底是哪种套餐，好去 plans.js 里对上参考档；
+ *   2. 配合订阅时间 / 优惠说明，算清楚「这次到底花了多少、优惠还在不在」。
+ *
+ * `token-pack` 是预付 token 包（火山方舟那种「40 块买 80 块的量」），不是按月订阅，
+ * 单独留一档；`quota-pool` 是**额度池订阅**（OpenCode Go 那种：付 $10，各家模型
+ * 各给一笔美元额度，用掉的按比例折回那 $10 上扣）；`other` 兜住没归进上面几类的。
+ */
+const PLAN_TYPES = ['agent-plan', 'coding-plan', 'token-plan', 'quota-pool', 'token-pack', 'other']
+
+const PLAN_TYPE_LABELS = {
+  'agent-plan': 'Agent Plan',
+  'coding-plan': 'Coding Plan',
+  'token-plan': 'Token Plan',
+  'quota-pool': '额度池订阅',
+  'token-pack': '特价 token 包',
+  other: '其他订阅',
+}
+
+/**
+ * 订阅形式 → 关键词。挑参考档时对套餐的 **id + 标题** 一起匹配（只看标题不够：
+ * trae 的标题是「TRAE 会员 Pro」、火山的 id 是 volcengine-agent-* 而标题写「Token Plan」）。
+ * 过滤完空了就退回全部候选（matched:false，宁可多摆几档，也别让用户没参考）。
+ */
+const PLAN_TYPE_KEYWORDS = {
+  'agent-plan': ['agent', '智能体'],
+  'coding-plan': ['coding', '编程', 'code'],
+  'token-plan': ['token', '积分'],
+}
+
+/**
+ * 给一条订阅线路挑参考套餐档（「订阅形式」和套餐表联动的那一步）。
+ * @returns {{ planType:string|null, plans:Array, minCNY:number|null, maxCNY:number|null, matched:boolean }|null}
+ */
+function suggestPlanRef(provider, planType, planTierId) {
+  const base = subscriptionPlanRef(provider, planTierId)
+  if (base === null) return null
+  const keywords = planType ? PLAN_TYPE_KEYWORDS[planType] : null
+  if (!Array.isArray(keywords) || keywords.length === 0 || base.tierSource === 'cn-official') {
+    // 选了官方档位就不再按关键词过滤 —— 用户已经明确指定了哪一档
+    return { planType: planType || null, plans: base.plans, minCNY: base.minCNY, maxCNY: base.maxCNY, matched: base.tierSource === 'cn-official', snapshotAt: base.snapshotAt, tierSource: base.tierSource }
+  }
+  const picked = base.plans.filter((p) => {
+    const hay = (String(p.id || '') + ' ' + String(p.title || '')).toLowerCase()
+    return keywords.some((k) => hay.includes(k))
+  })
+  if (picked.length === 0) {
+    return { planType: planType, plans: base.plans, minCNY: base.minCNY, maxCNY: base.maxCNY, matched: false, snapshotAt: base.snapshotAt }
+  }
+  let minCNY = Infinity
+  let maxCNY = 0
+  for (const p of picked) {
+    const cny = p.currency === 'USD' ? p.price * USD_TO_CNY : p.price
+    if (cny < minCNY) minCNY = cny
+    if (cny > maxCNY) maxCNY = cny
+  }
+  return {
+    planType,
+    plans: picked,
+    minCNY: Number(minCNY.toFixed(2)),
+    maxCNY: Number(maxCNY.toFixed(2)),
+    matched: true,
+    snapshotAt: base.snapshotAt,
+  }
+}
+
+/**
+ * 额度池订阅的折算（2.7.1）—— OpenCode Go 那种。
+ *
+ * 玩法：付 **$10 基础价**，各家模型各给一笔美元额度（DeepSeek $100、Kimi K3 $15…）。
+ * 用掉某个模型的额度，就按「用掉的 / 这个模型的额度」这个比例，从基础价里扣掉对应的钱。
+ *
+ *   例：基础价 $10，DeepSeek 额度 $100 用了 $20 → 消耗 20% → 折 $2
+ *       Kimi K3 额度 $15 用了 $3      → 消耗 20% → 折 $2
+ *       合计已消耗 $4，基础价还剩 $6
+ *
+ * ⚠ 这里的「用掉多少额度」得有数据来源。两条：
+ *   1. `usedByModel`：调用方按模型给的**已用额度**（美元），最准；
+ *   2. 没有就退回按 token 折官方价当已用额度（`costByModel`，也是美元），
+ *      这是估算 —— 官方价 ≠ 这家的额度扣减口径，界面要标清楚。
+ *
+ * 单个模型的消耗比例**钳在 100%**：额度用超了（超额继续用 / 口径不一致）
+ * 不该把基础价扣成负数。
+ *
+ * @param {{basePrice:number, baseCurrency:string, pools:Array<{model:string,quota:number}>}} pool
+ * @param {Object<string,number>} usedByModel 模型 id → 已用额度（美元）
+ * @returns {{ basePrice, baseCurrency, baseCNY, rows, usedTotal, usedCNY, leftCNY, usedPct, matched }|null}
+ */
+export function quotaPoolSpend(pool, usedByModel) {
+  if (!pool || typeof pool !== 'object') return null
+  const basePrice = typeof pool.basePrice === 'number' && pool.basePrice > 0 ? pool.basePrice : null
+  const pools = Array.isArray(pool.pools) ? pool.pools : []
+  if (basePrice === null || pools.length === 0) return null
+  const baseCurrency = pool.baseCurrency === 'CNY' ? 'CNY' : 'USD'
+  const baseCNY = baseCurrency === 'USD' ? basePrice * USD_TO_CNY : basePrice
+  const used = usedByModel && typeof usedByModel === 'object' ? usedByModel : {}
+  const rows = []
+  let usedTotal = 0
+  for (const item of pools) {
+    if (!item || typeof item.model !== 'string' || !(item.quota > 0)) continue
+    const raw = used[item.model]
+    const usedQuota = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : 0
+    const ratio = Math.min(1, usedQuota / item.quota) // 钳 100%，不让基础价扣成负
+    const cost = basePrice * ratio
+    usedTotal += cost
+    rows.push({
+      model: item.model,
+      quota: item.quota,
+      usedQuota: Number(usedQuota.toFixed(4)),
+      ratio: Number(ratio.toFixed(6)),
+      cost: Number(cost.toFixed(4)),
+      costCNY: Number((baseCurrency === 'USD' ? cost * USD_TO_CNY : cost).toFixed(4)),
+      capped: usedQuota > item.quota, // 用超了：界面提示「已超额，按 100% 计」
+    })
+  }
+  if (rows.length === 0) return null
+  /**
+   * 总消耗**封顶在基础价**：各模型比例各自钳 100% 后，合计仍可能超过基础价
+   * （两个模型都用超时 $10+$10=$20 > $10）。基础价就那么多钱，扣不出更多 ——
+   * 超了按比例缩回去，让「已消耗 + 剩余 = 基础价」始终成立。
+   */
+  const overCap = usedTotal > basePrice
+  if (overCap) {
+    const scale = basePrice / usedTotal
+    for (const row of rows) {
+      row.cost = Number((row.cost * scale).toFixed(4))
+      row.costCNY = Number((baseCurrency === 'USD' ? row.cost * USD_TO_CNY : row.cost).toFixed(4))
+      row.scaledDown = true // 界面提示「多个模型超额，已按比例缩到基础价」
+    }
+    usedTotal = basePrice
+  }
+  const usedPct = basePrice > 0 ? Math.min(1, usedTotal / basePrice) : 0
+  return {
+    basePrice,
+    baseCurrency,
+    baseCNY: Number(baseCNY.toFixed(4)),
+    rows,
+    usedTotal: Number(usedTotal.toFixed(4)),
+    usedCNY: Number((baseCurrency === 'USD' ? usedTotal * USD_TO_CNY : usedTotal).toFixed(4)),
+    leftCNY: Number((baseCNY * (1 - usedPct)).toFixed(4)),
+    usedPct: Number((usedPct * 100).toFixed(2)),
+    overCap,
+    // 有几个模型真的对上了用量（一个都没对上说明这份账是空的，界面别摆个 0 骗人）
+    matched: rows.filter((r) => r.usedQuota > 0).length,
+  }
+}
+
+/**
+ * 订阅周期账：从**首次订阅日**算到今天，第几个计费周期、当前周期从哪天到哪天。
+ * 用来判断「首月优惠」还在不在第一期：subscribedAt + paidPrice + promoNote 三件套齐了才有意义。
+ *
+ * **termMonths = 一个付费周期几个月**（2.7.1）。不填按 1 个月算（老行为）；
+ * 填 12 就是年付：一个周期跨 12 个月，年费要除以 12 才是「等价月付金额」，
+ * 拿年费直接跟等价月费比会得出「贵了 12 倍」的假结论。
+ *
+ * **autoRenew（2.7.5）= 到期自动对齐到最新一期**：
+ *   true（默认）  连续包月/包季/包年、一直续着的订阅 —— 本期 = 包含今天的这一期，
+ *                 到期日 = 本期结束，永远不用手改日期；
+ *   false         一次买 N 个月、到期不续的 —— 到期日 = 首次订阅 + N 个月（老口径），
+ *                 过期就如实标过期。
+ *
+ * 月末订阅（1-31）各期钳到当月最后一天（2-28、4-30…）。**从起点按月数直接算**，
+ * 不做「逐月 +1 推进」—— 推进式在钳过月末后 day 变了（31→28），下一轮再钳会原地踏步死循环。
+ * @returns {{ periodIndex:number, periodStart:string, periodEnd:string, daysSince:number,
+ *             termMonths:number, expiresAt:string, daysLeft:number, expired:boolean,
+ *             autoRenew:boolean }|null}
+ */
+export function subscriptionPeriod(subscribedAt, nowMs, termMonths, autoRenew) {
+  if (typeof subscribedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(subscribedAt)) return null
+  const start = new Date(subscribedAt + 'T00:00:00')
+  if (Number.isNaN(start.getTime())) return null
+  const now = new Date(Number.isFinite(nowMs) ? nowMs : Date.now())
+  if (now < start) return null
+  // 时长：正整数月，1~120（十年）。非法 / 没填都退回 1 个月
+  const term =
+    typeof termMonths === 'number' && Number.isFinite(termMonths) && termMonths >= 1 && termMonths <= 120
+      ? Math.floor(termMonths)
+      : 1
+  const renew = autoRenew !== false
+  /** 起点 + n 个月，日期钳到目标月最后一天 */
+  const addMonths = (n) => {
+    const d = new Date(start.getFullYear(), start.getMonth() + n, 1)
+    const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()
+    d.setDate(Math.min(start.getDate(), lastDay))
+    return d
+  }
+  let idx = 0
+  while (idx < 1200 && addMonths((idx + 1) * term) <= now) idx += 1
+  const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  // 自动续费：到期 = 当前这一期结束；一次性购买：到期 = 首次订阅 + term（第 1 期结束）
+  const termEnd = renew ? addMonths((idx + 1) * term) : addMonths(term)
+  return {
+    periodIndex: idx + 1, // 第 1 期 = 首次订阅那一期
+    periodStart: fmt(addMonths(idx * term)),
+    periodEnd: fmt(addMonths((idx + 1) * term)),
+    daysSince: Math.floor((now - start) / 86400000),
+    termMonths: term,
+    // 本期到哪天为止 + 还剩几天（负数 = 已过期几天）
+    expiresAt: fmt(termEnd),
+    daysLeft: Math.ceil((termEnd - now) / 86400000),
+    expired: termEnd <= now,
+    autoRenew: renew,
+  }
+}
+
+/**
+ * 「赠送」记录（2.7.6 起，2.7.7 改名并扩到全渠道）。
+ *
+ * 主人要「每输入一条就记一条」：一条 = { kind, amount, unit, note, at }。
+ *   kind   'credit' 赠金（钱，¥/$）| 'points' 赠送积分（各家积分）| 'tokens' 免费 Token 额度
+ *   unit   赠金：CNY / USD；积分：raw 分；token：raw 个 / K 千 / M 百万 / B 十亿
+ *   amount 正数（按 unit 的原值，不做换算存储，展示时再折）
+ *   note   备注（来源 / 活动名），≤80 字
+ *   at     记录时间戳（毫秒）
+ * 只记账不参与折算 —— 赠送不是订阅费，别混进「值不值」的比较里。
+ * 一条记录最多记 60 条，防滥用。**所有渠道都能记**（不限订阅档）。
+ */
+const GIFT_KINDS = ['credit', 'points', 'tokens']
+const GIFT_UNITS = { credit: ['CNY', 'USD'], points: ['raw'], tokens: ['raw', 'K', 'M', 'B'] }
+
+function normalizeGifts(value) {
+  if (!Array.isArray(value)) return null
+  const rows = []
+  for (const row of value) {
+    if (!row || typeof row !== 'object') continue
+    const kind = GIFT_KINDS.includes(row.kind) ? row.kind : null
+    const amount = typeof row.amount === 'number' && Number.isFinite(row.amount) && row.amount > 0 ? row.amount : null
+    if (kind === null || amount === null) continue
+    const unit = GIFT_UNITS[kind].includes(row.unit) ? row.unit : GIFT_UNITS[kind][0]
+    const note = typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null
+    const at = typeof row.at === 'number' && Number.isFinite(row.at) && row.at > 0 ? row.at : Date.now()
+    rows.push({ kind, amount, unit, note, at })
+    if (rows.length >= 60) break
+  }
+  return rows.length > 0 ? rows : null
+}
+
+/** 赠送记录汇总：赠金折 CNY + 赠送积分合计 + 免费 token 折「个」（展示用） */
+export function giftTotals(gifts) {
+  if (!Array.isArray(gifts) || gifts.length === 0) return null
+  let creditCNY = 0
+  let pointsRaw = 0
+  let tokensRaw = 0
+  let creditCount = 0
+  let pointsCount = 0
+  let tokenCount = 0
+  const TOKEN_SCALE = { raw: 1, K: 1e3, M: 1e6, B: 1e9 }
+  for (const g of gifts) {
+    if (!g || typeof g.amount !== 'number') continue
+    if (g.kind === 'credit') {
+      creditCNY += g.unit === 'USD' ? g.amount * USD_TO_CNY : g.amount
+      creditCount += 1
+    } else if (g.kind === 'points') {
+      pointsRaw += g.amount
+      pointsCount += 1
+    } else if (g.kind === 'tokens') {
+      tokensRaw += g.amount * (TOKEN_SCALE[g.unit] || 1)
+      tokenCount += 1
+    }
+  }
+  return {
+    creditCNY: Number(creditCNY.toFixed(2)),
+    pointsRaw: Number(pointsRaw.toFixed(2)),
+    tokensRaw,
+    creditCount,
+    pointsCount,
+    tokenCount,
+    count: gifts.length,
+  }
+}
 
 /**
  * 覆盖表一条记录的真身。
@@ -1016,17 +1386,119 @@ function normalizeOverrideEntry(value) {
   if (typeof value === 'string') {
     if (!BILLING_MODES.includes(value)) return null
     // 老的 'estimate' 本身就是「折钱」，但 foldCredit 只对 credits 生效，不受影响
-    return { mode: value, estimate: value === 'estimate', monthlyCNY: null }
+    return {
+      mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
+      subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
+      basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
+      autoRenew: null, accountPlan: null, accountSyncedAt: null, gifts: null, accountEntries: null,
+    }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const mode = BILLING_MODES.includes(value.mode) ? value.mode : null
   const estimate = value.estimate === true
-  const monthlyCNY =
-    typeof value.monthlyCNY === 'number' && Number.isFinite(value.monthlyCNY) && value.monthlyCNY > 0
-      ? value.monthlyCNY
+  const posNum = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null)
+  const monthlyCNY = posNum(value.monthlyCNY)
+  // 订阅形式：只认枚举里的值，其余当没填
+  const planType = PLAN_TYPES.includes(value.planType) ? value.planType : null
+  // 订阅时间：'YYYY-MM-DD' 字符串，归一成它；解析不出就丢
+  let subscribedAt = null
+  if (typeof value.subscribedAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value.subscribedAt.trim())) {
+    const d = new Date(value.subscribedAt.trim() + 'T00:00:00')
+    if (!Number.isNaN(d.getTime())) subscribedAt = value.subscribedAt.trim()
+  }
+  // 优惠说明：首月半价 / 假日活动之类，纯文本，截断防滥用
+  const promoNote =
+    typeof value.promoNote === 'string' && value.promoNote.trim() !== ''
+      ? value.promoNote.trim().slice(0, 80)
       : null
-  if (mode === null && estimate === false && monthlyCNY === null) return null
-  return { mode, estimate, monthlyCNY }
+  // 这一次订阅了多久（月）：1~120 的整数；null = 没填，周期账按 1 个月算
+  let termMonths = null
+  if (typeof value.termMonths === 'number' && Number.isFinite(value.termMonths)) {
+    const t = Math.floor(value.termMonths)
+    if (t >= 1 && t <= 120) termMonths = t
+  }
+  // 本次实付总额 + 币种：年付 120 就是 120，不是每月 120
+  const paidTotal = posNum(value.paidTotal)
+  const currencyOf = (v) => (v === 'USD' || v === 'CNY' ? v : null)
+  const paidCurrency = paidTotal === null ? null : currencyOf(value.paidCurrency) || 'CNY'
+  // 额度池订阅（quota-pool）：基础价 + 每个模型各给多少额度
+  const basePrice = posNum(value.basePrice)
+  const baseCurrency = basePrice === null ? null : currencyOf(value.baseCurrency) || 'USD'
+  let quotaPools = null
+  if (Array.isArray(value.quotaPools)) {
+    const rows = []
+    for (const row of value.quotaPools) {
+      if (!row || typeof row !== 'object') continue
+      const model = typeof row.model === 'string' ? row.model.trim().slice(0, 80) : ''
+      const quota = posNum(row.quota)
+      if (model === '' || quota === null) continue
+      rows.push({ model, quota })
+      if (rows.length >= 40) break // 防滥用：一条订阅最多记 40 个模型的额度
+    }
+    if (rows.length > 0) quotaPools = rows
+  }
+  // 官方档位（2.7.4）：国内官方档位表的 id（cn-tiers.js），选了它参考价就按官方月付原价
+  const planTier =
+    typeof value.planTier === 'string' && cnTierById(value.planTier) !== null ? value.planTier : null
+  // 自动续费（2.7.5）：true = 连续包月/包年，周期自动对齐到最新一期；false = 一次买 N 个月。
+  // null = 没设置，按 true 算（大多数订阅是续着的）
+  const autoRenew = typeof value.autoRenew === 'boolean' ? value.autoRenew : null
+  // 从账户读到的订阅快照（2.7.5）：{ name, planName, planTier, expiresAt, source, atMs }
+  // 只留展示要用的公开字段，金额账户里没有 —— 实付永远手填
+  let accountPlan = null
+  if (value.accountPlan && typeof value.accountPlan === 'object' && !Array.isArray(value.accountPlan)) {
+    const ap = value.accountPlan
+    const str = (v, max) => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null)
+    const name = str(ap.name, 60)
+    const planName = str(ap.planName, 60)
+    const expiresAt =
+      typeof ap.expiresAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.expiresAt) ? ap.expiresAt : null
+    if (name !== null || planName !== null || expiresAt !== null) {
+      accountPlan = {
+        name,
+        planName,
+        planTier: str(ap.planTier, 60),
+        expiresAt,
+        periodStart: typeof ap.periodStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.periodStart) ? ap.periodStart : null,
+        source: str(ap.source, 40) || 'connector',
+        atMs: typeof ap.atMs === 'number' && Number.isFinite(ap.atMs) ? ap.atMs : null,
+      }
+    }
+  }
+  // 账户对齐的时间戳（毫秒）
+  const accountSyncedAt =
+    typeof value.accountSyncedAt === 'number' && Number.isFinite(value.accountSyncedAt) && value.accountSyncedAt > 0
+      ? value.accountSyncedAt
+      : null
+  // 「赠送」记录（2.7.6 起）：逐条记账，不参与折算
+  const gifts = normalizeGifts(value.gifts)
+  // 逐账户设置（2.7.7）：{ 账户id: 同构记录 }，最多 20 个账户；每个账户一份自己的订阅/赠送账
+  let accountEntries = null
+  if (value.accountEntries && typeof value.accountEntries === 'object' && !Array.isArray(value.accountEntries)) {
+    const out = {}
+    let n = 0
+    for (const [accId, raw] of Object.entries(value.accountEntries)) {
+      if (typeof accId !== 'string' || accId === '' || accId.length > 80) continue
+      const sub = normalizeOverrideEntry(raw)
+      if (sub === null) continue
+      out[accId] = sub
+      n += 1
+      if (n >= 20) break
+    }
+    if (n > 0) accountEntries = out
+  }
+  const empty =
+    mode === null && estimate === false && monthlyCNY === null && planType === null &&
+    subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
+    basePrice === null && quotaPools === null && planTier === null &&
+    autoRenew === null && accountPlan === null && accountSyncedAt === null && gifts === null &&
+    accountEntries === null
+  if (empty) return null
+  return {
+    mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
+    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
+    autoRenew, accountPlan, accountSyncedAt, gifts, accountEntries,
+  }
 }
 
 function billingRules(overrides) {
@@ -1041,6 +1513,18 @@ function billingRules(overrides) {
   const auto = (provider) => {
     if (isTokenBilled(provider)) return 'token'
     if (isEstimateBilled(provider)) return 'estimate'
+    /**
+     * 本地 CLI agent（2.7.2）：**没探到登录凭据就不算订阅**。
+     *
+     * 这些 id 原来硬编码在 CREDIT_ROUTES 里，于是本机压根没登录的
+     * Claude Code / Codex CLI 也被显示成「订阅」。登录 ≠ 订阅，没登录更不算 ——
+     * 探不到就落进 unknown（界面标「未确认」，既不算订阅也不折钱），
+     * 用户确认自己确实订阅了再手标成订阅。
+     */
+    if (isLocalCliAgent(provider)) {
+      const auth = probeLocalCliAuth(provider)
+      return auth.signedIn === true ? 'credits' : 'unknown'
+    }
     return 'credits'
   }
   const entryOf = (provider) => map.get(provider) || null
@@ -1076,8 +1560,123 @@ function billingRules(overrides) {
       const entry = entryOf(provider)
       return entry === null ? null : entry.monthlyCNY
     },
+    /** 订阅形式（planType 枚举），没填 null */
+    planType: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.planType
+    },
+    /** 订阅时间 'YYYY-MM-DD'，没填 null */
+    subscribedAt: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.subscribedAt
+    },
+    /** 优惠说明文本（首月半价 / 假日活动等），没填 null */
+    promoNote: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.promoNote
+    },
+    /** 这一次订阅了多久（月），没填 null（周期账按 1 个月算） */
+    termMonths: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.termMonths
+    },
+    /** 本次实付总额 + 币种（年付就是年费，不是月费） */
+    paid: (provider) => {
+      const entry = entryOf(provider)
+      if (entry === null || entry.paidTotal === null) return null
+      return { total: entry.paidTotal, currency: entry.paidCurrency }
+    },
+    /**
+     * 折合月费：本次实付 ÷ 订阅月数。
+     * 年付 ¥120 / 12 个月 = ¥10/月 —— 拿年费直接跟等价月费比会得出「贵 12 倍」的假结论。
+     * 没填实付总额就退回 monthlyCNY（老字段，按月填的那种）。
+     */
+    effectiveMonthlyCNY: (provider) => {
+      const entry = entryOf(provider)
+      if (entry === null) return null
+      if (entry.paidTotal !== null) {
+        const term = entry.termMonths === null ? 1 : entry.termMonths
+        const cny = entry.paidCurrency === 'USD' ? entry.paidTotal * USD_TO_CNY : entry.paidTotal
+        return Number((cny / term).toFixed(4))
+      }
+      return entry.monthlyCNY
+    },
+    /** 额度池订阅的原始配置：基础价 + 每模型额度，没配 null */
+    quotaPool: (provider) => {
+      const entry = entryOf(provider)
+      if (entry === null || entry.basePrice === null || entry.quotaPools === null) return null
+      return {
+        basePrice: entry.basePrice,
+        baseCurrency: entry.baseCurrency,
+        pools: entry.quotaPools.slice(),
+      }
+    },
+    /** 选定的官方档位 id（2.7.4），没选 null */
+    planTier: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.planTier
+    },
+    /** 自动续费开关（2.7.5）：null = 没设置（按自动续费算） */
+    autoRenew: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.autoRenew
+    },
+    /** 从账户读到的订阅快照（2.7.5），没同步过 null */
+    accountPlan: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.accountPlan
+    },
+    /** 上次账户对齐时间（毫秒），没同步过 null */
+    accountSyncedAt: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.accountSyncedAt
+    },
+    /** 「赠送」记录（2.7.6 起），没记过 null */
+    gifts: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.gifts
+    },
+    /** 逐账户设置（2.7.7）：{ 账户id: 记录 }，没记过 null */
+    accountEntries: (provider) => {
+      const entry = entryOf(provider)
+      return entry === null ? null : entry.accountEntries
+    },
+    /**
+     * 「自动」按钮要不要出现（2.7.5）：有**用户意图**才出现。
+     *
+     * 老口径 touched = 表里有没有这一条 —— 于是只点过「一键填额度」/ 快捷时长的
+     * opencode-go / ark / qoder，记录里只有额度池 / termMonths，跟自动判定完全一致，
+     * 「自动」按钮却赖着不走。新口径：
+     *   · 手选了模式（mode 非空）→ 出现（点它退回自动判定）
+     *   · 订阅档开了折算 → 出现（点它连折算一起清）
+     *   · 只有订阅信息（时间 / 实付 / 档位 / 额度池 / 账户快照）→ 不出现 ——
+     *     那些不是「口径覆盖」，没有可退的；要清信息用订阅行里的「清空订阅信息」。
+     */
+    resettable: (provider) => {
+      const entry = entryOf(provider)
+      if (entry === null) return false
+      if (entry.mode !== null) return true
+      return effective(provider) === 'credits' && entry.estimate === true
+    },
+    /** 计费挡位：月付 / 多月包 / 年付。一次买俩月的限时优惠仍归月付挡 */
+    billingClass: (provider) => {
+      const entry = entryOf(provider)
+      return billingClassOfTerm(entry === null ? null : entry.termMonths)
+    },
+    /** 这条线路的国内官方档位表（下拉用），没有 null */
+    cnTiers: (provider) => cnTiersOf(provider),
+    /** 整条覆盖记录（所有字段都要时用） */
+    entry: (provider) => entryOf(provider),
     /** 要不要查价、要不要算钱（按量 / 套餐折算 / 订阅+折算 三种都算） */
-    priced: (provider) => effective(provider) !== 'credits' || foldCredit(provider),
+    /**
+     * 要不要查价、要不要算钱。
+     * ⚠ 用**白名单**而不是「!== credits」：2.7.2 加了 unknown 档（本地 CLI 没探到登录），
+     * 排除法会把 unknown 也当成要折钱，凭空多出一笔假花费。
+     */
+    priced: (provider) => {
+      const mode = effective(provider)
+      return mode === 'token' || mode === 'estimate' || foldCredit(provider)
+    },
     /** 显示文案：订阅+折算 单独一档 */
     label: (provider) => (foldCredit(provider) ? BILLING_LABEL_FOLDED : BILLING_LABELS[effective(provider)]),
     /** 是否由用户手动指定模式（界面标「手选」用） */
@@ -1121,6 +1720,9 @@ export function describeBilling(overrides) {
     labels: { ...BILLING_LABELS },
     foldedLabel: BILLING_LABEL_FOLDED,
     modes: BILLING_MODES.slice(),
+    /** 订阅形式枚举与显示名（前端下拉用） */
+    planTypes: PLAN_TYPES.slice(),
+    planTypeLabels: { ...PLAN_TYPE_LABELS },
     auto: (provider) => rules.auto(provider),
     effective: (provider) => rules.effective(provider),
     override: (provider) => rules.override(provider),
@@ -1132,6 +1734,48 @@ export function describeBilling(overrides) {
     estimateFlag: (provider) => rules.estimateFlag(provider),
     /** 用户填的参考月费 */
     monthlyCNY: (provider) => rules.monthlyCNY(provider),
+    /** 订阅形式 / 订阅时间 / 优惠说明 */
+    planType: (provider) => rules.planType(provider),
+    subscribedAt: (provider) => rules.subscribedAt(provider),
+    promoNote: (provider) => rules.promoNote(provider),
+    /** 订阅时长（月）/ 本次实付 / 折合月费 / 额度池配置 */
+    termMonths: (provider) => rules.termMonths(provider),
+    paid: (provider) => rules.paid(provider),
+    effectiveMonthlyCNY: (provider) => rules.effectiveMonthlyCNY(provider),
+    quotaPool: (provider) => rules.quotaPool(provider),
+    /** 按订阅形式从套餐表挑的参考档（联动 plans.js / 国内官方档位） */
+    planSuggestion: (provider) => suggestPlanRef(provider, rules.planType(provider), rules.planTier(provider)),
+    /** 官方档位 / 计费挡位 / 国内档位表（2.7.4） */
+    planTier: (provider) => rules.planTier(provider),
+    billingClass: (provider) => rules.billingClass(provider),
+    cnTiers: (provider) => rules.cnTiers(provider),
+    /** 自动续费 / 账户订阅快照 / 上次对齐时间 / 「自动」按钮条件（2.7.5） */
+    autoRenew: (provider) => rules.autoRenew(provider),
+    accountPlan: (provider) => rules.accountPlan(provider),
+    accountSyncedAt: (provider) => rules.accountSyncedAt(provider),
+    resettable: (provider) => rules.resettable(provider),
+    /** 「赠送」记录与汇总（2.7.6 起） */
+    gifts: (provider) => rules.gifts(provider),
+    giftTotals: (provider) => giftTotals(rules.gifts(provider)),
+    /** 逐账户设置（2.7.7） */
+    accountEntries: (provider) => rules.accountEntries(provider),
+    /** 本地 CLI agent 的本机登录态（2.7.2）；不是这类线路返回 null */
+    localCli: (provider) => {
+      if (!isLocalCliAgent(provider)) return null
+      const meta = LOCAL_CLI_AGENTS[provider] || null
+      const auth = probeLocalCliAuth(provider)
+      return {
+        label: meta ? meta.label : provider,
+        known: meta !== null,
+        signedIn: auth.signedIn,
+        via: auth.via,
+      }
+    },
+    /**
+     * opencode-go 的官方额度池建议（2.7.2）：拿这条线路实际有的模型逐个对官方额度表。
+     * 传进来的 modelIds 由调用方给（dsh-api 有线路的模型清单）。
+     */
+    goPoolSuggestion: (modelIds, tier) => buildGoPool(modelIds, tier),
     label: (provider) => rules.label(provider),
     /** 这条线路在订阅白名单里有没有积分查询端点 */
     creditEndpoint: (provider) => {
@@ -1652,6 +2296,8 @@ export async function collectUsage(ctx, options) {
       const realBilled = billing.token(bucket.provider)
       const estimate = billing.estimate(bucket.provider)
       const folded = billing.foldCredit(bucket.provider)
+      // 2.7.2：本地 CLI agent 没探到登录凭据 → unknown，既不算订阅也不折钱
+      const unconfirmed = billing.effective(bucket.provider) === 'unknown'
       // 按量的查价；套餐里那几个（通义 Token Plan / opencode-go）也查，用来折算等价金额；
       // 订阅线路打开了「折算」开关的同样查 —— 算等价金额，给「这个套餐值不值」当尺子；
       // 其余订阅渠道不查 —— 没公开价的硬编会编出错的数
@@ -1664,8 +2310,11 @@ export async function collectUsage(ctx, options) {
       if (!realBilled && !estimate) {
         // 纯套餐 / 订阅线路：只报 token 和（能拿到的）积分，不折金额。
         // 打开折算开关的线路照样算一个等价金额，但它仍然是「订阅」这一档。
-        creditTokens += bucket.total
-        creditCalls += bucket.calls
+        // ⚠ unknown（本地 CLI 没登录）不进订阅账 —— 那会凭空多出一笔「订阅用量」。
+        if (!unconfirmed) {
+          creditTokens += bucket.total
+          creditCalls += bucket.calls
+        }
         const balance = creditBalances[bucket.provider] || null
         const cost = folded ? costOf(price, bucket) : null
         if (cost !== null) {
@@ -1727,8 +2376,11 @@ export async function collectUsage(ctx, options) {
       const cost = costOf(price, bucket)
       // 等价金额单独累加，绝不混进「实际花费」那个数
       if (!realBilled) {
-        creditTokens += bucket.total
-        creditCalls += bucket.calls
+        // unknown 不进订阅账（同上）
+        if (!unconfirmed) {
+          creditTokens += bucket.total
+          creditCalls += bucket.calls
+        }
       } else if (cost === null) {
         unknownTokens += bucket.total
         unknownCalls += bucket.calls
@@ -1870,11 +2522,56 @@ export async function collectUsage(ctx, options) {
   const subscriptionWorth = [...worthAgg.values()]
     .map((agg) => {
       const monthlyCNY = Number(((agg.costCNY + agg.costUSD * USD_TO_CNY) * monthlyScale).toFixed(2))
-      const planRef = subscriptionPlanRef(agg.provider)
-      const manualMonthly = billing.monthlyCNY(agg.provider)
-      const refMin = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.minCNY
-      const refMax = manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.maxCNY
-      const refSource = manualMonthly !== null ? 'manual' : planRef === null ? null : 'plan'
+      const planTierId = billing.planTier(agg.provider)
+      const planRef = subscriptionPlanRef(agg.provider, planTierId)
+      // 参考月费（2.7.4 优先级）：官方档位（国内价）> 本次实付÷月数 > 手填月费 > plans.js 候选
+      const manualMonthly = billing.effectiveMonthlyCNY(agg.provider)
+      const paid = billing.paid(agg.provider)
+      const officialTier = planRef !== null && planRef.tierSource === 'cn-official' ? planRef : null
+      const refMin = officialTier !== null ? officialTier.minCNY : manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.minCNY
+      const refMax = officialTier !== null ? officialTier.maxCNY : manualMonthly !== null ? manualMonthly : planRef === null ? null : planRef.maxCNY
+      const refSource =
+        officialTier !== null ? 'tier' : manualMonthly !== null ? (paid !== null ? 'paid' : 'manual') : planRef === null ? null : 'plan'
+      /**
+       * 额度池订阅（quota-pool）：按「用掉的额度 / 该模型额度」的比例，从基础价里扣。
+       *
+       * 「用掉多少额度」两条口径，**优先官方**：
+       *   1. opencode-go：用**这家自己的官方单价**（opencode-go.js 快照，来自公开
+       *      models 端点）把 token 折成美元。官方文档明确「$1.5 用量 / $15 额度 = 10%」，
+       *      拿原厂价（DeepSeek / 月之暗面）去折会算错 —— 这是 2.7.2 修掉的偏差。
+       *   2. 其他家：没有官方单价表，退回按原厂价折出的金额当近似，标 estimated。
+       */
+      const poolCfg = billing.quotaPool(agg.provider)
+      let quotaPool = null
+      if (poolCfg !== null) {
+        const useGoPrices = agg.provider === 'opencode-go'
+        const usedByModel = {}
+        let goPriced = 0
+        for (const m of agg.modelRows) {
+          let usd = null
+          if (useGoPrices) {
+            usd = goUsageUSD(m.model, {
+              inputTokens: m.inputTokens,
+              outputTokens: m.outputTokens,
+              cacheReadTokens: m.cacheReadTokens,
+            })
+            if (usd !== null) goPriced += 1
+          }
+          if (usd === null) usd = m.currency === 'USD' ? m.cost : m.cost / USD_TO_CNY
+          usedByModel[m.model] = (usedByModel[m.model] || 0) + usd
+        }
+        const calc = quotaPoolSpend(poolCfg, usedByModel)
+        if (calc !== null) {
+          quotaPool = {
+            ...calc,
+            // 全部模型都用上官方单价 → 不是估算
+            estimated: !(useGoPrices && goPriced === agg.modelRows.length && goPriced > 0),
+            priceSource: useGoPrices && goPriced > 0 ? 'opencode-official' : 'vendor-estimate',
+            goSnapshotAt: useGoPrices ? OPENCODE_GO_SNAPSHOT_AT : null,
+            windowDays: windowMeta.days,
+          }
+        }
+      }
       let verdict = null
       let ratio = null
       if (refMin !== null && refMin > 0 && monthlyCNY > 0) {
@@ -1912,6 +2609,14 @@ export async function collectUsage(ctx, options) {
         ratio,
         verdict,
         planRef,
+        // 额度池订阅的按比例折算（没配就是 null）
+        quotaPool,
+        // 订阅时长 / 到期（界面「本期」那行用）
+        termMonths: billing.termMonths(agg.provider),
+        paid,
+        // 官方档位与计费挡位（2.7.4）：月付挡含「一次买俩月」的限时优惠
+        planTier: planTierId,
+        billingClass: billing.billingClass(agg.provider),
         // 展开明细：每个模型的等价金额（统一折成人民币）+ 折合月
         modelRows: agg.modelRows
           .slice()

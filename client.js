@@ -41,10 +41,13 @@ window.__ModuleLoader__.load({
      * ⚠️ 这些是**累计值**，跟时间窗（今天 / 7 天 / 30 天）无关 —— 官方没给按天明细。
      */
     const CREDIT_ENDPOINTS = [
-      { route: 'trae', endpoint: 'dsh-connect-trae' },
-      { route: 'qoder', endpoint: 'dsh-connect-qoder' },
-      { route: 'qoder-global', endpoint: 'dsh-connect-qoder' },
-      { route: 'workbuddy', endpoint: 'dsh-connect-workbuddy' },
+      { route: 'trae', url: '/plugins/dsh-connect-trae/usage' },
+      { route: 'qoder', url: '/plugins/dsh-connect-qoder/usage' },
+      { route: 'qoder-global', url: '/plugins/dsh-connect-qoder/usage' },
+      { route: 'workbuddy', url: '/plugins/dsh-connect-workbuddy/usage' },
+      // CodeArts 的连接器是 dsh-codearts，订阅信息（planName / periodStart / periodEnd）
+      // 在它自己的 /api/codearts/status 里（2.7.5）
+      { route: 'codearts', url: '/api/codearts/status' },
     ]
 
     /** 从 /usage 的 credits 块里抠出「已消耗」「剩余」「总额度」 */
@@ -85,25 +88,270 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 从 /usage 里读「这条渠道加了几个账号」（2.7.1，2.7.2 扩充为逐账号明细）。
+     *
+     * 连接器自己就把账号列表摊在 `accounts` 里，当前用的是哪个看顶层 `accountId`。
+     * **逐账号的订阅状态在 `pool.accounts` 里**（2.7.2）：
+     *   member            这个账号是不是会员（开了订阅）—— 多账号里可能只有部分开了
+     *   credits           这个账号自己的积分余额
+     *   planExpiresAtMs   套餐到期
+     *   current           是不是当前在用的
+     *   checkedInToday    今天签到过没
+     *
+     * 只取这些公开字段，不碰 token / pat 这些凭据。
+     *
+     * ⚠ 跟积分不同：**登出了也要报账号数**（trae 现在 signed-out 但存着 2 个账号），
+     * 所以这个读取不看 status。
+     */
+    const readAccounts = (payload) => {
+      if (!payload || !Array.isArray(payload.accounts)) return null
+      // pool.accounts 按 accountId 索引，拿逐账号的会员 / 积分 / 到期
+      const poolById = new Map()
+      const poolRows = payload.pool && Array.isArray(payload.pool.accounts) ? payload.pool.accounts : []
+      for (const row of poolRows) {
+        if (row && typeof row.accountId === 'string') poolById.set(row.accountId, row)
+      }
+      const memberIds = new Set(
+        (payload.pool && Array.isArray(payload.pool.effectiveMemberAccountIds)
+          ? payload.pool.effectiveMemberAccountIds
+          : payload.pool && Array.isArray(payload.pool.memberAccountIds)
+            ? payload.pool.memberAccountIds
+            : []
+        ).filter((x) => typeof x === 'string'),
+      )
+      const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+      const nowMs = Date.now()
+      const rows = []
+      for (const item of payload.accounts) {
+        if (!item || typeof item !== 'object') continue
+        const id = typeof item.id === 'string' && item.id !== '' ? item.id : null
+        if (id === null) continue
+        const pool = poolById.get(id) || null
+        // 会员判定：pool 里明说 member，或 id 在会员名单里；两样都没有就是 null（不知道）
+        let member = null
+        if (pool && typeof pool.member === 'boolean') member = pool.member
+        else if (memberIds.size > 0) member = memberIds.has(id)
+        /**
+         * 套餐到期核查（2.7.3）：member 标记可能是缓存的旧状态 ——
+         * planExpiresAtMs 已经过了就**不算已订阅**（标「已过期」），
+         * 免得把过期账号当成还在订阅、把它的旧积分当成可用额度。
+         */
+        const planExp = pool ? num(pool.planExpiresAtMs) : null
+        const planExpired = member === true && planExp !== null && planExp <= nowMs
+        if (planExpired) member = false
+        rows.push({
+          id,
+          name: typeof item.accountName === 'string' && item.accountName !== '' ? item.accountName : null,
+          selected: item.selected === true,
+          member,
+          planExpired,
+          credits: pool ? num(pool.credits) : null,
+          planExpiresAtMs: planExp,
+          nearestExpiryMs: pool ? num(pool.nearestExpiryMs) : null,
+          checkedInToday: pool && typeof pool.checkedInToday === 'boolean' ? pool.checkedInToday : null,
+          tokenExpiresAtMs: num(item.tokenExpiresAtMs),
+          region: typeof item.region === 'string' ? item.region : null,
+          enterprise: typeof item.enterprise === 'boolean' ? item.enterprise : null,
+        })
+        if (rows.length >= 20) break
+      }
+      if (rows.length === 0) return null
+      const activeId = typeof payload.accountId === 'string' && payload.accountId !== '' ? payload.accountId : null
+      let currentId = activeId !== null && rows.some((r) => r.id === activeId) ? activeId : null
+      if (currentId === null) {
+        const marked = rows.find((r) => r.selected)
+        currentId = marked ? marked.id : null
+      }
+      const memberCount = rows.filter((r) => r.member === true).length
+      const expiredCount = rows.filter((r) => r.planExpired === true).length
+      const anyMemberKnown = rows.some((r) => r.member !== null)
+      return { count: rows.length, currentId, accounts: rows, memberCount, expiredCount, anyMemberKnown }
+    }
+
+    /**
+     * 从账户 /usage 里读「这条渠道的订阅信息」（2.7.5）。
+     *
+     * 各家连接器给的东西不一样，能拿多少拿多少：
+     *   Qoder      credits.planExpiresAtMs → 当前套餐到期日（没有档位名）
+     *   WorkBuddy  credits.packages 里 monthly:true 的包 → 包名带官方档位名
+     *              （「CodeBuddy个人体验版」），cycleRefreshMs → 本期刷新日
+     *   CodeArts   /api/codearts/status 的 credits.credits：planName（体验版…）、
+     *              periodStart / periodEnd —— 最全的一家
+     *   Trae       只给账号列表，订阅信息拿不到（null）
+     *
+     * ⚠ 金额（订阅时间 / 实付）账户里**没有** —— 首次订阅时间和实付永远手填，
+     *   这里只对齐「档位名 + 当前有效期」。
+     */
+    const readAccountPlan = (route, payload) => {
+      if (!payload || typeof payload !== 'object') return null
+      const dayOf = (ms) => {
+        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null
+        const d = new Date(ms)
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      }
+      // CodeArts：planName + periodStart/periodEnd 直接给
+      if (route === 'codearts') {
+        const c = payload.credits && payload.credits.credits ? payload.credits.credits : null
+        if (!c) return null
+        const expiresAt = typeof c.periodEnd === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(c.periodEnd) ? c.periodEnd : null
+        if (c.planName === undefined && expiresAt === null) return null
+        return {
+          name: typeof payload.accountName === 'string' && payload.accountName !== '' ? payload.accountName : null,
+          planName: typeof c.planName === 'string' && c.planName !== '' ? c.planName : null,
+          expiresAt,
+          periodStart: typeof c.periodStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(c.periodStart) ? c.periodStart : null,
+          source: 'codearts-status',
+          atMs: typeof c.fetchedAt === 'number' ? c.fetchedAt : Date.now(),
+        }
+      }
+      // Qoder：只有套餐到期时间
+      if (route === 'qoder' || route === 'qoder-global') {
+        const exp = payload.credits ? payload.credits.planExpiresAtMs : null
+        const day = dayOf(exp)
+        if (day === null) return null
+        return {
+          name: typeof payload.accountName === 'string' && payload.accountName !== '' ? payload.accountName : null,
+          planName: null,
+          expiresAt: day,
+          periodStart: null,
+          source: 'connector-usage',
+          atMs: typeof payload.creditsAtMs === 'number' ? payload.creditsAtMs : Date.now(),
+        }
+      }
+      // WorkBuddy：monthly 包的名字就是官方档位名
+      if (route === 'workbuddy') {
+        const packs = payload.credits && Array.isArray(payload.credits.packages) ? payload.credits.packages : []
+        const monthly = packs.filter((p) => p && p.monthly === true)
+        if (monthly.length === 0) return null
+        const named = monthly.find((p) => typeof p.packageName === 'string' && p.packageName !== '') || null
+        return {
+          name: typeof payload.accountName === 'string' && payload.accountName !== '' ? payload.accountName : null,
+          planName: named ? named.packageName : null,
+          expiresAt: dayOf(named ? named.cycleRefreshMs : null),
+          periodStart: null,
+          source: 'connector-usage',
+          atMs: Date.now(),
+        }
+      }
+      return null
+    }
+
+    /**
+     * 账户档位名 → 官方档位 id 的关键词匹配（2.7.5）。
+     * 匹配不上就 null —— 宁可不填也不瞎猜（体验版/免费 这种同义词列全）。
+     */
+    const TIER_NAME_HINTS = [
+      { re: /体验版|免费版|免费|trial|free/i, suffix: 'free' },
+      { re: /旗舰|ultra|flagship/i, suffix: 'ultra' },
+      { re: /高级|advanced/i, suffix: 'advanced' },
+      { re: /专业|pro\b/i, suffix: 'pro' },
+      { re: /标准|standard/i, suffix: 'standard' },
+      { re: /轻量|lite/i, suffix: 'lite' },
+    ]
+    const matchTierByName = (cnTiers, planName) => {
+      if (!cnTiers || !Array.isArray(cnTiers.tiers) || typeof planName !== 'string' || planName === '') return null
+      for (const hint of TIER_NAME_HINTS) {
+        if (!hint.re.test(planName)) continue
+        // 先找 id 以该后缀结尾的（codearts-doer-free / wb-cn-free / qoder-cn-pro…）
+        const byId = cnTiers.tiers.find((t) => t.id.endsWith('-' + hint.suffix))
+        if (byId) return byId.id
+        const byName = cnTiers.tiers.find((t) => hint.re.test(t.official))
+        if (byName) return byName.id
+      }
+      return null
+    }
+
+    /**
+     * 周期账（2.7.7 前端镜像版）：给「按账户投影」的记录算当前有效期。
+     * 口径与宿主 subscriptionPeriod 一致：autoRenew !== false 时到期 = 包含今天的本期结束。
+     * 只用于多账户选中时的展示；线路级记录仍用宿主算好的 period。
+     */
+    const periodOf = (subscribedAt, termMonths, autoRenew) => {
+      if (typeof subscribedAt !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(subscribedAt)) return null
+      const start = new Date(subscribedAt + 'T00:00:00')
+      if (Number.isNaN(start.getTime())) return null
+      const now = new Date()
+      if (now < start) return null
+      const term = typeof termMonths === 'number' && termMonths >= 1 && termMonths <= 120 ? Math.floor(termMonths) : 1
+      const renew = autoRenew !== false
+      const addMonths = (n) => {
+        const d = new Date(start.getFullYear(), start.getMonth() + n, 1)
+        const lastDay = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate()
+        d.setDate(Math.min(start.getDate(), lastDay))
+        return d
+      }
+      let idx = 0
+      while (idx < 1200 && addMonths((idx + 1) * term) <= now) idx += 1
+      const fmt = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+      const termEnd = renew ? addMonths((idx + 1) * term) : addMonths(term)
+      return {
+        periodIndex: idx + 1,
+        periodStart: fmt(addMonths(idx * term)),
+        periodEnd: fmt(addMonths((idx + 1) * term)),
+        daysSince: Math.floor((now - start) / 86400000),
+        termMonths: term,
+        expiresAt: fmt(termEnd),
+        daysLeft: Math.ceil((termEnd - now) / 86400000),
+        expired: termEnd <= now,
+        autoRenew: renew,
+      }
+    }
+
+    /** 赠送汇总（2.7.7 前端镜像版）：给按账户投影的记录算合计，口径与宿主 giftTotals 一致 */
+    const giftTotalsOf = (gifts) => {
+      if (!Array.isArray(gifts) || gifts.length === 0) return null
+      let creditCNY = 0
+      let pointsRaw = 0
+      let tokensRaw = 0
+      let creditCount = 0
+      let pointsCount = 0
+      let tokenCount = 0
+      const SCALE = { raw: 1, K: 1e3, M: 1e6, B: 1e9 }
+      for (const g of gifts) {
+        if (!g || typeof g.amount !== 'number') continue
+        if (g.kind === 'credit') { creditCNY += g.unit === 'USD' ? g.amount * 7.2 : g.amount; creditCount += 1 }
+        else if (g.kind === 'points') { pointsRaw += g.amount; pointsCount += 1 }
+        else if (g.kind === 'tokens') { tokensRaw += g.amount * (SCALE[g.unit] || 1); tokenCount += 1 }
+      }
+      return {
+        creditCNY: Number(creditCNY.toFixed(2)),
+        pointsRaw: Number(pointsRaw.toFixed(2)),
+        tokensRaw,
+        creditCount,
+        pointsCount,
+        tokenCount,
+        count: gifts.length,
+      }
+    }
+
     const fetchCreditBalances = async () => {
       const out = {}
       await Promise.all(
         CREDIT_ENDPOINTS.map(async (item) => {
           try {
-            const response = await fetch('/plugins/' + item.endpoint + '/usage', {
+            const response = await fetch(item.url, {
               cache: 'no-store',
               credentials: 'same-origin',
             })
             if (!response.ok) return
             const payload = await response.json()
-            if (!payload || payload.status !== 'signed-in') return
-            const book = readCreditBook(payload.credits)
-            if (book === null) return
+            if (!payload) return
+            // 账号列表：登出也报（存着几个账号是事实，跟当前能不能用无关）
+            const accounts = readAccounts(payload)
+            // 积分：只有登录态才有意义
+            const book = payload.status === 'signed-in' ? readCreditBook(payload.credits) : null
+            // 账户订阅信息（2.7.5）：CodeArts 的 status 没有 signed-in 字段，单独放行
+            const plan = payload.status === 'signed-in' || item.route === 'codearts' ? readAccountPlan(item.route, payload) : null
+            if (book === null && accounts === null && plan === null) return
+            const prev = out[item.route]
             out[item.route] = {
-              consumed: book.consumed,
-              remaining: book.remaining,
-              total: book.total,
-              accountName: payload.accountName || null,
+              consumed: book === null ? (prev ? prev.consumed : null) : book.consumed,
+              remaining: book === null ? (prev ? prev.remaining : null) : book.remaining,
+              total: book === null ? (prev ? prev.total : null) : book.total,
+              accountName: payload.accountName || (prev ? prev.accountName : null),
+              accounts,
+              plan,
             }
           } catch (error) {
             // 没这家连接器就算了
@@ -224,12 +472,14 @@ window.__ModuleLoader__.load({
      *   credits  订阅 · 不折钱：只报 token 和积分；再打开折算就是「订阅 · 折算」
      */
     const BILLING_LABELS = {
-      token: '按量计费',
+      token: 'API 按量',
       estimate: '套餐 · 折算',
       credits: '订阅 · 不折钱',
+      // 2.7.2：本地 CLI agent 没探到登录凭据 —— 既不算订阅也不折钱
+      unknown: '未确认',
     }
     const BILLING_SHORT = {
-      token: '按量',
+      token: 'API 按量',
       estimate: '折算',
       credits: '订阅',
     }
@@ -565,6 +815,171 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-label-secondary, #8a8f98);
   border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.22));
   background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
+/* 全局搜索栏：栏目切换下面那条，对当前栏即时过滤 */
+.ac-globalsearch { display: flex; align-items: center; gap: 8px; margin: 16px 0 2px; }
+.ac-search-global { flex: 1; max-width: 420px; }
+/* 订阅详情行：订阅形式 / 订阅时间 / 本期实付，三行小表单 */
+.ac-sub-detail { margin-top: 6px; padding: 9px 11px; border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 30%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 5%, transparent); }
+.ac-sub-detail-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 5px; }
+.ac-sub-detail-row:first-child { margin-top: 0; }
+.ac-sub-detail-row .ac-bill-label { min-width: 52px; }
+.ac-sub-select, .ac-sub-input { font-size: 11px; padding: 3px 7px; border-radius: 6px; font-family: inherit;
+  color: var(--dsw-alias-label-primary, inherit);
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.26));
+  background: var(--dsw-alias-bg-layer-0, #fff); }
+.ac-sub-select:focus, .ac-sub-input:focus { outline: none; border-color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-sub-select:disabled, .ac-sub-input:disabled { opacity: .55; cursor: default; }
+.ac-sub-input::placeholder { color: var(--dsw-alias-label-secondary, #8a8f98); opacity: .8; }
+.ac-sub-price { width: 92px; }
+.ac-sub-price-wrap { display: inline-flex; align-items: center; gap: 3px; }
+.ac-sub-price-wrap::before { content: '¥'; font-size: 11px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-sub-promo { flex: 1; min-width: 160px; }
+.ac-sub-suggest { font-size: 10.5px; line-height: 1.5; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-sub-period { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-sub-period b { color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-sub-promo-hint { font-size: 10.5px; color: var(--dsw-alias-state-warn-primary, #c08a2e); }
+/* 多账号徽标（2.7.1）→ 可展开按钮（2.7.2） */
+.ac-route-accounts { font-size: 10px; padding: 1px 6px; border-radius: 5px; font-weight: 600; cursor: pointer;
+  font-family: inherit;
+  color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 40%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 10%, transparent); }
+.ac-route-accounts:hover { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 18%, transparent); }
+.ac-route-accounts[data-on] { background: var(--dsw-alias-brand-primary, #4d7cfe); color: #fff; }
+/* 多账号明细面板（2.7.2） */
+.ac-accounts { margin-top: 8px; padding: 9px 11px; border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 26%, transparent);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 5%, transparent); }
+.ac-accounts-head { font-size: 11px; margin-bottom: 6px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-accounts-head b { color: var(--dsw-alias-label-primary, inherit); }
+.ac-account-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 10.5px;
+  padding: 4px 0; border-top: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.14)); }
+.ac-account-row:first-of-type { border-top: none; }
+.ac-account-row[data-current] .ac-account-name { font-weight: 650; }
+.ac-account-name { min-width: 120px; }
+.ac-account-member { font-size: 9.5px; padding: 1px 5px; border-radius: 4px; font-weight: 600; }
+.ac-account-member[data-member="yes"] { color: var(--dsw-alias-state-ok-primary, #2e9e5b);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-ok-primary, #2e9e5b) 40%, transparent); }
+.ac-account-member[data-member="no"] { color: var(--dsw-alias-label-secondary, #8a8f98);
+  border: 1px dashed var(--dsw-alias-border-l1, rgba(128,128,128,.34)); }
+.ac-account-member[data-member="unknown"] { color: var(--dsw-alias-label-secondary, #8a8f98); opacity: .7; }
+.ac-account-member[data-member="expired"] { color: var(--dsw-alias-state-danger-primary, #d9534f);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-danger-primary, #d9534f) 40%, transparent); }
+.ac-account-fact { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-account-fact b { color: var(--dsw-alias-label-primary, inherit); }
+.ac-account-cur { margin-left: auto; font-size: 9.5px; padding: 1px 5px; border-radius: 4px;
+  color: var(--dsw-alias-brand-primary, #4d7cfe);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 12%, transparent); }
+.ac-accounts-note { margin-top: 6px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
+/* 本地 CLI agent 未确认（2.7.2） */
+.ac-cli-note { margin-top: 6px; padding: 7px 10px; border-radius: 8px; font-size: 10.5px; line-height: 1.6;
+  color: var(--dsw-alias-label-secondary, #8a8f98);
+  border: 1px dashed var(--dsw-alias-border-l1, rgba(128,128,128,.34)); }
+.ac-cli-note b { color: var(--dsw-alias-label-primary, inherit); }
+/* Go 官方额度一键填（2.7.2）+ 全表检索（2.7.3） */
+.ac-go-fill { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.ac-go-src { font-size: 10px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-go-table { margin-top: 7px; padding: 8px 10px; border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
+.ac-go-table-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+.ac-go-table-search { flex: 1; min-width: 150px; max-width: 260px; }
+.ac-go-table-rows { max-height: 320px; overflow-y: auto; }
+.ac-go-table-row { display: grid; grid-template-columns: minmax(160px, 1.6fr) repeat(5, minmax(52px, .7fr));
+  gap: 6px; align-items: center; font-size: 10.5px; padding: 3px 2px;
+  border-top: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.12)); }
+.ac-go-table-th { border-top: none; font-weight: 600; font-size: 10px;
+  color: var(--dsw-alias-label-secondary, #8a8f98); position: sticky; top: 0;
+  background: var(--dsw-alias-bg-layer-1, #f4f5f7); }
+.ac-go-table-row[data-inroute] { background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 6%, transparent); }
+.ac-go-table-model { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.ac-go-table-model code { font-size: 10px; }
+.ac-go-inroute { font-style: normal; font-size: 9px; padding: 0 4px; border-radius: 4px;
+  color: var(--dsw-alias-brand-primary, #4d7cfe);
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 12%, transparent); }
+.ac-go-peak { font-style: normal; font-size: 9px; padding: 0 4px; border-radius: 4px;
+  color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 35%, transparent); }
+.ac-go-free { color: var(--dsw-alias-state-ok-primary, #2e9e5b); font-size: 10px; }
+/* 未配置线路的收起开关（2.7.1） */
+.ac-unconf-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 2px; }
+.ac-unconf-note { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+/* 订阅时长 / 到期 / 折合月费（2.7.1） */
+.ac-sub-term-wrap { display: inline-flex; align-items: center; gap: 4px; }
+.ac-sub-term { width: 58px; }
+.ac-sub-unit { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-sub-term-quick { font-size: 10px; padding: 2px 7px; }
+/* 官方档位下拉 + 计费挡位标签（2.7.4） */
+.ac-tier-select { max-width: 220px; }
+.ac-bill-class { font-size: 9.5px; padding: 1px 6px; border-radius: 4px; font-weight: 600;
+  color: var(--dsw-alias-label-secondary, #8a8f98);
+  border: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,.26)); }
+.ac-bill-class[data-class="monthly"] { color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 40%, transparent); }
+.ac-bill-class[data-class="yearly"] { color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border-color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 40%, transparent); }
+.ac-sub-cur { width: 46px; padding: 3px 4px; }
+.ac-sub-monthly { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-sub-monthly b { color: var(--dsw-alias-label-primary, inherit); }
+.ac-sub-expire { font-size: 10.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-sub-expire[data-soon] { color: var(--dsw-alias-state-warn-primary, #c08a2e); font-weight: 600; }
+.ac-sub-expire[data-expired] { color: var(--dsw-alias-state-danger-primary, #d9534f); font-weight: 600; }
+/* 额度池订阅（2.7.1） */
+.ac-quota { margin-top: 7px; padding-top: 7px;
+  border-top: 1px dashed color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 30%, transparent); }
+.ac-quota-pools-row { align-items: flex-start; }
+.ac-quota-text { flex: 1; min-width: 200px; font-family: ui-monospace, monospace; font-size: 10.5px;
+  line-height: 1.6; resize: vertical; }
+.ac-quota-hint { margin-top: 5px; font-size: 10px; line-height: 1.9; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-quota-hint code { margin-right: 5px; padding: 1px 4px; border-radius: 4px; font-size: 9.5px;
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.10)); }
+.ac-quota-calc { margin-top: 7px; padding: 8px 10px; border-radius: 8px;
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
+.ac-quota-calc-head { font-size: 11px; margin-bottom: 5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-quota-calc-head b { font-size: 13px; color: var(--dsw-alias-label-primary, inherit); }
+.ac-quota-calc-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 10.5px; padding: 2px 0; }
+.ac-quota-calc-row code { font-size: 10px; }
+.ac-quota-calc-detail { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-quota-calc-row b { margin-left: auto; }
+.ac-quota-cap { font-size: 9.5px; padding: 0 4px; border-radius: 4px;
+  color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 40%, transparent); }
+.ac-quota-note { margin-top: 5px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
+/* 赠金 / 免费 token 记账（2.7.6） */
+.ac-gifts { margin-top: 7px; padding-top: 7px;
+  border-top: 1px dashed color-mix(in srgb, var(--dsw-alias-state-ok-primary, #3aa76d) 35%, transparent); }
+.ac-gift-amount { width: 90px; }
+.ac-gift-note { flex: 1; min-width: 140px; }
+.ac-gift-list { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+.ac-gift-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 10.5px;
+  padding: 3px 8px; border-radius: 6px;
+  background: var(--dsw-alias-bg-layer-1, rgba(128,128,128,.06)); }
+.ac-gift-kind { font-size: 9.5px; padding: 0 5px; border-radius: 4px; font-weight: 600; }
+.ac-gift-kind[data-kind="credit"] { color: var(--dsw-alias-state-ok-primary, #3aa76d);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-ok-primary, #3aa76d) 40%, transparent); }
+.ac-gift-kind[data-kind="tokens"] { color: var(--dsw-alias-brand-primary, #4d7cfe);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 40%, transparent); }
+.ac-gift-amount { font-size: 11.5px; }
+.ac-gift-note-text { color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-gift-at { margin-left: auto; font-size: 9.5px; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-gift-del { border: none; background: none; cursor: pointer; font-size: 10px; padding: 1px 4px;
+  color: var(--dsw-alias-label-secondary, #8a8f98); border-radius: 4px; }
+.ac-gift-del:hover { color: var(--dsw-alias-state-danger-primary, #d9534f);
+  background: color-mix(in srgb, var(--dsw-alias-state-danger-primary, #d9534f) 12%, transparent); }
+.ac-gift-total { margin-top: 5px; font-size: 10px; line-height: 1.6; color: var(--dsw-alias-label-secondary, #8a8f98); }
+.ac-gift-total b { color: var(--dsw-alias-label-primary, inherit); }
+.ac-gift-kind[data-kind="points"] { color: var(--dsw-alias-state-warn-primary, #c08a2e);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-state-warn-primary, #c08a2e) 40%, transparent); }
+/* 多账户设置选择（2.7.7） */
+.ac-acc-edit { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 7px;
+  padding: 6px 10px; border-radius: 8px;
+  background: color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 6%, transparent);
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-primary, #4d7cfe) 22%, transparent); }
+.ac-acc-select { max-width: 260px; }
+.ac-acc-edit-hint { font-size: 10.5px; color: var(--dsw-alias-brand-primary, #4d7cfe); }
+.ac-acc-edit-hint b { font-weight: 600; }
+.ac-acc-copy { display: inline-flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
 .ac-models { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
 .ac-model-chip { font-size: 10.5px; padding: 3px 7px; border-radius: 6px; font-family: ui-monospace, monospace;
   color: var(--dsw-alias-label-secondary, #8a8f98);
@@ -881,6 +1296,17 @@ window.__ModuleLoader__.load({
       const [planRegion, setPlanRegion] = React.useState('all')
       // 用量的时间范围：今天 / 近 7 天 / 近 30 天
       const [usageWindow, setUsageWindow] = React.useState('month')
+      // 接入栏：要不要把「本机还没配起来」的线路也显示出来（默认收起，2.7.1）
+      const [showUnconfigured, setShowUnconfigured] = React.useState(false)
+      // 多账号明细展开的线路 id（2.7.2）：null = 都收着
+      const [accountsOpen, setAccountsOpen] = React.useState(null)
+      // Go 官方额度全表展开 + 表内检索词（2.7.3）
+      const [goTableOpen, setGoTableOpen] = React.useState(false)
+      const [goTableQuery, setGoTableQuery] = React.useState('')
+      // 「赠送」输入草稿（2.7.6 起）：按线路 id 存，每输入一条记一条
+      const [giftDraft, setGiftDraft] = React.useState({})
+      // 多账户设置选择（2.7.7）：{ 线路id: 账户id }，null/缺省 = 整条渠道
+      const [accountEdit, setAccountEdit] = React.useState({})
 
       const load = React.useCallback(async () => {
         try {
@@ -1183,7 +1609,13 @@ window.__ModuleLoader__.load({
               payload.usage === undefined || payload.usage === null
                 ? prev.usage
                 : { ...payload.usage, creditBalances: balances }
-            return { ...prev, dshApi: payload.dshApi, usage: nextUsage }
+            return {
+              ...prev,
+              dshApi: payload.dshApi,
+              usage: nextUsage,
+              // 「重新读」也带回 Go 官方额度表（2.7.3）
+              opencodeGo: payload.opencodeGo !== undefined ? payload.opencodeGo : prev.opencodeGo,
+            }
           })
           // 刷新时宿主可能把几条手选的口径退回订阅了 —— 说出来，别让人以为点坏了
           const cleared =
@@ -1341,6 +1773,32 @@ window.__ModuleLoader__.load({
         return out
       }, [priceProviders, priceRegions, priceRegion, priceSort])
 
+      // 价格栏的全局搜索：按厂商名 / 模型名 / 模型 id / 备注过滤，命中的模型行留下，
+      // 厂商整名命中就整个厂商留下；过滤后空组不显示
+      const filteredPriceGroups = React.useMemo(() => {
+        const n = query.trim().toLowerCase()
+        if (n === '') return priceGroups
+        return priceGroups
+          .map((group) => ({
+            ...group,
+            entries: group.entries
+              .map((entry) => {
+                const providerHit = [entry.provider.title, entry.provider.note || '']
+                  .join(' ')
+                  .toLowerCase()
+                  .includes(n)
+                const models = providerHit
+                  ? entry.models
+                  : entry.models.filter((model) =>
+                      [model.name, model.id, model.note || ''].join(' ').toLowerCase().includes(n),
+                    )
+                return models.length > 0 ? { ...entry, models } : null
+              })
+              .filter(Boolean),
+          }))
+          .filter((group) => group.entries.length > 0)
+      }, [priceGroups, query])
+
       const priceStaleDays = priceData ? daysSince(priceData.snapshotAt) : null
 
       // ------------------------------------------------------------ 订阅数据（通用 / 编程工具）
@@ -1351,18 +1809,30 @@ window.__ModuleLoader__.load({
       const planCategory = view === 'coding' ? 'coding' : 'general'
       const visiblePlans = planItems.filter((item) => planCategoryOf(item) === planCategory)
 
+      // 订阅栏的全局搜索：按套餐名 / 厂商 / 额度 / 权益 / 备注过滤
+      const filteredPlans = React.useMemo(() => {
+        const n = query.trim().toLowerCase()
+        if (n === '') return visiblePlans
+        return visiblePlans.filter((plan) =>
+          [plan.title, plan.provider, plan.quota || '', plan.priceNote || '', plan.note || '', (plan.benefits || []).join(' ')]
+            .join(' ')
+            .toLowerCase()
+            .includes(n),
+        )
+      }, [visiblePlans, query])
+
       const planRegions = React.useMemo(() => {
-        const present = new Set(visiblePlans.map((item) => item.region))
+        const present = new Set(filteredPlans.map((item) => item.region))
         const out = REGION_ORDER.filter((name) => present.has(name))
         for (const name of present) if (!out.includes(name)) out.push(name)
         return out
-      }, [visiblePlans])
+      }, [filteredPlans])
 
       const planGroups = React.useMemo(() => {
         const regions = planRegions.filter((name) => planRegion === 'all' || name === planRegion)
         const out = []
         for (const name of regions) {
-          const rows = visiblePlans.filter((item) => item.region === name)
+          const rows = filteredPlans.filter((item) => item.region === name)
           // 只按厂商分组、不按币种拆组，保证厂商顺序固定；同一家内按价格从低到高
           const byProvider = new Map()
           for (const plan of rows) {
@@ -1397,7 +1867,7 @@ window.__ModuleLoader__.load({
           })
         }
         return out
-      }, [visiblePlans, planRegions, planRegion])
+      }, [filteredPlans, planRegions, planRegion])
 
       const planStaleDays = planData ? daysSince(planData.snapshotAt) : null
       const planReachable = visiblePlans.filter((item) => item.reachable === true).length
@@ -1414,6 +1884,38 @@ window.__ModuleLoader__.load({
           },
           label,
         )
+
+      /**
+       * 全局搜索框：放在栏目切换下面，对**当前所在栏**即时过滤。
+       * 领取入口那栏的过滤已经用同一个 query（名字/关键词），其余五栏各配一个匹配器。
+       */
+      const needle = query.trim().toLowerCase()
+      const SEARCH_PLACEHOLDERS = {
+        credits: '搜名字 / 关键词…',
+        prices: '搜厂商 / 模型…',
+        general: '搜套餐 / 厂商…',
+        coding: '搜套餐 / 厂商…',
+        dsh: '搜线路 / 模型 / 端点…',
+        usage: '搜渠道 / 模型…',
+      }
+      const searchMatches = (fields) => {
+        if (needle === '') return true
+        return fields.join(' ').toLowerCase().includes(needle)
+      }
+      const searchBar = h(
+        'div',
+        { className: 'ac-globalsearch' },
+        h('input', {
+          className: 'ac-search ac-search-global',
+          type: 'search',
+          placeholder: SEARCH_PLACEHOLDERS[view] || '搜索…',
+          value: query,
+          onChange: (event) => setQuery(event.target.value),
+        }),
+        needle !== ''
+          ? h('button', { type: 'button', className: 'ac-chip', onClick: () => setQuery('') }, '清除 ✕')
+          : null,
+      )
 
       // ------------------------------------------------------------ 四个栏目
 
@@ -1674,15 +2176,10 @@ window.__ModuleLoader__.load({
                 const n = sources.filter((item) => item.category === name).length
                 return chip(name, name + ' (' + n + ')', category === name, () => setCategory(name))
               }),
-              h('input', {
-                className: 'ac-search',
-                type: 'search',
-                placeholder: '搜名字 / 关键词…',
-                value: query,
-                onChange: (event) => setQuery(event.target.value),
-              }),
             )
           : null,
+
+        data !== null ? searchBar : null,
 
         groups.map((group) => {
           const buckets = BUCKETS.map((bucket) => ({
@@ -1814,6 +2311,8 @@ window.__ModuleLoader__.load({
             )
           : null,
 
+        priceData !== null && priceProviders.length > 0 ? searchBar : null,
+
         priceData !== null && priceProviders.length > 0
           ? h(
               'div',
@@ -1834,7 +2333,7 @@ window.__ModuleLoader__.load({
                     h('th', null, '说明'),
                   ),
                 ),
-                priceGroups.map((group) =>
+                filteredPriceGroups.map((group) =>
                   h(
                     'tbody',
                     { key: group.key },
@@ -1921,8 +2420,14 @@ window.__ModuleLoader__.load({
             )
           : null,
 
-        priceGroups.length === 0 && priceProviders.length > 0
-          ? h('div', { className: 'ac-price-empty' }, '这个区域还没有收录厂商，切回「全部」看看。')
+        filteredPriceGroups.length === 0 && priceProviders.length > 0
+          ? h(
+              'div',
+              { className: 'ac-price-empty' },
+              needle !== ''
+                ? '没有匹配「' + query.trim() + '」的厂商或模型，换个关键词试试。'
+                : '这个区域还没有收录厂商，切回「全部」看看。',
+            )
           : null,
 
         priceData !== null && priceProviders.length > 0
@@ -2115,16 +2620,22 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'ac-price-empty' }, '这个栏目还没有收录套餐。')
           : null,
 
-        planData !== null && planItems.length > 0
+        planData !== null && planItems.length > 0 && visiblePlans.length > 0
           ? h(
               'div',
               { className: 'ac-price-tools' },
               chip('all', '全部 (' + visiblePlans.length + ' 个)', planRegion === 'all', () => setPlanRegion('all')),
               ...planRegions.map((name) => {
-                const n = visiblePlans.filter((item) => item.region === name).length
+                const n = filteredPlans.filter((item) => item.region === name).length
                 return chip(name, name + ' (' + n + ')', planRegion === name, () => setPlanRegion(name))
               }),
             )
+          : null,
+
+        planData !== null && visiblePlans.length > 0 ? searchBar : null,
+
+        planData !== null && visiblePlans.length > 0 && filteredPlans.length === 0
+          ? h('div', { className: 'ac-price-empty' }, '没有匹配「' + query.trim() + '」的套餐，换个关键词试试。')
           : null,
 
         planGroups.map((group) =>
@@ -2206,6 +2717,34 @@ window.__ModuleLoader__.load({
       const dshBilling = dshApi && dshApi.billing ? dshApi.billing : null
       const dshRoutes = dshApi && Array.isArray(dshApi.routes) ? dshApi.routes : []
       const dshTotals = (dshApi && dshApi.totals) || { routes: 0, models: 0, configured: 0, missing: 0 }
+      // 接入栏的全局搜索：按线路名 / id / 端点 / 协议 / 模型名过滤
+      const searchedRoutes = dshRoutes.filter((route) =>
+        searchMatches([
+          route.name,
+          route.id,
+          route.baseURL || '',
+          route.api || '',
+          ...(Array.isArray(route.models) ? route.models.map((m) => m.name + ' ' + m.id) : []),
+        ]),
+      )
+      /**
+       * 本机还没配起来的线路默认收起来（2.7.1）。
+       *
+       * 宿主会把 profile 里声明过的通道全列出来，哪怕密钥没填、一个模型都读不到
+       * （火山方舟那几个没加 API 的通道就是这样），一堆点不动的空卡片很占屏。
+       * 这里默认只显示配起来的，另给一个「显示 N 条未配置」的开关。
+       *
+       * ⚠ 搜索时**不藏**：用户明确在找某条线路，搜到了就该看得见。
+       */
+      const unconfiguredRoutes = searchedRoutes.filter((route) => route.unconfigured === true)
+      const filteredRoutes =
+        showUnconfigured || needle !== ''
+          ? searchedRoutes
+          : searchedRoutes.filter((route) => route.unconfigured !== true)
+      // 多账号（2.7.1）：页面问连接器 /usage 拿的账号列表，按线路 id 索引
+      const usageCreditBooks = (data && data.usage && data.usage.creditBalances) || {}
+      // Go 官方额度全表（2.7.3）：宿主实时拉官方端点、快照兜底；线路里有的排前面
+      const goCatalog = data && data.opencodeGo ? data.opencodeGo : null
       // 订阅线路：卡片标蓝，汇总里也能直接把名字列出来
       const dshSubscribed = dshRoutes.filter((route) => route.billing && route.billing.mode === 'credits')
       const dshSubscribedNames = dshSubscribed.map((route) => route.name || route.id).join('、')
@@ -2248,7 +2787,122 @@ window.__ModuleLoader__.load({
       const routeCard = (route) => {
         const isDefault = dshDefault !== null && dshDefault.provider === route.id
         const keyState = keyStateOf(route.credential)
-        const bill = route.billing || null
+        const rawBill = route.billing || null
+        // 多账号（2.7.1）：账号列表由页面问连接器 /usage 拿的，挂在 usage.creditBalances 上
+        const accountBook = usageCreditBooks[route.id]
+        const accountsInfo = accountBook && accountBook.accounts ? accountBook.accounts : null
+        /**
+         * 多账户设置选择（2.7.7）：这条渠道加了多个账号时，可以选「给哪个账号记设置」。
+         * 选中某个账号后，下面的订阅表单 / 赠送记录读写的都是**那个账号自己的账**
+         * （billing.json 的 accountEntries[账户id]）；「整条渠道」才是线路级记录。
+         * 计费口径按钮（API按量/订阅/折算）始终是线路级的，不随账号变。
+         */
+        const accSel = accountEdit[route.id] || null
+        const accValid =
+          accSel !== null && accountsInfo !== null && accountsInfo.accounts.some((a) => a.id === accSel)
+        const activeAcc = accValid ? accSel : null
+        const accEntry =
+          activeAcc !== null && rawBill && rawBill.accountEntries && rawBill.accountEntries[activeAcc]
+            ? rawBill.accountEntries[activeAcc]
+            : null
+        // 选中账号时把它的记录「投影」成 bill 的形状，表单代码不用改；
+        // mode/auto/label 这些线路级字段保持原样。没填过的字段给 null，别漏出线路级的值。
+        const bill = (() => {
+          if (rawBill === null) return null
+          if (activeAcc === null) return rawBill
+          const e = accEntry || {}
+          const term = typeof e.termMonths === 'number' ? e.termMonths : null
+          const subAt = typeof e.subscribedAt === 'string' ? e.subscribedAt : null
+          const paidTotal = typeof e.paidTotal === 'number' ? e.paidTotal : null
+          return {
+            ...rawBill,
+            planType: e.planType || null,
+            planTypeLabel: e.planType && dshBilling && dshBilling.planTypeLabels ? dshBilling.planTypeLabels[e.planType] || null : null,
+            subscribedAt: subAt,
+            promoNote: e.promoNote || null,
+            termMonths: term,
+            paid: paidTotal !== null ? { total: paidTotal, currency: e.paidCurrency || 'CNY' } : null,
+            monthlyCNY: typeof e.monthlyCNY === 'number' ? e.monthlyCNY : null,
+            effectiveMonthlyCNY:
+              paidTotal !== null
+                ? Number(((e.paidCurrency === 'USD' ? paidTotal * 7.2 : paidTotal) / (term || 1)).toFixed(4))
+                : typeof e.monthlyCNY === 'number' ? e.monthlyCNY : null,
+            planTier: e.planTier || null,
+            autoRenew: typeof e.autoRenew === 'boolean' ? e.autoRenew : null,
+            accountPlan: e.accountPlan || null,
+            accountSyncedAt: typeof e.accountSyncedAt === 'number' ? e.accountSyncedAt : null,
+            gifts: Array.isArray(e.gifts) ? e.gifts : null,
+            giftTotals: giftTotalsOf(e.gifts),
+            quotaPoolConfig:
+              typeof e.basePrice === 'number' && Array.isArray(e.quotaPools)
+                ? { basePrice: e.basePrice, baseCurrency: e.baseCurrency || 'USD', pools: e.quotaPools }
+                : null,
+            billingClass: term === null || term <= 2 ? 'monthly' : term < 12 ? 'quarterly' : 'yearly',
+            period: subAt !== null ? periodOf(subAt, term, typeof e.autoRenew === 'boolean' ? e.autoRenew : null) : null,
+            planSuggestion: rawBill.planSuggestion,
+          }
+        })()
+        /** 表单写回：选了账号就整份替换那个账户的记录，否则走线路级 patch */
+        const setEntry = (patch) => {
+          if (activeAcc === null) {
+            setBilling(route.id, patch)
+            return
+          }
+          const base = accEntry || {}
+          const next = { ...base, ...patch }
+          // 清掉空字段，别把一堆 null 写进盘。
+          // ⚠ autoRenew=false 是「一次买断」这个**真实选择**，不能当空值删（2.7.8 修）
+          for (const k of Object.keys(next)) {
+            if (k === 'autoRenew') {
+              if (next[k] === null || next[k] === undefined) delete next[k]
+              continue
+            }
+            if (next[k] === null || next[k] === undefined || next[k] === false) delete next[k]
+          }
+          const entries = { ...((rawBill && rawBill.accountEntries) || {}) }
+          if (Object.keys(next).length > 0) entries[activeAcc] = next
+          else delete entries[activeAcc]
+          setBilling(route.id, { accountEntries: Object.keys(entries).length > 0 ? entries : null })
+        }
+        /**
+         * 一键复制设置（2.7.8）：整条渠道 ⇄ 某个账户。
+         * 复制的是**记录内容**（订阅形式/档位/时间/时长/实付/优惠/续费方式/额度池/赠送），
+         * 不含计费口径（mode/estimate 始终线路级）和账户快照来源标记。
+         */
+        const COPY_FIELDS = [
+          'planType', 'subscribedAt', 'promoNote', 'termMonths', 'paidTotal', 'paidCurrency',
+          'monthlyCNY', 'planTier', 'autoRenew', 'basePrice', 'baseCurrency', 'quotaPools', 'gifts',
+        ]
+        const pickCopy = (src) => {
+          const out = {}
+          if (!src || typeof src !== 'object') return out
+          for (const k of COPY_FIELDS) {
+            if (src[k] !== null && src[k] !== undefined) out[k] = src[k]
+          }
+          return out
+        }
+        const copyChannelToAccount = () => {
+          if (activeAcc === null || rawBill === null) return
+          const copied = pickCopy(rawBill)
+          const entries = { ...((rawBill && rawBill.accountEntries) || {}) }
+          if (Object.keys(copied).length > 0) entries[activeAcc] = copied
+          else delete entries[activeAcc]
+          setBilling(route.id, { accountEntries: Object.keys(entries).length > 0 ? entries : null })
+          setBillingNotice('已把整条渠道的设置复制到「' + accNameOf(activeAcc) + '」（计费口径不变）')
+        }
+        const copyAccountToChannel = () => {
+          if (activeAcc === null || accEntry === null) return
+          const copied = pickCopy(accEntry)
+          const patch = {}
+          for (const k of COPY_FIELDS) patch[k] = copied[k] !== undefined ? copied[k] : null
+          setBilling(route.id, patch)
+          setBillingNotice('已把「' + accNameOf(activeAcc) + '」的设置复制到整条渠道（计费口径不变）')
+        }
+        const accNameOf = (id) => {
+          if (accountsInfo === null) return id
+          const a = accountsInfo.accounts.find((x) => x.id === id)
+          return a && a.name ? a.name : id
+        }
         // 缺密钥的线路通常读不到模型清单，这时候别说「没报模型」，会让人以为线路坏了
         const countText =
           route.modelCount > 0
@@ -2327,10 +2981,23 @@ window.__ModuleLoader__.load({
                   disabled: busy,
                   'data-active': bill.manual && bill.override === 'token' ? '' : undefined,
                   'data-auto': !bill.manual && bill.mode === 'token' ? '' : undefined,
-                  title: '标成「按量计费」：真花钱，折金额',
+                  title: '标成「API 按量」：真花钱，按官方单价折金额',
                   onClick: () => setBilling(route.id, { mode: 'token' }),
                 },
                 busy ? '…' : BILLING_SHORT.token,
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-bill-btn',
+                  disabled: busy,
+                  'data-active': bill.manual && bill.override === 'credits' ? '' : undefined,
+                  'data-auto': !bill.manual && bill.mode === 'credits' ? '' : undefined,
+                  title: '标成「订阅」→ 卡片标蓝；下面会出现订阅形式 / 订阅时间 / 实付价的填写行',
+                  onClick: () => setBilling(route.id, { mode: 'credits' }),
+                },
+                busy ? '…' : BILLING_SHORT.credits,
               ),
               h(
                 'button',
@@ -2348,20 +3015,10 @@ window.__ModuleLoader__.load({
                 },
                 busy ? '…' : BILLING_SHORT.estimate,
               ),
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'ac-bill-btn',
-                  disabled: busy,
-                  'data-active': bill.manual && bill.override === 'credits' ? '' : undefined,
-                  'data-auto': !bill.manual && bill.mode === 'credits' ? '' : undefined,
-                  title: '标成「订阅 · 不折钱」→ 这张卡片标蓝（套餐额度，不折现金）',
-                  onClick: () => setBilling(route.id, { mode: 'credits' }),
-                },
-                busy ? '…' : BILLING_SHORT.credits,
-              ),
-              bill.touched
+              // 「自动」按钮（2.7.5 改条件）：只有**口径覆盖**才出现 ——
+              // 手选了模式，或订阅档开了折算。只填过订阅信息 / 额度池 / 快捷时长的
+              // （opencode-go / ark / qoder 那种）记录跟自动判定一致，按钮不赖着不走。
+              bill.resettable
                 ? h(
                     'button',
                     {
@@ -2369,15 +3026,1044 @@ window.__ModuleLoader__.load({
                       className: 'ac-bill-btn',
                       disabled: busy,
                       title:
-                        '全清掉：退回白名单自动判定（现在是「' +
+                        '退回白名单自动判定（现在是「' +
                         autoLabel(bill.auto) +
-                        '」），手填的月费也一起清',
-                      onClick: () => setBilling(route.id, { mode: null, estimate: false, monthlyCNY: null }),
+                        '」）并关掉折算；订阅时间 / 实付 / 额度池这些信息保留，要清用订阅行里的「清空订阅信息」',
+                      onClick: () =>
+                        setBilling(route.id, {
+                          mode: null,
+                          estimate: false,
+                        }),
                     },
                     '自动',
                   )
                 : null,
             ),
+          )
+        })()
+
+        /**
+         * 订阅详情行：只在「订阅」档出现。三个可填项 + 套餐表联动建议：
+         *   订阅形式   Agent Plan / Token Plan / Coding Plan / 特价 token 包 / 其他
+         *   订阅时间   用来算现在处于第几个计费周期（首月优惠还在不在）
+         *   实付价     本期实际付了多少（含优惠），跟套餐表建议价并排显示
+         * 套餐表建议价来自 plans.js：先按订阅形式的关键词过滤这条线路的候选档，
+         * 对不上就摆全部候选档（宁多勿缺）。
+         */
+        /**
+         * 本地 CLI agent 未确认提示（2.7.2）。
+         *
+         * Claude Code / Codex CLI 这类是「本机装的命令行 agent」，不是 DSH 买的订阅。
+         * 它自己怎么认证 DSH 不知道：可能 OAuth + Pro/Max 订阅，可能 API key 按量，
+         * 也可能压根没登录。探不到登录凭据就标「未确认」，别硬说成订阅。
+         */
+        const cliNote = (() => {
+          const cli = route.localCli || null
+          if (cli === null) return null
+          if (cli.signedIn === true) {
+            return h(
+              'div',
+              { className: 'ac-cli-note' },
+              '本机 CLI agent（',
+              h('b', null, cli.label),
+              '）：探到登录凭据（' + (cli.via === 'apikey' ? '环境变量里的 API key' : '凭据文件') + '）。' +
+                '⚠ 登录不等于订阅 —— 它可能是按量付费的 API key。确实订阅了再点上面「订阅」。',
+            )
+          }
+          return h(
+            'div',
+            { className: 'ac-cli-note' },
+            '本机 CLI agent（',
+            h('b', null, cli.label),
+            '）：',
+            cli.known
+              ? '没探到登录凭据，本机应该还没登录 —— 所以不算订阅，也不折钱。'
+              : '这类线路的登录态探不出来。',
+            ' 它不是 DSH 买的订阅，而是本机装的命令行 agent；确实订阅了（Pro / Max 等）再点上面「订阅」自己标。',
+          )
+        })()
+
+        const subscriptionRow = (() => {
+          if (bill === null || bill.mode !== 'credits') return null
+          const busy = billingBusy === route.id
+          const planTypes = (dshBilling && Array.isArray(dshBilling.planTypes) ? dshBilling.planTypes : [])
+          const planTypeLabels = (dshBilling && dshBilling.planTypeLabels) || {}
+          const suggestion = bill.planSuggestion || null
+          const period = bill.period || null
+          const firstPeriod = period !== null && period.periodIndex === 1
+
+          /**
+           * 账户订阅快照行（2.7.5 起，2.7.8 改名「存到本地」）：连接器 /usage
+           * （CodeArts 是 /api/codearts/status）能读到「档位名 + 当前有效期」，
+           * 但**读不到首次订阅时间和实付金额** —— 那两样永远手填。
+           * 按钮方向是**线上 → 本地**：把读到的存一份快照进 billing.json，
+           * 离线 / 连接器没开时也有数；不会改线上订阅。
+           */
+          const accountPlanRow = (() => {
+            const live = accountBook && accountBook.plan ? accountBook.plan : null
+            const saved = bill.accountPlan || null
+            const shown = live || saved
+            if (shown === null) {
+              // 有连接器但没读到订阅信息：说清楚为什么（Trae 登出 / 没开会员）
+              if (route.id === 'trae' || route.id === 'qoder' || route.id === 'workbuddy' || route.id === 'codearts') {
+                return h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h('span', { className: 'ac-bill-label' }, '账户订阅'),
+                  h('span', { className: 'ac-bill-auto-hint' }, '连接器没读到订阅信息（没登录 / 体验版没有套餐字段）—— 首次订阅时间和实付自己填'),
+                )
+              }
+              return null
+            }
+            const matchedTier = shown.planName && bill.cnTiers ? matchTierByName(bill.cnTiers, shown.planName) : null
+            const alreadySame =
+              saved !== null &&
+              live !== null &&
+              saved.planName === live.planName &&
+              saved.expiresAt === live.expiresAt &&
+              (matchedTier === null || bill.planTier === matchedTier)
+            const syncNow = () => {
+              const patch = {
+                accountPlan: { ...live, planTier: matchedTier, atMs: Date.now() },
+                accountSyncedAt: Date.now(),
+              }
+              // 档位没选过且名字对得上 → 顺手把官方档位也选上
+              if (matchedTier !== null && (bill.planTier === null || bill.planTier === undefined)) patch.planTier = matchedTier
+              setEntry(patch)
+            }
+            return h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '账户订阅'),
+              h(
+                'span',
+                { className: 'ac-sub-suggest' },
+                shown.name ? shown.name + ' · ' : '',
+                shown.planName ? h('b', null, shown.planName) : '（连接器没给档位名）',
+                shown.expiresAt ? ' · 账户有效期到 ' + shown.expiresAt : '',
+                live !== null ? '（线上实时）' : saved !== null ? '（本地快照）' : '',
+              ),
+              live !== null
+                ? h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: busy || alreadySame,
+                      title:
+                        '方向：线上 → 本地。把刚从连接器读到的线上订阅信息（档位名 / 有效期）存一份快照进本地 billing.json，' +
+                        '下次离线 / 连接器没开时也有数。不会改你线上的订阅，也不动首次订阅时间和实付（那两样线上没有，仍手填）',
+                      onClick: syncNow,
+                    },
+                    alreadySame ? '已存快照' : '存到本地',
+                  )
+                : null,
+              matchedTier !== null && bill.planTier !== matchedTier
+                ? h('span', { className: 'ac-bill-auto-hint' }, '名字对上官方档位「' + matchedTier + '」，点「存到本地」会一起选上')
+                : null,
+              h(
+                'span',
+                { className: 'ac-bill-auto-hint' },
+                '「存到本地」= 把线上读到的档位/有效期记一份本地快照，不是改线上订阅',
+              ),
+            )
+          })()
+
+          /**
+           * 额度池订阅（2.7.1）—— OpenCode Go 那种：
+           * 付 $10 基础价，各家模型各给一笔额度（DeepSeek $100、Kimi K3 $15…），
+           * 用掉多少就按「用掉的 / 该模型额度」的比例，从基础价里扣掉对应的钱。
+           *
+           * 只在订阅形式选了「额度池订阅」时出现。上半截是配置（基础价 + 每模型额度），
+           * 下半截是宿主按用量算出来的折算明细（usage.subscriptionWorth[].quotaPool）。
+           */
+          const quotaPoolRow = (() => {
+            if (bill.planType !== 'quota-pool') return null
+            const cfg = bill.quotaPoolConfig || null
+            const pools = cfg && Array.isArray(cfg.pools) ? cfg.pools : []
+            const worth = worthByProvider.get(route.id) || null
+            const calc = worth && worth.quotaPool ? worth.quotaPool : null
+            const baseCur = (cfg && cfg.baseCurrency) || 'USD'
+            // 编辑额度表：一行一个「模型 id : 额度」，用文本框整体编辑，回车/失焦提交
+            const poolsText = pools.map((p) => p.model + ':' + p.quota).join('\n')
+            // opencode-go：官方额度表建议（来自公开 models 端点快照），一键填省得手抄
+            const goSug = bill.goPoolSuggestion || null
+            const goText = goSug ? goSug.pools.map((p) => p.model + ':' + p.quota).join('\n') : ''
+            const goSame = goSug !== null && goText === poolsText && cfg && cfg.basePrice === goSug.basePrice
+            return h(
+              'div',
+              { className: 'ac-quota' },
+              goSug !== null
+                ? h(
+                    'div',
+                    { className: 'ac-go-fill' },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'ac-chip',
+                        disabled: busy || goSame,
+                        title:
+                          '按 OpenCode 官方额度表填：' + goSug.tierLabel + ' 档基础价 $' + goSug.basePrice +
+                          '，' + goSug.pools.length + ' 个模型各自的月度额度。来源 ' + goSug.snapshotAt + ' 快照',
+                        onClick: () =>
+                          setEntry({
+                            basePrice: goSug.basePrice,
+                            baseCurrency: 'USD',
+                            quotaPools: goSug.pools,
+                          }),
+                      },
+                      goSame ? '已按官方额度表' : '用官方额度表填（' + goSug.pools.length + ' 个模型）',
+                    ),
+                    h(
+                      'span',
+                      { className: 'ac-go-src' },
+                      'OpenCode ' + goSug.tierLabel + ' $' + goSug.basePrice + '/月 · ',
+                      goCatalog !== null && goCatalog.source === 'live'
+                        ? '官方实时表 ' + (goCatalog.count || '') + ' 个模型'
+                        : '官方快照 ' + goSug.snapshotAt,
+                      goSug.unmatched.length > 0 ? ' · ' + goSug.unmatched.length + ' 个模型官方表里没有' : '',
+                    ),
+                    // 全表检索（2.7.3）：不止本线路的 18 个，官方全部模型都能查
+                    goCatalog !== null && Array.isArray(goCatalog.models) && goCatalog.models.length > 0
+                      ? h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'ac-chip',
+                            'data-on': goTableOpen ? '' : undefined,
+                            onClick: () => setGoTableOpen(!goTableOpen),
+                          },
+                          goTableOpen ? '收起额度表 ▴' : '查全部模型额度（' + goCatalog.models.length + '）▾',
+                        )
+                      : null,
+                  )
+                : null,
+              // 官方额度全表：可检索、三档额度 + 官方单价，本线路有的标出来
+              goTableOpen && goCatalog !== null && Array.isArray(goCatalog.models)
+                ? (() => {
+                    const q = goTableQuery.trim().toLowerCase()
+                    const rows =
+                      q === ''
+                        ? goCatalog.models
+                        : goCatalog.models.filter(
+                            (r) => r.model.includes(q) || (r.name || '').toLowerCase().includes(q),
+                          )
+                    return h(
+                      'div',
+                      { className: 'ac-go-table' },
+                      h(
+                        'div',
+                        { className: 'ac-go-table-head' },
+                        h('input', {
+                          className: 'ac-sub-input ac-go-table-search',
+                          type: 'search',
+                          placeholder: '检索模型 id / 名称…',
+                          value: goTableQuery,
+                          onChange: (event) => setGoTableQuery(event.target.value),
+                        }),
+                        h(
+                          'span',
+                          { className: 'ac-go-src' },
+                          goCatalog.source === 'live'
+                            ? '官方实时表 · ' + fmtTime(goCatalog.at) + (goCatalog.stale ? '（上次成功值）' : '')
+                            : '离线快照 ' + (goCatalog.snapshotAt || '') + (goCatalog.error ? ' · ' + goCatalog.error : ''),
+                          ' · 命中 ' + rows.length + ' / ' + goCatalog.models.length,
+                        ),
+                      ),
+                      h(
+                        'div',
+                        { className: 'ac-go-table-rows' },
+                        h(
+                          'div',
+                          { className: 'ac-go-table-row ac-go-table-th' },
+                          h('span', null, '模型'),
+                          h('span', null, 'Go $10'),
+                          h('span', null, 'Plus $40'),
+                          h('span', null, 'Teams $20/人'),
+                          h('span', null, '输入 $/M'),
+                          h('span', null, '输出 $/M'),
+                        ),
+                        ...rows.slice(0, 60).map((r) =>
+                          h(
+                            'div',
+                            { className: 'ac-go-table-row', key: r.model, 'data-inroute': r.inRoute ? '' : undefined },
+                            h(
+                              'span',
+                              { className: 'ac-go-table-model' },
+                              h('code', null, r.model),
+                              r.inRoute ? h('i', { className: 'ac-go-inroute' }, '本线路') : null,
+                              r.peakFactor ? h('i', { className: 'ac-go-peak' }, '高峰×' + r.peakFactor) : null,
+                            ),
+                            r.free
+                              ? h('span', { className: 'ac-go-free' }, '限时免费')
+                              : r.limits
+                                ? h('span', null, '$' + (r.limits.go !== undefined ? r.limits.go : '—'))
+                                : h('span', null, '—'),
+                            r.limits && r.limits['go-plus'] !== undefined ? h('span', null, '$' + r.limits['go-plus']) : h('span', null, r.free ? '' : '—'),
+                            r.limits && r.limits['go-teams'] !== undefined ? h('span', null, '$' + r.limits['go-teams']) : h('span', null, r.free ? '' : '—'),
+                            h('span', null, r.input !== null ? '$' + r.input : '—'),
+                            h('span', null, r.output !== null ? '$' + r.output : '—'),
+                          ),
+                        ),
+                        rows.length > 60 ? h('div', { className: 'ac-go-src' }, '只摆前 60 条，检索词再收窄一点') : null,
+                        rows.length === 0 ? h('div', { className: 'ac-go-src' }, '没有匹配「' + goTableQuery.trim() + '」的模型') : null,
+                      ),
+                    )
+                  })()
+                : null,
+              h(
+                'div',
+                { className: 'ac-sub-detail-row' },
+                h('span', { className: 'ac-bill-label' }, '基础价'),
+                h('span', { className: 'ac-sub-price-wrap' },
+                  h('input', {
+                    type: 'number',
+                    className: 'ac-sub-input ac-sub-price',
+                    key: 'base-' + (cfg && cfg.basePrice !== null ? String(cfg.basePrice) : ''),
+                    defaultValue: cfg && cfg.basePrice !== null && cfg.basePrice !== undefined ? String(cfg.basePrice) : '',
+                    placeholder: '10',
+                    min: 0,
+                    step: 1,
+                    disabled: busy,
+                    title: '这份订阅实际付的基础价（OpenCode Go 是 $10）。各模型的消耗按比例从这里面扣',
+                    onKeyDown: (event) => {
+                      if (event.key === 'Enter') event.target.blur()
+                    },
+                    onBlur: (event) => {
+                      const raw = String(event.target.value || '').trim()
+                      const value = raw === '' ? null : Number(raw)
+                      if (value !== null && (!Number.isFinite(value) || value <= 0)) return
+                      const current = cfg && cfg.basePrice !== null && cfg.basePrice !== undefined ? cfg.basePrice : null
+                      if (value === current) return
+                      setEntry({ basePrice: value })
+                    },
+                  }),
+                  h(
+                    'select',
+                    {
+                      className: 'ac-sub-select ac-sub-cur',
+                      disabled: busy,
+                      value: baseCur,
+                      onChange: (event) => setEntry({ baseCurrency: event.target.value }),
+                    },
+                    h('option', { value: 'USD' }, '$'),
+                    h('option', { value: 'CNY' }, '¥'),
+                  ),
+                ),
+                h('span', { className: 'ac-bill-auto-hint' }, '各模型用掉的额度按比例从这里扣'),
+              ),
+              h(
+                'div',
+                { className: 'ac-sub-detail-row ac-quota-pools-row' },
+                h('span', { className: 'ac-bill-label' }, '模型额度'),
+                h('textarea', {
+                  className: 'ac-sub-input ac-quota-text',
+                  key: 'pools-' + poolsText,
+                  defaultValue: poolsText,
+                  rows: Math.min(6, Math.max(3, pools.length + 1)),
+                  placeholder: '每行一个：模型id:额度\ndeepseek:100\nkimi-k3:15',
+                  disabled: busy,
+                  title: '每行「模型id:额度」。模型id 要和这条线路实际用的模型 id 一致（下面模型标签里能看到），额度是这家给的上限',
+                  onBlur: (event) => {
+                    const text = String(event.target.value || '')
+                    const rows = []
+                    for (const line of text.split('\n')) {
+                      const t = line.trim()
+                      if (t === '') continue
+                      const at = t.lastIndexOf(':')
+                      if (at <= 0) continue
+                      const model = t.slice(0, at).trim()
+                      const quota = Number(t.slice(at + 1).trim())
+                      if (model === '' || !Number.isFinite(quota) || quota <= 0) continue
+                      rows.push({ model, quota })
+                    }
+                    const nextText = rows.map((p) => p.model + ':' + p.quota).join('\n')
+                    if (nextText === poolsText) return
+                    setEntry({ quotaPools: rows.length > 0 ? rows : null })
+                  },
+                }),
+              ),
+              pools.length > 0 && route.models.length > 0
+                ? h(
+                    'div',
+                    { className: 'ac-quota-hint' },
+                    '这条线路的模型 id：',
+                    route.models.slice(0, 12).map((m) => h('code', { key: m.id }, m.id)),
+                    route.models.length > 12 ? h('span', null, ' …') : null,
+                  )
+                : null,
+              // 折算明细：宿主按用量算的（用掉额度 / 该模型额度 × 基础价）
+              calc !== null && calc.matched > 0
+                ? h(
+                    'div',
+                    { className: 'ac-quota-calc' },
+                    h(
+                      'div',
+                      { className: 'ac-quota-calc-head' },
+                      '按比例折算 ',
+                      h('b', null, fmtPrice(calc.usedCNY, 'CNY')),
+                      ' / 基础价 ' + fmtPrice(calc.baseCNY, 'CNY') + ' · 已用 ' + String(calc.usedPct) + '% · 还剩 ' + fmtPrice(calc.leftCNY, 'CNY'),
+                    ),
+                    ...calc.rows.map((row) =>
+                      h(
+                        'div',
+                        { className: 'ac-quota-calc-row', key: row.model },
+                        h('code', null, row.model),
+                        h(
+                          'span',
+                          { className: 'ac-quota-calc-detail' },
+                          '用 ' + fmtPrice(row.usedQuota, calc.baseCurrency) + ' / 额度 ' + fmtPrice(row.quota, calc.baseCurrency) +
+                            ' = ' + (row.ratio * 100).toFixed(1) + '%',
+                        ),
+                        h('b', null, fmtPrice(row.costCNY, 'CNY')),
+                        row.capped ? h('span', { className: 'ac-quota-cap' }, '超额按100%') : null,
+                      ),
+                    ),
+                    h(
+                      'div',
+                      { className: 'ac-quota-note' },
+                      calc.overCap ? '多个模型都用超了，已按比例缩到基础价上限。' : '',
+                      calc.priceSource === 'opencode-official'
+                        ? '「用掉多少额度」按 OpenCode 官方单价折算（快照 ' +
+                          (calc.goSnapshotAt || '') +
+                          '）。官方口径：用掉的美元 ÷ 该模型月度额度 = 吃掉额度池的百分比。时间窗跟着上面「今天 / 7 天 / 30 天」走。'
+                        : '「用掉多少额度」拿按官方价折出的金额当近似（这家没给按模型的额度扣减明细），所以是估算值；时间窗跟着上面「今天 / 7 天 / 30 天」走。',
+                    ),
+                  )
+                : pools.length > 0
+                  ? h('div', { className: 'ac-quota-note' }, '这个时间窗里还没有对得上这些模型的用量，折不出金额。')
+                  : null,
+            )
+          })()
+
+          return h(
+            'div',
+            { className: 'ac-sub-detail' },
+            h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '订阅形式'),
+              h(
+                'select',
+                {
+                  className: 'ac-sub-select',
+                  disabled: busy,
+                  value: bill.planType === null ? '' : bill.planType,
+                  onChange: (event) => setEntry({ planType: event.target.value === '' ? null : event.target.value }),
+                },
+                h('option', { value: '' }, '未指定'),
+                planTypes.map((t) => h('option', { key: t, value: t }, planTypeLabels[t] || t)),
+              ),
+              suggestion !== null && suggestion.plans.length > 0
+                ? h(
+                    'span',
+                    {
+                      className: 'ac-sub-suggest',
+                      title:
+                        '来自订阅表快照 ' + (suggestion.snapshotAt || '') +
+                        (suggestion.matched ? '' : '（没按订阅形式精确对上，摆的是这条线路的全部候选档）'),
+                    },
+                    '建议价 ',
+                    suggestion.maxCNY > suggestion.minCNY
+                      ? fmtPrice(suggestion.minCNY, 'CNY') + '–' + fmtPrice(suggestion.maxCNY, 'CNY')
+                      : fmtPrice(suggestion.minCNY, 'CNY'),
+                    ' / 月 · ',
+                    suggestion.plans.map((p) => p.title + ' ' + fmtPrice(p.price, p.currency)).join('；'),
+                  )
+                : h('span', { className: 'ac-bill-auto-hint' }, '订阅表里没有这条线路的参考档，实付价自己填'),
+            ),
+            // 官方档位下拉（2.7.4）：国内账号按国内官方价。选了档位参考价就按它的月付原价
+            bill.cnTiers
+              ? h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h('span', { className: 'ac-bill-label' }, '官方档位'),
+                  h(
+                    'select',
+                    {
+                      className: 'ac-sub-select ac-tier-select',
+                      disabled: busy,
+                      value: bill.planTier === null || bill.planTier === undefined ? '' : bill.planTier,
+                      title: '按官方页面给出的版本选（' + bill.cnTiers.label + '）。参考价按这一档的月付原价（国内价）算',
+                      onChange: (event) => {
+                        const id = event.target.value === '' ? null : event.target.value
+                        const patch = { planTier: id }
+                        // 选了档位顺手把付费周期对到这一档（月付 1 / 包年 12），
+                        // 没填实付时按官方周期价预填 —— 之后改实付就是真实账单
+                        if (id !== null && bill.cnTiers) {
+                          const tier = bill.cnTiers.tiers.find((t) => t.id === id) || null
+                          if (tier !== null) {
+                            const cycle = typeof tier.cycleMonths === 'number' && tier.cycleMonths >= 1 ? tier.cycleMonths : 1
+                            if ((bill.termMonths || 1) !== cycle) patch.termMonths = cycle
+                            // 周期价兜底：表里没写 cycleCNY 就按 月价×周期
+                            const cyclePrice =
+                              typeof tier.cycleCNY === 'number'
+                                ? tier.cycleCNY
+                                : typeof tier.monthlyCNY === 'number'
+                                  ? Number((tier.monthlyCNY * cycle).toFixed(2))
+                                  : null
+                            if (!bill.paid && cyclePrice !== null && cyclePrice > 0) {
+                              patch.paidTotal = cyclePrice
+                              patch.paidCurrency = 'CNY'
+                            }
+                          }
+                        }
+                        setEntry(patch)
+                      },
+                    },
+                    h('option', { value: '' }, '未指定'),
+                    bill.cnTiers.tiers.map((t) =>
+                      h(
+                        'option',
+                        { key: t.id, value: t.id },
+                        t.official +
+                          (t.monthlyCNY === 0 ? '（免费）' : t.monthlyCNY !== null ? '（¥' + t.monthlyCNY + '/月）' : ''),
+                      ),
+                    ),
+                  ),
+                  (() => {
+                    const sel =
+                      bill.planTier && bill.cnTiers
+                        ? bill.cnTiers.tiers.find((t) => t.id === bill.planTier) || null
+                        : null
+                    if (sel === null) return h('span', { className: 'ac-bill-auto-hint' }, '选官方版本，参考价按国内月付原价')
+                    return h(
+                      'span',
+                      { className: 'ac-sub-suggest' },
+                      sel.monthlyCNY === 0
+                        ? '免费档 · ' + (sel.promoNote || '')
+                        : '官方月付 ¥' + sel.monthlyCNY + '/月',
+                      sel.promoCNY !== null && sel.promoCNY !== undefined
+                        ? ' · 当前促销 ¥' + sel.promoCNY + '（' + (sel.promoNote || '') + '）'
+                        : sel.promoNote
+                          ? ' · ' + sel.promoNote
+                          : '',
+                      sel.credits ? ' · 每月 ' + sel.credits + ' 积分' : '',
+                    )
+                  })(),
+                )
+              : null,
+            h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '首次订阅'),
+              h('input', {
+                type: 'date',
+                className: 'ac-sub-input',
+                key: 'sub-' + (bill.subscribedAt || ''),
+                defaultValue: bill.subscribedAt === null ? '' : bill.subscribedAt,
+                disabled: busy,
+                title: '最开始订阅是哪天 —— 填一次就够：选了月付/季付/年付后，有效期自动对齐到包含今天的最新一期，不用每期手改',
+                onChange: (event) => {
+                  const v = String(event.target.value || '').trim()
+                  setEntry({ subscribedAt: v === '' ? null : v })
+                },
+              }),
+              // 这一次订阅了多久（2.7.1）：年付要按 12 个月摊，周期也按 12 个月推
+              h('span', { className: 'ac-sub-term-wrap' },
+                h('input', {
+                  type: 'number',
+                  className: 'ac-sub-input ac-sub-term',
+                  key: 'term-' + (bill.termMonths === null || bill.termMonths === undefined ? '' : String(bill.termMonths)),
+                  defaultValue: bill.termMonths === null || bill.termMonths === undefined ? '' : String(bill.termMonths),
+                  placeholder: '1',
+                  min: 1,
+                  max: 120,
+                  step: 1,
+                  disabled: busy,
+                  title: '一个付费周期几个月：月付 1、季付 3、年付 12。不论哪种，实付都 ÷ 时长折成等价月付金额。留空按 1 个月算',
+                  onKeyDown: (event) => {
+                    if (event.key === 'Enter') event.target.blur()
+                  },
+                  onBlur: (event) => {
+                    const raw = String(event.target.value || '').trim()
+                    const value = raw === '' ? null : Math.floor(Number(raw))
+                    if (value !== null && (!Number.isFinite(value) || value < 1 || value > 120)) return
+                    const current = bill.termMonths === null || bill.termMonths === undefined ? null : bill.termMonths
+                    if (value === current) return
+                    setEntry({ termMonths: value })
+                  },
+                }),
+                h('span', { className: 'ac-sub-unit' }, '个月'),
+              ),
+              // 常用时长快捷按钮：月 / 两月优惠 / 季 / 年
+              ...[1, 2, 3, 12].map((n) =>
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    key: 'term-quick-' + n,
+                    className: 'ac-chip ac-sub-term-quick',
+                    'data-on': (bill.termMonths || 1) === n ? '' : undefined,
+                    disabled: busy,
+                    title: n === 2 ? '限时优惠一次买俩月 —— 仍归月付挡，不是季付' : undefined,
+                    onClick: () => setEntry({ termMonths: n }),
+                  },
+                  n === 1 ? '月付' : n === 2 ? '两月优惠' : n === 3 ? '季付' : '年付',
+                ),
+              ),
+              // 计费挡位标签（2.7.4）：两月优惠仍归月付挡
+              h(
+                'span',
+                { className: 'ac-bill-class', 'data-class': bill.billingClass || 'monthly' },
+                bill.billingClass === 'yearly' ? '年付挡' : bill.billingClass === 'quarterly' ? '多月包挡' : '月付挡',
+                (bill.termMonths || 1) === 2 ? '（限时优惠买俩月，仍按月付）' : '',
+              ),
+              period !== null
+                ? h(
+                    'span',
+                    { className: 'ac-sub-period' },
+                    '现在第 ',
+                    h('b', null, String(period.periodIndex)),
+                    ' 期 · 本期 ' + period.periodStart + ' ~ ' + period.periodEnd + ' · 已订 ' + String(period.daysSince) + ' 天',
+                  )
+                : bill.subscribedAt === null
+                  ? h('span', { className: 'ac-bill-auto-hint' }, '填了首次订阅时间就能自动对齐有效期')
+                  : null,
+            ),
+            // 续费方式（2.7.5）：连续订阅自动对齐到最新一期；一次买 N 个月到期如实标过期
+            h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '续费方式'),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-chip',
+                  'data-on': bill.autoRenew !== false ? '' : undefined,
+                  disabled: busy,
+                  title: '连续包月 / 包季 / 包年：有效期自动对齐到包含今天的这一期，到期日跟着滚，不用手改日期',
+                  onClick: () => setEntry({ autoRenew: true }),
+                },
+                '连续订阅 · 自动对齐',
+              ),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-chip',
+                  'data-on': bill.autoRenew === false ? '' : undefined,
+                  disabled: busy,
+                  title: '一次买 N 个月、到期不续：到期日 = 首次订阅 + 时长，过期就标过期',
+                  onClick: () => setEntry({ autoRenew: false }),
+                },
+                '一次买断',
+              ),
+              period !== null && period.autoRenew && period.periodIndex > 1
+                ? h('span', { className: 'ac-bill-auto-hint' }, '已自动对齐到第 ' + String(period.periodIndex) + ' 期（按首次订阅日 + 周期推算）')
+                : null,
+            ),
+            // 有效期（2.7.5 改名）：自动续费 = 本期结束；一次买断 = 首订 + 时长
+            period !== null && period.expiresAt
+              ? h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h('span', { className: 'ac-bill-label' }, '当前有效期'),
+                  h(
+                    'span',
+                    { className: 'ac-sub-expire', 'data-soon': !period.expired && period.daysLeft <= 7 ? '' : undefined, 'data-expired': period.expired ? '' : undefined },
+                    period.periodStart + ' ~ ' + period.expiresAt,
+                    period.expired
+                      ? ' · 已过期 ' + String(Math.abs(period.daysLeft)) + ' 天（若已续费，把续费方式改成「连续订阅」或更新首次订阅日）'
+                      : ' · 还剩 ' + String(period.daysLeft) + ' 天',
+                  ),
+                )
+              : null,
+            // 账户订阅对齐（2.7.5）：从连接器读到的档位名 / 到期，一键记进本条订阅
+            accountPlanRow,
+            h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '本次实付'),
+              h('span', { className: 'ac-sub-price-wrap' },
+                h('input', {
+                  type: 'number',
+                  className: 'ac-sub-input ac-sub-price',
+                  key: 'paidtotal-' + (bill.paid && bill.paid.total !== null ? String(bill.paid.total) : ''),
+                  defaultValue: bill.paid && bill.paid.total !== null && bill.paid.total !== undefined ? String(bill.paid.total) : '',
+                  placeholder: '总额',
+                  min: 0,
+                  step: 1,
+                  disabled: busy,
+                  title: '一个付费周期总共付了多少（季付填季费、年付填年费，不是月费）。不论月付/季付/年付，都 ÷ 时长折成「等价月付金额」再跟等价用量比',
+                  onKeyDown: (event) => {
+                    if (event.key === 'Enter') event.target.blur()
+                  },
+                  onBlur: (event) => {
+                    const raw = String(event.target.value || '').trim()
+                    const value = raw === '' ? null : Number(raw)
+                    if (value !== null && (!Number.isFinite(value) || value <= 0)) return
+                    const current = bill.paid && bill.paid.total !== null && bill.paid.total !== undefined ? bill.paid.total : null
+                    if (value === current) return
+                    setEntry({ paidTotal: value })
+                  },
+                }),
+                h(
+                  'select',
+                  {
+                    className: 'ac-sub-select ac-sub-cur',
+                    disabled: busy,
+                    value: (bill.paid && bill.paid.currency) || 'CNY',
+                    onChange: (event) => setEntry({ paidCurrency: event.target.value }),
+                  },
+                  h('option', { value: 'CNY' }, '¥'),
+                  h('option', { value: 'USD' }, '$'),
+                ),
+              ),
+              // 折合月费：实付 ÷ 月数（年付 ¥120/12 = ¥10/月）—— 统一叫「等价月付」
+              bill.effectiveMonthlyCNY !== null && bill.effectiveMonthlyCNY !== undefined
+                ? h(
+                    'span',
+                    { className: 'ac-sub-monthly' },
+                    '等价月付 ',
+                    h('b', null, fmtPrice(bill.effectiveMonthlyCNY, 'CNY')),
+                    bill.paid && bill.termMonths ? '（' + fmtPrice(bill.paid.total, bill.paid.currency) + ' ÷ ' + String(bill.termMonths) + ' 个月）' : '',
+                  )
+                : null,
+              h('input', {
+                type: 'text',
+                className: 'ac-sub-input ac-sub-promo',
+                key: 'promo-' + (bill.promoNote || ''),
+                defaultValue: bill.promoNote === null ? '' : bill.promoNote,
+                placeholder: '优惠说明（如：首月半价 / 火山 40 抵 80）',
+                maxLength: 80,
+                disabled: busy,
+                onKeyDown: (event) => {
+                  if (event.key === 'Enter') event.target.blur()
+                },
+                onBlur: (event) => {
+                  const v = String(event.target.value || '').trim()
+                  const next = v === '' ? null : v.slice(0, 80)
+                  if (next === (bill.promoNote || null)) return
+                  setEntry({ promoNote: next })
+                },
+              }),
+              firstPeriod && bill.promoNote !== null
+                ? h('span', { className: 'ac-sub-promo-hint' }, '当前是首期，优惠还在生效期内')
+                : period !== null && !firstPeriod && bill.promoNote !== null
+                  ? h('span', { className: 'ac-sub-promo-hint' }, '已过首期 —— 首月优惠类的说明只适用第一期，续费价以实际扣款为准')
+                  : null,
+            ),
+            // 「按月」入口（2.7.5 起不论月付/季付/年付都统一折成等价月付金额）：
+            // 没填「本次实付」时保留 —— 填的就是等价月付，直接跟等价用量比
+            !bill.paid
+              ? h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h('span', { className: 'ac-bill-label' }, '按月'),
+                  h('span', { className: 'ac-sub-price-wrap' },
+                    h('input', {
+                      type: 'number',
+                      className: 'ac-sub-input ac-sub-price',
+                      key: 'paid-' + (bill.monthlyCNY === null || bill.monthlyCNY === undefined ? '' : String(bill.monthlyCNY)),
+                      defaultValue: bill.monthlyCNY === null || bill.monthlyCNY === undefined ? '' : String(bill.monthlyCNY),
+                      placeholder: '每月 ¥',
+                      min: 0,
+                      step: 1,
+                      disabled: busy,
+                      title: '直接填等价月付金额（不论你实际是月付/季付/年付，这里都填折算到每月的数）。等价于「本次实付」填 月额×时长',
+                      onKeyDown: (event) => {
+                        if (event.key === 'Enter') event.target.blur()
+                      },
+                      onBlur: (event) => {
+                        const raw = String(event.target.value || '').trim()
+                        const value = raw === '' ? null : Number(raw)
+                        if (value !== null && (!Number.isFinite(value) || value <= 0)) return
+                        const current = bill.monthlyCNY === null || bill.monthlyCNY === undefined ? null : bill.monthlyCNY
+                        if (value === current) return
+                        setEntry({ monthlyCNY: value })
+                      },
+                    }),
+                  ),
+                  h('span', { className: 'ac-bill-auto-hint' }, '不论月付/季付/年付，这里都填等价月付金额；要记真实账单就填上面「本次实付」+ 时长'),
+                )
+              : null,
+            // 清空订阅信息（2.7.5）：「自动」按钮不再顺手清这些，单独给一个入口
+            bill.subscribedAt !== null || bill.paid || bill.monthlyCNY !== null || bill.planTier !== null || bill.accountPlan
+              ? h(
+                  'div',
+                  { className: 'ac-sub-detail-row' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: busy,
+                      title: '清掉订阅信息：首次订阅时间 / 时长 / 实付 / 优惠 / 官方档位 / 账户快照。计费口径（订阅/折算）与赠送记录不动',
+                      onClick: () =>
+                        setEntry({
+                          subscribedAt: null,
+                          termMonths: null,
+                          paidTotal: null,
+                          paidCurrency: null,
+                          monthlyCNY: null,
+                          promoNote: null,
+                          planTier: null,
+                          autoRenew: null,
+                          accountPlan: null,
+                          accountSyncedAt: null,
+                        }),
+                    },
+                    '清空订阅信息',
+                  ),
+                )
+              : null,
+            quotaPoolRow,
+          )
+        })()
+
+        /**
+         * 「赠送」记账（2.7.6 起，2.7.7 改名并扩到全渠道）：每输入一条就记一条。
+         *
+         * 一条 = { kind: credit 赠金 / points 赠送积分 / tokens 免费Token, amount, unit, note, at }。
+         * 只记账不参与「值不值」折算。整表替换式提交：加/删一条都发全量 gifts。
+         * 2.7.7 起从订阅详情里挪出来，**所有渠道**（按量/套餐/订阅/未确认）都有这一栏；
+         * 选中某个账号时记进那个账号自己的账（setEntry 分流）。
+         */
+        const giftsRow = (() => {
+          if (bill === null) return null
+          const busy = billingBusy === route.id
+          const gifts = Array.isArray(bill.gifts) ? bill.gifts : []
+          const totals = bill.giftTotals || null
+          const draft = giftDraft[route.id] || { kind: 'credit', amount: '', unit: 'CNY', note: '' }
+          const patchDraft = (p) => setGiftDraft((prev) => ({ ...prev, [route.id]: { ...draft, ...p } }))
+          const fmtTokens = (n) => {
+            if (typeof n !== 'number' || !Number.isFinite(n)) return '—'
+            if (n >= 1e9) return (n / 1e9).toFixed(n % 1e9 === 0 ? 0 : 2) + 'B'
+            if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 === 0 ? 0 : 2) + 'M'
+            if (n >= 1e3) return (n / 1e3).toFixed(n % 1e3 === 0 ? 0 : 1) + 'K'
+            return String(n)
+          }
+          const addOne = () => {
+            const amount = Number(draft.amount)
+            if (!Number.isFinite(amount) || amount <= 0) return
+            const unit =
+              draft.kind === 'credit'
+                ? draft.unit === 'USD' ? 'USD' : 'CNY'
+                : draft.kind === 'points'
+                  ? 'raw'
+                  : ['raw', 'K', 'M', 'B'].includes(draft.unit) ? draft.unit : 'raw'
+            const row = {
+              kind: draft.kind,
+              amount,
+              unit,
+              note: String(draft.note || '').trim().slice(0, 80) || null,
+              at: Date.now(),
+            }
+            setEntry({ gifts: [...gifts, row].slice(0, 60) })
+            patchDraft({ amount: '', note: '' })
+          }
+          const removeOne = (idx) => {
+            const next = gifts.filter((_, i) => i !== idx)
+            setEntry({ gifts: next.length > 0 ? next : null })
+          }
+          return h(
+            'div',
+            { className: 'ac-gifts' },
+            h(
+              'div',
+              { className: 'ac-sub-detail-row' },
+              h('span', { className: 'ac-bill-label' }, '赠送'),
+              h(
+                'select',
+                {
+                  className: 'ac-sub-select',
+                  disabled: busy,
+                  value: draft.kind,
+                  title: '赠金 = 送的钱（¥/$）；赠送积分 = 各家送的积分；免费 Token 额度 = 送的 token（个/K/M/B）',
+                  onChange: (e) => patchDraft({ kind: e.target.value, unit: e.target.value === 'credit' ? 'CNY' : e.target.value === 'points' ? 'raw' : 'M' }),
+                },
+                h('option', { value: 'credit' }, '赠金'),
+                h('option', { value: 'points' }, '赠送积分'),
+                h('option', { value: 'tokens' }, '免费Token额度'),
+              ),
+              h('input', {
+                type: 'number',
+                className: 'ac-sub-input ac-gift-amount',
+                value: draft.amount,
+                placeholder: draft.kind === 'credit' ? '金额' : '数量',
+                min: 0,
+                step: 'any',
+                disabled: busy,
+                onChange: (e) => patchDraft({ amount: e.target.value }),
+                onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
+              }),
+              h(
+                'select',
+                {
+                  className: 'ac-sub-select ac-sub-cur',
+                  disabled: busy,
+                  value: draft.unit,
+                  onChange: (e) => patchDraft({ unit: e.target.value }),
+                },
+                draft.kind === 'credit'
+                  ? [h('option', { key: 'CNY', value: 'CNY' }, '¥'), h('option', { key: 'USD', value: 'USD' }, '$')]
+                  : draft.kind === 'points'
+                    ? [h('option', { key: 'raw', value: 'raw' }, '分')]
+                    : [
+                        h('option', { key: 'raw', value: 'raw' }, '个'),
+                        h('option', { key: 'K', value: 'K' }, 'K 千'),
+                        h('option', { key: 'M', value: 'M' }, 'M 百万'),
+                        h('option', { key: 'B', value: 'B' }, 'B 十亿'),
+                      ],
+              ),
+              h('input', {
+                type: 'text',
+                className: 'ac-sub-input ac-gift-note',
+                value: draft.note,
+                placeholder: '备注（来源 / 活动名，可空）',
+                maxLength: 80,
+                disabled: busy,
+                onChange: (e) => patchDraft({ note: e.target.value }),
+                onKeyDown: (e) => { if (e.key === 'Enter') addOne() },
+              }),
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-chip',
+                  disabled: busy || !(Number(draft.amount) > 0),
+                  title: '记一条：每输入一条就存一条，落在后台 billing.json',
+                  onClick: addOne,
+                },
+                '记一条',
+              ),
+            ),
+            gifts.length > 0
+              ? h(
+                  'div',
+                  { className: 'ac-gift-list' },
+                  ...gifts.map((g, idx) =>
+                    h(
+                      'div',
+                      { className: 'ac-gift-row', key: String(g.at) + '-' + idx },
+                      h(
+                        'span',
+                        { className: 'ac-gift-kind', 'data-kind': g.kind },
+                        g.kind === 'credit' ? '赠金' : g.kind === 'points' ? '赠送积分' : '免费Token',
+                      ),
+                      h(
+                        'b',
+                        { className: 'ac-gift-amount' },
+                        g.kind === 'credit'
+                          ? (g.unit === 'USD' ? '$' : '¥') + g.amount
+                          : g.kind === 'points'
+                            ? g.amount + ' 分'
+                            : g.amount + (g.unit === 'raw' ? ' 个' : ' ' + g.unit),
+                      ),
+                      g.note ? h('span', { className: 'ac-gift-note-text' }, g.note) : null,
+                      h('span', { className: 'ac-gift-at' }, (() => { const d = new Date(g.at); return (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') })()),
+                      h(
+                        'button',
+                        {
+                          type: 'button',
+                          className: 'ac-gift-del',
+                          disabled: busy,
+                          title: '删掉这条记录',
+                          onClick: () => removeOne(idx),
+                        },
+                        '✕',
+                      ),
+                    ),
+                  ),
+                )
+              : null,
+            totals !== null
+              ? h(
+                  'div',
+                  { className: 'ac-gift-total' },
+                  '已记 ',
+                  h('b', null, String(totals.count)),
+                  ' 条',
+                  totals.creditCount > 0 ? ' · 赠金合计 ' + fmtPrice(totals.creditCNY, 'CNY') : '',
+                  totals.pointsCount > 0 ? ' · 赠送积分合计 ' + totals.pointsRaw + ' 分' : '',
+                  totals.tokenCount > 0 ? ' · 免费Token合计 ' + fmtTokens(totals.tokensRaw) + ' 个' : '',
+                  '（只记账，不参与「值不值」折算）',
+                )
+              : h('div', { className: 'ac-bill-auto-hint' }, '领到的赠金 / 赠送积分 / 免费Token额度在这里逐条记，不参与折算'),
+          )
+        })()
+        /**
+         * 多账户设置选择器（2.7.7）：这条渠道有多个账号时，选「给哪个账号记设置」。
+         * 选中后订阅表单 / 赠送记录读写那个账号自己的账（accountEntries），
+         * 「整条渠道」是线路级记录。计费口径按钮不随账号变。
+         */
+        const accountSelector = (() => {
+          if (accountsInfo === null || accountsInfo.count <= 1) return null
+          const entries = (rawBill && rawBill.accountEntries) || {}
+          const nameOf = (id) => {
+            const a = accountsInfo.accounts.find((x) => x.id === id)
+            return a && a.name ? a.name : id
+          }
+          return h(
+            'div',
+            { className: 'ac-acc-edit' },
+            h('span', { className: 'ac-bill-label' }, '设置记给'),
+            h(
+              'select',
+              {
+                className: 'ac-sub-select ac-acc-select',
+                value: activeAcc === null ? '' : activeAcc,
+                title: '选一个账号：下面的订阅信息 / 赠送记录就记到那个账号名下；「整条渠道」记给线路本身',
+                onChange: (e) =>
+                  setAccountEdit((prev) => ({ ...prev, [route.id]: e.target.value === '' ? null : e.target.value })),
+              },
+              h('option', { value: '' }, '整条渠道（' + route.name + '）'),
+              accountsInfo.accounts.map((a) =>
+                h(
+                  'option',
+                  { key: a.id, value: a.id },
+                  (a.name || a.id) +
+                    (a.id === accountsInfo.currentId ? ' · 当前在用' : '') +
+                    (entries[a.id] ? ' · 已记' : ''),
+                ),
+              ),
+            ),
+            activeAcc !== null
+              ? h(
+                  'span',
+                  { className: 'ac-acc-edit-hint' },
+                  '正在给「',
+                  h('b', null, nameOf(activeAcc)),
+                  '」记设置 —— 订阅信息 / 赠送都进这个账号自己的账',
+                  accEntry
+                    ? null
+                    : '（还没记过，填一条就有）',
+                )
+              : h('span', { className: 'ac-bill-auto-hint' }, '多账号可以分开记：选一个账号，下面的设置就记到它名下'),
+            // 一键复制（2.7.8）：整条渠道 ⇄ 选中账户。覆盖式复制，先说清楚再动手
+            activeAcc !== null
+              ? h(
+                  'span',
+                  { className: 'ac-acc-copy' },
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: billingBusy === route.id,
+                      title: '把整条渠道当前的订阅设置（形式/档位/时间/时长/实付/优惠/续费方式/额度池/赠送）整体复制给「' + nameOf(activeAcc) + '」，覆盖它原有的记录。计费口径（API按量/订阅/折算）不复制',
+                      onClick: copyChannelToAccount,
+                    },
+                    '渠道设置 → 此账户',
+                  ),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'ac-chip',
+                      disabled: billingBusy === route.id || accEntry === null,
+                      title: accEntry === null
+                        ? '这个账户还没记过设置，没东西可复制'
+                        : '把「' + nameOf(activeAcc) + '」的订阅设置整体复制回整条渠道，覆盖渠道原有的记录。计费口径不复制',
+                      onClick: copyAccountToChannel,
+                    },
+                    '此账户 → 渠道设置',
+                  ),
+                )
+              : null,
           )
         })()
 
@@ -2443,7 +4129,13 @@ window.__ModuleLoader__.load({
                   worth.refMax !== null && worth.refMax !== worth.refMin
                     ? fmtPrice(worth.refMin, 'CNY') + '–' + fmtPrice(worth.refMax, 'CNY')
                     : fmtPrice(worth.refMin, 'CNY'),
-                  worth.refSource === 'manual' ? '（你填的）' : '（套餐表）',
+                  worth.refSource === 'tier'
+                    ? '（官方档位·国内价）'
+                    : worth.refSource === 'paid'
+                      ? '（本次实付 ÷ 订阅月数）'
+                      : worth.refSource === 'manual'
+                        ? '（你填的）'
+                        : '（套餐表）',
                 )
               : null,
             verdict
@@ -2454,17 +4146,103 @@ window.__ModuleLoader__.load({
                     key: 'd',
                     'data-tone': verdict.tone,
                     title:
-                      worth.refSource === 'manual'
-                        ? '拿等价月费跟你填的月费比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
-                        : '拿等价月费跟套餐表里这条线路的最低价档比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少',
+                      worth.refSource === 'tier'
+                        ? '拿等价月费跟你选的官方档位月付原价（国内价）比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
+                        : worth.refSource === 'paid'
+                          ? '拿等价月费跟「本次实付 ÷ 订阅月数」比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
+                          : worth.refSource === 'manual'
+                            ? '拿等价月费跟你填的月费比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少'
+                            : '拿等价月费跟套餐表里这条线路的最低价档比：≥1 倍算划算，0.6–1 倍差不多，≤0.6 倍是用得少',
                   },
                   verdict.text,
                   worth.ratio === null ? '' : ' ' + worth.ratio.toFixed(2) + '×',
                 )
               : null,
-            h('span', { className: 'ac-bill-price-wrap', key: 'p' }, priceInput),
+            // 订阅档的实付价输入已经挪进「订阅详情行」，这里只在 estimate 档保留月费输入，避免两个框打架
+            bill.mode === 'credits' ? null : h('span', { className: 'ac-bill-price-wrap', key: 'p' }, priceInput),
           ]
           return h('div', { className: 'ac-bill ac-bill-worth-row' }, ...parts)
+        })()
+
+        /**
+         * 多账号明细面板（2.7.2）：点头部「N 个账号」展开。
+         *
+         * 为什么必须能展开 —— **多账号里可能只有部分账号开了订阅**。
+         * 只报一个「2 个账号」会让人以为两个都有额度，实际积分是各账号独立的。
+         * 这里逐账号摆：是否会员（订阅）、自己的积分余额、套餐到期、今天签到没。
+         *
+         * 数据来自连接器 /usage 的 pool.accounts（member / credits / planExpiresAtMs）。
+         * 拿不到会员信息的渠道（trae 只给账号列表）就标「未知」，不瞎猜。
+         */
+        const accountsPanel = (() => {
+          if (accountsInfo === null || accountsInfo.count <= 1) return null
+          if (accountsOpen !== route.id) return null
+          const fmtDay = (ms) => {
+            if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return null
+            const d = new Date(ms)
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+          }
+          // ⚠ 不能用用量栏那个 fmtCredits —— 它在下面才声明（const 箭头函数不提升），
+          // 在这里引用会 TDZ 报错、整页消失。这里自己格式化一份。
+          const fmtAccCredits = (n) => {
+            if (typeof n !== 'number' || !Number.isFinite(n)) return '—'
+            if (Math.abs(n) >= 1000) return n.toFixed(0)
+            return Number.isInteger(n) ? String(n) : n.toFixed(1)
+          }
+          return h(
+            'div',
+            { className: 'ac-accounts' },
+            h(
+              'div',
+              { className: 'ac-accounts-head' },
+              '这台机器在这条渠道上加了 ',
+              h('b', null, String(accountsInfo.count)),
+              ' 个账号',
+              accountsInfo.anyMemberKnown
+                ? '，其中 ' + String(accountsInfo.memberCount) + ' 个在订阅中' +
+                  (accountsInfo.expiredCount > 0 ? '、' + String(accountsInfo.expiredCount) + ' 个订阅已过期' : '') +
+                  (accountsInfo.memberCount < accountsInfo.count ? '（未订阅的账号没有套餐额度，只有免费/签到积分）' : '')
+                : '（这家连接器没给会员状态，只能看账号本身）',
+            ),
+            ...accountsInfo.accounts.map((acc) => {
+              const isCurrent = acc.id === accountsInfo.currentId
+              const planDay = fmtDay(acc.planExpiresAtMs)
+              const tokenDay = fmtDay(acc.tokenExpiresAtMs)
+              return h(
+                'div',
+                { className: 'ac-account-row', key: acc.id, 'data-current': isCurrent ? '' : undefined },
+                h('span', { className: 'ac-account-name' }, (isCurrent ? '▸ ' : '') + (acc.name || acc.id)),
+                h(
+                  'span',
+                  {
+                    className: 'ac-account-member',
+                    'data-member': acc.planExpired ? 'expired' : acc.member === true ? 'yes' : acc.member === false ? 'no' : 'unknown',
+                  },
+                  acc.planExpired
+                    ? '订阅已过期'
+                    : acc.member === true
+                      ? '已订阅'
+                      : acc.member === false
+                        ? '未订阅'
+                        : '订阅未知',
+                ),
+                acc.credits !== null
+                  ? h('span', { className: 'ac-account-fact' }, '积分 ', h('b', null, fmtAccCredits(acc.credits)))
+                  : null,
+                planDay ? h('span', { className: 'ac-account-fact' }, '套餐到期 ' + planDay) : null,
+                !planDay && tokenDay ? h('span', { className: 'ac-account-fact' }, '登录有效至 ' + tokenDay) : null,
+                acc.checkedInToday === true ? h('span', { className: 'ac-account-fact' }, '今日已签到') : null,
+                acc.enterprise === true ? h('span', { className: 'ac-account-fact' }, '企业版') : null,
+                isCurrent ? h('span', { className: 'ac-account-cur' }, '当前在用') : null,
+              )
+            }),
+            h(
+              'div',
+              { className: 'ac-accounts-note' },
+              '积分是各账号独立的 —— 用量栏那条线路的积分只反映当前在用的这个账号。' +
+                '多账号轮换时，别把单个账号的余额当成整条线路的额度。',
+            ),
+          )
         })()
 
         return h(
@@ -2498,6 +4276,24 @@ window.__ModuleLoader__.load({
                 )
               : null,
             isDefault ? h('span', { className: 'ac-route-tag' }, '当前默认') : null,
+            // 多账号（2.7.1，2.7.2 改为可展开）：点开看每个账号的会员 / 积分 / 到期
+            accountsInfo !== null && accountsInfo.count > 1
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'ac-route-accounts',
+                    'data-on': accountsOpen === route.id ? '' : undefined,
+                    title: '点开看每个账号的订阅状态与积分 —— 多账号里可能只有部分开了订阅',
+                    onClick: () => setAccountsOpen(accountsOpen === route.id ? null : route.id),
+                  },
+                  String(accountsInfo.count) + ' 个账号',
+                  accountsInfo.anyMemberKnown
+                    ? ' · ' + String(accountsInfo.memberCount) + '/' + String(accountsInfo.count) + ' 已订阅'
+                    : '',
+                  accountsOpen === route.id ? ' ▴' : ' ▾',
+                )
+              : null,
             h('span', { className: 'ac-route-count' }, countText),
           ),
           h(
@@ -2515,8 +4311,13 @@ window.__ModuleLoader__.load({
             route.settingsNs ? h('span', null, '设置 ', h('code', null, route.settingsNs)) : null,
           ),
           route.modelsError ? h('div', { className: 'ac-note' }, '模型清单没读到：' + route.modelsError) : null,
+          accountsPanel,
           billingRow,
+          cliNote,
+          accountSelector,
+          subscriptionRow,
           worthRow,
+          giftsRow,
           route.models.length > 0
             ? h(
                 'div',
@@ -2714,10 +4515,49 @@ window.__ModuleLoader__.load({
             )
           : null,
 
-        dshRoutes.length > 0 ? h('div', { className: 'ac-dsh' }, dshRoutes.map(routeCard)) : null,
+        dshApi !== null && dshRoutes.length > 0 ? searchBar : null,
+
+        // 未配置的线路默认收起（2.7.1）：给个开关，别让人以为线路丢了
+        unconfiguredRoutes.length > 0 && needle === ''
+          ? h(
+              'div',
+              { className: 'ac-unconf-bar' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'ac-chip',
+                  'data-on': showUnconfigured ? '' : undefined,
+                  onClick: () => setShowUnconfigured(!showUnconfigured),
+                },
+                showUnconfigured
+                  ? '收起未配置（' + unconfiguredRoutes.length + '）'
+                  : '显示未配置（' + unconfiguredRoutes.length + '）',
+              ),
+              h(
+                'span',
+                { className: 'ac-unconf-note' },
+                showUnconfigured
+                  ? '这些线路本机还没配起来：密钥没填，或压根没有密钥位且一个模型都读不到。'
+                  : '已收起 ' + unconfiguredRoutes.length + ' 条本机没配起来的线路（密钥没填 / 空挂的通道）。',
+              ),
+            )
+          : null,
+
+        filteredRoutes.length > 0 ? h('div', { className: 'ac-dsh' }, filteredRoutes.map(routeCard)) : null,
 
         dshApi !== null && dshRoutes.length === 0
           ? h('div', { className: 'ac-price-empty' }, '这台机器上还没接任何模型线路。')
+          : null,
+
+        dshApi !== null && dshRoutes.length > 0 && filteredRoutes.length === 0
+          ? h(
+              'div',
+              { className: 'ac-price-empty' },
+              needle !== ''
+                ? '没有匹配「' + query.trim() + '」的线路，换个关键词试试。'
+                : '配起来的线路一条都没有 —— 点上面「显示未配置」看看都声明了哪些通道。',
+            )
           : null,
 
         dshApi !== null
@@ -2741,7 +4581,7 @@ window.__ModuleLoader__.load({
               h(
                 'span',
                 null,
-                '「按量」真花钱、「折算」按官方价折个参考、「订阅」只报 token —— 判错了点右边按钮自己改',
+                '「API 按量」真花钱、「订阅」是套餐额度（点开后填订阅形式/时间/实付价）、「折算」按官方价折个参考 —— 判错了点右边按钮自己改',
               ),
             )
           : null,
@@ -2789,9 +4629,11 @@ window.__ModuleLoader__.load({
       //   token    按量付费，金额是真金白银的折算
       //   estimate 套餐/订阅，金额只是「按官方价买要多少」的等价参考
       //   credits  纯套餐，不折金额
-      const tokenSources = usageSources.filter((row) => row.billing === 'token')
-      const estimateSources = usageSources.filter((row) => row.billing === 'estimate')
-      const creditSources = usageSources.filter((row) => row.billing === 'credits').map(withBalance)
+      // 全局搜索只过滤**行列表**，顶部汇总卡片仍按全量算（不然搜一下总账就变，吓一跳）
+      const usageSearchHit = (row) => searchMatches([row.provider, row.model, row.routeLabel || ''])
+      const tokenSources = usageSources.filter((row) => row.billing === 'token' && usageSearchHit(row))
+      const estimateSources = usageSources.filter((row) => row.billing === 'estimate' && usageSearchHit(row))
+      const creditSources = usageSources.filter((row) => row.billing === 'credits' && usageSearchHit(row)).map(withBalance)
 
       // DeepSeek 系（能对上余额差分的两条）—— 单独算，用来跟实际扣费比
       const deepseekSources = tokenSources.filter(
@@ -2982,11 +4824,15 @@ window.__ModuleLoader__.load({
             h(
               'span',
               { className: 'ac-worth-detail-sub' },
-              row.refSource === 'manual'
-                ? '你在「接入情况」里填的数'
-                : row.refSource === 'plan'
-                  ? '套餐表（plans.js）里这条线路对得上的档位，取最低一档比'
-                  : '没有参考价 —— 去「接入情况」这条线路右边填你实际付的月费',
+              row.refSource === 'tier'
+                ? '你选的官方档位月付原价（国内价，cn-tiers.js）—— 促销价另记在实付里'
+                : row.refSource === 'paid'
+                  ? '本次实付 ÷ 订阅月数（年付摊到月）—— 在「接入情况」里填的'
+                  : row.refSource === 'manual'
+                    ? '你在「接入情况」里填的数'
+                    : row.refSource === 'plan'
+                      ? '套餐表（plans.js）里这条线路对得上的档位，取最低一档比'
+                      : '没有参考价 —— 去「接入情况」这条线路右边填你实际付的月费',
             ),
           ),
           planRef.length > 0
@@ -3004,9 +4850,23 @@ window.__ModuleLoader__.load({
                 ),
               )
             : null,
-          row.refSource === 'manual' && row.refMin !== null
-            ? h('div', { className: 'ac-worth-plans' }, h('span', { className: 'ac-worth-plan' }, '你填 ', h('b', null, fmtPrice(row.refMin, 'CNY')), ' / 月'))
-            : null,
+          row.refSource === 'paid' && row.refMin !== null
+            ? h(
+                'div',
+                { className: 'ac-worth-plans' },
+                h(
+                  'span',
+                  { className: 'ac-worth-plan' },
+                  '本次实付 ',
+                  h('b', null, row.paid ? fmtPrice(row.paid.total, row.paid.currency) : fmtPrice(row.refMin, 'CNY')),
+                  row.termMonths ? ' ÷ ' + String(row.termMonths) + ' 个月 = ' : ' → ',
+                  h('b', null, fmtPrice(row.refMin, 'CNY')),
+                  ' / 月',
+                ),
+              )
+            : row.refSource === 'manual' && row.refMin !== null
+              ? h('div', { className: 'ac-worth-plans' }, h('span', { className: 'ac-worth-plan' }, '你填 ', h('b', null, fmtPrice(row.refMin, 'CNY')), ' / 月'))
+              : null,
         )
 
         return h(
@@ -3607,6 +5467,11 @@ window.__ModuleLoader__.load({
             )
           : null,
 
+        usage !== null ? searchBar : null,
+        usage !== null && needle !== ''
+          ? h('div', { className: 'ac-group-note' }, '搜索只过滤下面的明细行，顶部汇总仍是全量数字。')
+          : null,
+
         usageTotals !== null
           ? h(
               'div',
@@ -3704,7 +5569,10 @@ window.__ModuleLoader__.load({
           const m = usage && usage.media ? usage.media : null
           if (m === null || !m.totals || (m.totals.count || 0) === 0) return null
           const t = m.totals
-          const models = Array.isArray(m.byModel) ? m.byModel : []
+          const allModels = Array.isArray(m.byModel) ? m.byModel : []
+          // 媒体行也吃全局搜索：按模型名 / 供应商过滤；汇总卡仍是全量
+          const models = needle === '' ? allModels : allModels.filter((r) => searchMatches([r.model, r.provider || '']))
+          if (models.length === 0) return null
           const maxMediaCost = models.reduce((mx, r) => (r.cny > mx ? r.cny : mx), 0)
 
           const mediaRow = (row) => {
@@ -4001,7 +5869,13 @@ window.__ModuleLoader__.load({
                             (row.refMax !== null && row.refMax !== row.refMin
                               ? fmtPrice(row.refMin, 'CNY') + '–' + fmtPrice(row.refMax, 'CNY')
                               : fmtPrice(row.refMin, 'CNY')) +
-                            (row.refSource === 'manual' ? '（你填的）' : '（套餐表）'),
+                            (row.refSource === 'tier'
+                              ? '（官方档位·国内价）'
+                              : row.refSource === 'paid'
+                                ? '（实付÷月数）'
+                                : row.refSource === 'manual'
+                                  ? '（你填的）'
+                                  : '（套餐表）'),
                       ),
                       verdict
                         ? h(

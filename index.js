@@ -26,6 +26,8 @@ import {
 import { collectDshApi } from './dsh-api.js'
 import { collectUsage, describeBilling } from './usage.js'
 import { fetchOfficialPricing } from './pricing-sync.js'
+import { fetchGoModels, searchGoModels, OPENCODE_GO_TIERS, OPENCODE_GO_SNAPSHOT_AT } from './opencode-go.js'
+import { cnTierById } from './cn-tiers.js'
 import { collectOfficialUsage, resolveKeyMap, importOfficialFiles } from './official-usage.js'
 
 export const inject = ['webServer', 'timer']
@@ -46,21 +48,129 @@ const STORE_FILE = join(DATA_DIR, 'catalog.json')
  */
 const BILLING_FILE = join(DATA_DIR, 'billing.json')
 const BILLING_MODES = ['token', 'estimate', 'credits']
+/** 订阅形式枚举 —— 必须和 usage.js 的 PLAN_TYPES 一致（那边是权威，这边校验用） */
+const BILLING_PLAN_TYPES = ['agent-plan', 'token-plan', 'coding-plan', 'token-pack', 'quota-pool', 'other']
 
 function normalizeBillingEntry(value) {
   if (typeof value === 'string') {
     if (!BILLING_MODES.includes(value)) return null
-    return { mode: value, estimate: value === 'estimate', monthlyCNY: null }
+    return {
+      mode: value, estimate: value === 'estimate', monthlyCNY: null, planType: null,
+      subscribedAt: null, promoNote: null, termMonths: null, paidTotal: null, paidCurrency: null,
+      basePrice: null, baseCurrency: null, quotaPools: null, planTier: null,
+      autoRenew: null, accountPlan: null, accountSyncedAt: null, gifts: null, accountEntries: null,
+    }
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const mode = BILLING_MODES.includes(value.mode) ? value.mode : null
   const estimate = value.estimate === true
-  const monthlyCNY =
-    typeof value.monthlyCNY === 'number' && Number.isFinite(value.monthlyCNY) && value.monthlyCNY > 0
-      ? value.monthlyCNY
+  const posNum = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null)
+  const monthlyCNY = posNum(value.monthlyCNY)
+  const planType = BILLING_PLAN_TYPES.includes(value.planType) ? value.planType : null
+  let subscribedAt = null
+  if (typeof value.subscribedAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value.subscribedAt.trim())) {
+    subscribedAt = value.subscribedAt.trim()
+  }
+  const promoNote =
+    typeof value.promoNote === 'string' && value.promoNote.trim() !== '' ? value.promoNote.trim().slice(0, 80) : null
+  // 订阅时长（月）1~120 整数
+  let termMonths = null
+  if (typeof value.termMonths === 'number' && Number.isFinite(value.termMonths)) {
+    const t = Math.floor(value.termMonths)
+    if (t >= 1 && t <= 120) termMonths = t
+  }
+  const currencyOf = (v) => (v === 'USD' || v === 'CNY' ? v : null)
+  const paidTotal = posNum(value.paidTotal)
+  const paidCurrency = paidTotal === null ? null : currencyOf(value.paidCurrency) || 'CNY'
+  const basePrice = posNum(value.basePrice)
+  const baseCurrency = basePrice === null ? null : currencyOf(value.baseCurrency) || 'USD'
+  let quotaPools = null
+  if (Array.isArray(value.quotaPools)) {
+    const rows = []
+    for (const row of value.quotaPools) {
+      if (!row || typeof row !== 'object') continue
+      const model = typeof row.model === 'string' ? row.model.trim().slice(0, 80) : ''
+      const quota = posNum(row.quota)
+      if (model === '' || quota === null) continue
+      rows.push({ model, quota })
+      if (rows.length >= 40) break
+    }
+    if (rows.length > 0) quotaPools = rows
+  }
+  // 官方档位（2.7.4）：只认 cn-tiers.js 里存在的 id
+  const planTier = typeof value.planTier === 'string' && cnTierById(value.planTier) !== null ? value.planTier : null
+  // 自动续费（2.7.5）：true 连续订阅自动对齐周期 / false 一次买 N 个月 / null 没设置
+  const autoRenew = typeof value.autoRenew === 'boolean' ? value.autoRenew : null
+  // 账户订阅快照（2.7.5）：只留公开字段，金额账户里没有
+  let accountPlan = null
+  if (value.accountPlan && typeof value.accountPlan === 'object' && !Array.isArray(value.accountPlan)) {
+    const ap = value.accountPlan
+    const str = (v, max) => (typeof v === 'string' && v.trim() !== '' ? v.trim().slice(0, max) : null)
+    const name = str(ap.name, 60)
+    const planName = str(ap.planName, 60)
+    const expiresAt =
+      typeof ap.expiresAt === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.expiresAt) ? ap.expiresAt : null
+    if (name !== null || planName !== null || expiresAt !== null) {
+      accountPlan = {
+        name,
+        planName,
+        planTier: str(ap.planTier, 60),
+        expiresAt,
+        periodStart: typeof ap.periodStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(ap.periodStart) ? ap.periodStart : null,
+        source: str(ap.source, 40) || 'connector',
+        atMs: typeof ap.atMs === 'number' && Number.isFinite(ap.atMs) ? ap.atMs : null,
+      }
+    }
+  }
+  const accountSyncedAt =
+    typeof value.accountSyncedAt === 'number' && Number.isFinite(value.accountSyncedAt) && value.accountSyncedAt > 0
+      ? value.accountSyncedAt
       : null
-  if (mode === null && estimate === false && monthlyCNY === null) return null
-  return { mode, estimate, monthlyCNY }
+  // 「赠送」记录（2.7.6 起，2.7.7 加 points）—— 必须和 usage.js 的 normalizeGifts 镜像
+  let gifts = null
+  if (Array.isArray(value.gifts)) {
+    const rows = []
+    for (const row of value.gifts) {
+      if (!row || typeof row !== 'object') continue
+      const kind = row.kind === 'credit' || row.kind === 'points' || row.kind === 'tokens' ? row.kind : null
+      const amount = typeof row.amount === 'number' && Number.isFinite(row.amount) && row.amount > 0 ? row.amount : null
+      if (kind === null || amount === null) continue
+      const units = kind === 'credit' ? ['CNY', 'USD'] : kind === 'points' ? ['raw'] : ['raw', 'K', 'M', 'B']
+      const unit = units.includes(row.unit) ? row.unit : units[0]
+      const note = typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null
+      const at = typeof row.at === 'number' && Number.isFinite(row.at) && row.at > 0 ? row.at : Date.now()
+      rows.push({ kind, amount, unit, note, at })
+      if (rows.length >= 60) break
+    }
+    if (rows.length > 0) gifts = rows
+  }
+  // 逐账户设置（2.7.7）：{ 账户id: 同构记录 } —— 必须和 usage.js 镜像
+  let accountEntries = null
+  if (value.accountEntries && typeof value.accountEntries === 'object' && !Array.isArray(value.accountEntries)) {
+    const out = {}
+    let n = 0
+    for (const [accId, raw] of Object.entries(value.accountEntries)) {
+      if (typeof accId !== 'string' || accId === '' || accId.length > 80) continue
+      const sub = normalizeBillingEntry(raw)
+      if (sub === null) continue
+      out[accId] = sub
+      n += 1
+      if (n >= 20) break
+    }
+    if (n > 0) accountEntries = out
+  }
+  const empty =
+    mode === null && estimate === false && monthlyCNY === null && planType === null &&
+    subscribedAt === null && promoNote === null && termMonths === null && paidTotal === null &&
+    basePrice === null && quotaPools === null && planTier === null &&
+    autoRenew === null && accountPlan === null && accountSyncedAt === null && gifts === null &&
+    accountEntries === null
+  if (empty) return null
+  return {
+    mode, estimate, monthlyCNY, planType, subscribedAt, promoNote,
+    termMonths, paidTotal, paidCurrency, basePrice, baseCurrency, quotaPools, planTier,
+    autoRenew, accountPlan, accountSyncedAt, gifts, accountEntries,
+  }
 }
 
 function loadBillingOverrides() {
@@ -92,6 +202,25 @@ function saveBillingOverrides(overrides) {
     if (entry.mode) value.mode = entry.mode
     if (entry.estimate) value.estimate = true
     if (entry.monthlyCNY !== null && entry.monthlyCNY !== undefined) value.monthlyCNY = entry.monthlyCNY
+    if (entry.planType) value.planType = entry.planType
+    if (entry.subscribedAt) value.subscribedAt = entry.subscribedAt
+    if (entry.promoNote) value.promoNote = entry.promoNote
+    if (entry.termMonths !== null && entry.termMonths !== undefined) value.termMonths = entry.termMonths
+    if (entry.paidTotal !== null && entry.paidTotal !== undefined) {
+      value.paidTotal = entry.paidTotal
+      value.paidCurrency = entry.paidCurrency || 'CNY'
+    }
+    if (entry.basePrice !== null && entry.basePrice !== undefined) {
+      value.basePrice = entry.basePrice
+      value.baseCurrency = entry.baseCurrency || 'USD'
+    }
+    if (Array.isArray(entry.quotaPools) && entry.quotaPools.length > 0) value.quotaPools = entry.quotaPools
+    if (entry.planTier) value.planTier = entry.planTier
+    if (typeof entry.autoRenew === 'boolean') value.autoRenew = entry.autoRenew
+    if (entry.accountPlan && typeof entry.accountPlan === 'object') value.accountPlan = entry.accountPlan
+    if (entry.accountSyncedAt !== null && entry.accountSyncedAt !== undefined) value.accountSyncedAt = entry.accountSyncedAt
+    if (Array.isArray(entry.gifts) && entry.gifts.length > 0) value.gifts = entry.gifts
+    if (entry.accountEntries && typeof entry.accountEntries === 'object') value.accountEntries = entry.accountEntries
     if (Object.keys(value).length > 0) compact[provider] = value
   }
   const tmp = BILLING_FILE + '.' + process.pid + '.' + Date.now() + '.tmp'
@@ -117,8 +246,46 @@ function reconcileBillingOverrides(overrides) {
   for (const [provider, entry] of Object.entries(overrides)) {
     if (entry.mode && entry.mode !== 'credits' && auto(provider) === 'credits') {
       cleared.push(provider)
-      const kept = { mode: null, estimate: entry.estimate, monthlyCNY: entry.monthlyCNY }
-      if (kept.estimate === false && kept.monthlyCNY === null) continue
+      // 只退 mode；其余字段（折算 / 月费 / 订阅形式 / 时间 / 时长 / 实付 / 额度池 / 账户快照）都不动
+      const kept = {
+        mode: null,
+        estimate: entry.estimate,
+        monthlyCNY: entry.monthlyCNY,
+        planType: entry.planType,
+        subscribedAt: entry.subscribedAt,
+        promoNote: entry.promoNote,
+        termMonths: entry.termMonths,
+        paidTotal: entry.paidTotal,
+        paidCurrency: entry.paidCurrency,
+        basePrice: entry.basePrice,
+        baseCurrency: entry.baseCurrency,
+        quotaPools: entry.quotaPools,
+        planTier: entry.planTier === undefined ? null : entry.planTier,
+        autoRenew: entry.autoRenew === undefined ? null : entry.autoRenew,
+        accountPlan: entry.accountPlan === undefined ? null : entry.accountPlan,
+        accountSyncedAt: entry.accountSyncedAt === undefined ? null : entry.accountSyncedAt,
+        gifts: entry.gifts === undefined ? null : entry.gifts,
+        accountEntries: entry.accountEntries === undefined ? null : entry.accountEntries,
+      }
+      if (
+        kept.estimate === false &&
+        kept.monthlyCNY === null &&
+        kept.planType === null &&
+        kept.subscribedAt === null &&
+        kept.promoNote === null &&
+        kept.termMonths === null &&
+        kept.paidTotal === null &&
+        kept.basePrice === null &&
+        kept.quotaPools === null &&
+        kept.planTier === null &&
+        kept.autoRenew === null &&
+        kept.accountPlan === null &&
+        kept.accountSyncedAt === null &&
+        kept.gifts === null &&
+        kept.accountEntries === null
+      ) {
+        continue
+      }
       next[provider] = kept
       continue
     }
@@ -1259,12 +1426,16 @@ export function apply(ctx, config) {
     })
   }
 
-  function currentPayload(dshApi, usage, official, officialUsage) {
+  function currentPayload(dshApi, usage, official, officialUsage, goLive) {
     const state = mergeSeeds(loadState() || blankState())
     const sources = publicSources(state)
     const prices = publicPrices(state)
     const plans = publicPlans(state)
     const removedList = publicRemoved(state)
+    // opencode-go 官方额度表（2.7.3）：实时优先、快照兜底；全表给界面检索
+    const goRoute = dshApi && Array.isArray(dshApi.routes) ? dshApi.routes.find((r) => r.id === 'opencode-go') : null
+    const goRouteModels = goRoute && Array.isArray(goRoute.models) ? goRoute.models.map((m) => m.id) : []
+    const goTable = goLive && goLive.models ? goLive.models : null
     return {
       ok: true,
       now: nowIso(),
@@ -1280,6 +1451,19 @@ export function apply(ctx, config) {
       usage: usage || null,
       // 官网实时价核对结果（拉到 / 拉不到 / 与本地快照有没有差）
       officialPricing: official || null,
+      // OpenCode Go 官方额度表：全表可检索（2.7.3）。source=live 实时 / snapshot 兜底
+      opencodeGo: {
+        ok: goLive ? goLive.ok === true : false,
+        source: goLive ? goLive.source : 'snapshot',
+        stale: goLive ? goLive.stale === true : false,
+        at: goLive ? goLive.at : null,
+        error: goLive && goLive.error ? goLive.error : null,
+        snapshotAt: OPENCODE_GO_SNAPSHOT_AT,
+        tiers: OPENCODE_GO_TIERS,
+        count: goLive ? goLive.count : null,
+        // 全表（线路里有的排前面）；界面搜索在前端本地过滤
+        models: searchGoModels('', goTable, goRouteModels),
+      },
       // 官方导出的用量账单（CSV）—— 权威口径，用来跟日志折算对账
       officialUsage: officialUsage || null,
       counts: {
@@ -1364,9 +1548,11 @@ export function apply(ctx, config) {
           const billing = loadBillingOverrides()
           const dshApi = await collectDshApi(ctx, { billing }).catch(() => null)
           const official = await fetchOfficialPricing().catch(() => null)
+          // Go 官方额度表：先拉（有 6h 缓存），让折算能用上新价，再算用量
+          const goLive = await fetchGoModels().catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
           const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
-          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage, goLive))
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
@@ -1399,9 +1585,23 @@ export function apply(ctx, config) {
           }
           const dshApi = await collectDshApi(ctx, { force: true, billing })
           const official = await fetchOfficialPricing({ force: true }).catch(() => null)
+          const goLive = await fetchGoModels({ force: refreshRequested(req) }).catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR, { force: true }).catch(() => null)
           const usage = await collectUsage(ctx, { force: true, window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
-          sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage, billingRefresh })
+          // 「重新读」也带全表（界面额度检索表就在这栏）
+          const goRoute = dshApi && Array.isArray(dshApi.routes) ? dshApi.routes.find((r) => r.id === 'opencode-go') : null
+          const opencodeGo = {
+            ok: goLive ? goLive.ok === true : false,
+            source: goLive ? goLive.source : 'snapshot',
+            stale: goLive ? goLive.stale === true : false,
+            at: goLive ? goLive.at : null,
+            error: goLive && goLive.error ? goLive.error : null,
+            snapshotAt: OPENCODE_GO_SNAPSHOT_AT,
+            tiers: OPENCODE_GO_TIERS,
+            count: goLive ? goLive.count : null,
+            models: searchGoModels('', goLive && goLive.models ? goLive.models : null, goRoute && Array.isArray(goRoute.models) ? goRoute.models.map((m) => m.id) : []),
+          }
+          sendJson(res, 200, { ok: true, dshApi, usage, officialPricing: official, officialUsage, billingRefresh, opencodeGo })
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
@@ -1500,9 +1700,10 @@ export function apply(ctx, config) {
           const billing = loadBillingOverrides()
           const dshApi = await collectDshApi(ctx, { billing }).catch(() => null)
           const official = await fetchOfficialPricing().catch(() => null)
+          const goLive = await fetchGoModels().catch(() => null)
           const officialUsage = await collectOfficialUsage(CFG_DIR).catch(() => null)
           const usage = await collectUsage(ctx, { window: usageWindowOf(req), official, officialUsage, billing, keyMap: resolveKeyMap(configuredKeyMap, officialUsage && officialUsage.byKey) }).catch(() => null)
-          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage))
+          sendJson(res, 200, currentPayload(dshApi, usage, official, officialUsage, goLive))
         } catch (error) {
           sendJson(res, 500, { ok: false, error: String((error && error.message) || error) })
         }
@@ -1563,19 +1764,256 @@ export function apply(ctx, config) {
             return
           }
         }
+        // planType：订阅形式，只认枚举；null = 清掉
+        const planType = parsed.planType
+        if (planType !== undefined && planType !== null && !BILLING_PLAN_TYPES.includes(planType)) {
+          sendJson(res, 400, { ok: false, error: 'planType 只能是 ' + BILLING_PLAN_TYPES.join(' / ') + '，或 null' })
+          return
+        }
+        // subscribedAt：订阅日期 'YYYY-MM-DD'；null = 清掉
+        const subscribedAt = parsed.subscribedAt
+        if (subscribedAt !== undefined && subscribedAt !== null) {
+          const s = String(subscribedAt).trim()
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(new Date(s + 'T00:00:00').getTime())) {
+            sendJson(res, 400, { ok: false, error: 'subscribedAt 要 YYYY-MM-DD，或 null' })
+            return
+          }
+        }
+        // promoNote：优惠说明，纯文本，截断
+        const promoNote = parsed.promoNote
+        if (promoNote !== undefined && promoNote !== null && typeof promoNote !== 'string') {
+          sendJson(res, 400, { ok: false, error: 'promoNote 要是字符串，或 null' })
+          return
+        }
+        // termMonths：这一次订阅了多久（月），1~120 整数；null = 清掉
+        const termMonths = parsed.termMonths
+        if (termMonths !== undefined && termMonths !== null) {
+          const t = Number(termMonths)
+          if (!Number.isFinite(t) || t < 1 || t > 120 || Math.floor(t) !== t) {
+            sendJson(res, 400, { ok: false, error: 'termMonths 要 1~120 的整数（月），或 null' })
+            return
+          }
+        }
+        // paidTotal / paidCurrency：本次实付总额 + 币种
+        const paidTotal = parsed.paidTotal
+        if (paidTotal !== undefined && paidTotal !== null) {
+          const v = Number(paidTotal)
+          if (!Number.isFinite(v) || v <= 0) {
+            sendJson(res, 400, { ok: false, error: 'paidTotal 要正数，或 null' })
+            return
+          }
+        }
+        const paidCurrency = parsed.paidCurrency
+        if (paidCurrency !== undefined && paidCurrency !== null && paidCurrency !== 'CNY' && paidCurrency !== 'USD') {
+          sendJson(res, 400, { ok: false, error: 'paidCurrency 只能 CNY / USD，或 null' })
+          return
+        }
+        // basePrice / baseCurrency：额度池订阅的基础价
+        const basePrice = parsed.basePrice
+        if (basePrice !== undefined && basePrice !== null) {
+          const v = Number(basePrice)
+          if (!Number.isFinite(v) || v <= 0) {
+            sendJson(res, 400, { ok: false, error: 'basePrice 要正数，或 null' })
+            return
+          }
+        }
+        const baseCurrency = parsed.baseCurrency
+        if (baseCurrency !== undefined && baseCurrency !== null && baseCurrency !== 'CNY' && baseCurrency !== 'USD') {
+          sendJson(res, 400, { ok: false, error: 'baseCurrency 只能 CNY / USD，或 null' })
+          return
+        }
+        // quotaPools：每个模型各给多少额度 [{ model, quota }]
+        const quotaPools = parsed.quotaPools
+        if (quotaPools !== undefined && quotaPools !== null) {
+          if (!Array.isArray(quotaPools)) {
+            sendJson(res, 400, { ok: false, error: 'quotaPools 要数组 [{model,quota}]，或 null' })
+            return
+          }
+          for (const row of quotaPools) {
+            const model = row && typeof row.model === 'string' ? row.model.trim() : ''
+            const quota = row ? Number(row.quota) : NaN
+            if (model === '' || !Number.isFinite(quota) || quota <= 0) {
+              sendJson(res, 400, { ok: false, error: 'quotaPools 每条要 { model: 非空字符串, quota: 正数 }' })
+              return
+            }
+          }
+        }
+        // planTier：国内官方档位 id（2.7.4），只认 cn-tiers.js 里存在的；null = 清掉
+        const planTier = parsed.planTier
+        if (planTier !== undefined && planTier !== null && cnTierById(String(planTier)) === null) {
+          sendJson(res, 400, { ok: false, error: 'planTier 不是已知的官方档位 id，或 null' })
+          return
+        }
+        // autoRenew（2.7.5）：true / false / null（null = 清掉，按自动续费算）
+        const autoRenew = parsed.autoRenew
+        if (autoRenew !== undefined && autoRenew !== null && typeof autoRenew !== 'boolean') {
+          sendJson(res, 400, { ok: false, error: 'autoRenew 只能 true / false / null' })
+          return
+        }
+        // accountPlan（2.7.5）：从账户读到的订阅快照；对象或 null
+        const accountPlan = parsed.accountPlan
+        if (accountPlan !== undefined && accountPlan !== null && (typeof accountPlan !== 'object' || Array.isArray(accountPlan))) {
+          sendJson(res, 400, { ok: false, error: 'accountPlan 要对象 { name, planName, expiresAt… }，或 null' })
+          return
+        }
+        // accountSyncedAt（2.7.5）：对齐时间戳（毫秒）；null = 清掉
+        const accountSyncedAt = parsed.accountSyncedAt
+        if (accountSyncedAt !== undefined && accountSyncedAt !== null) {
+          const v = Number(accountSyncedAt)
+          if (!Number.isFinite(v) || v <= 0) {
+            sendJson(res, 400, { ok: false, error: 'accountSyncedAt 要正的毫秒时间戳，或 null' })
+            return
+          }
+        }
+        // gifts（2.7.6）：「赠送」记录，整表替换（前端加一条/删一条都发全量）
+        const gifts = parsed.gifts
+        if (gifts !== undefined && gifts !== null) {
+          if (!Array.isArray(gifts)) {
+            sendJson(res, 400, { ok: false, error: 'gifts 要数组 [{kind,amount,unit,note,at}]，或 null' })
+            return
+          }
+          if (gifts.length > 60) {
+            sendJson(res, 400, { ok: false, error: 'gifts 最多 60 条' })
+            return
+          }
+          for (const row of gifts) {
+            const kind = row && row.kind
+            const amount = row ? Number(row.amount) : NaN
+            if (kind !== 'credit' && kind !== 'points' && kind !== 'tokens') {
+              sendJson(res, 400, { ok: false, error: 'gifts 每条 kind 要 credit（赠金）/ points（赠送积分）/ tokens（免费 Token）' })
+              return
+            }
+            if (!Number.isFinite(amount) || amount <= 0) {
+              sendJson(res, 400, { ok: false, error: 'gifts 每条 amount 要正数' })
+              return
+            }
+            const units = kind === 'credit' ? ['CNY', 'USD'] : kind === 'points' ? ['raw'] : ['raw', 'K', 'M', 'B']
+            if (row.unit !== undefined && row.unit !== null && !units.includes(row.unit)) {
+              sendJson(res, 400, { ok: false, error: 'gifts unit：赠金 CNY/USD，积分 raw，token raw/K/M/B' })
+              return
+            }
+          }
+        }
+        // accountEntries（2.7.7 起，2.7.8 修：之前 POST 根本没接这个字段，
+        // 逐账户设置被静默丢弃 —— 订阅形式 / 档位选了存不上就是它）：
+        // { 账户id: 同构记录 }，整表替换；null = 清掉全部逐账户设置
+        const accountEntries = parsed.accountEntries
+        if (accountEntries !== undefined && accountEntries !== null) {
+          if (typeof accountEntries !== 'object' || Array.isArray(accountEntries)) {
+            sendJson(res, 400, { ok: false, error: 'accountEntries 要对象 { 账户id: 记录 }，或 null' })
+            return
+          }
+          const ids = Object.keys(accountEntries)
+          if (ids.length > 20) {
+            sendJson(res, 400, { ok: false, error: 'accountEntries 最多 20 个账户' })
+            return
+          }
+          for (const id of ids) {
+            if (id === '' || id.length > 80) {
+              sendJson(res, 400, { ok: false, error: 'accountEntries 账户 id 要 1~80 字符' })
+              return
+            }
+            const sub = accountEntries[id]
+            if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) {
+              sendJson(res, 400, { ok: false, error: 'accountEntries 每个账户要一份记录对象' })
+              return
+            }
+          }
+        }
         try {
           const overrides = loadBillingOverrides()
-          const current = overrides[provider] || { mode: null, estimate: false, monthlyCNY: null }
-          const next = { mode: current.mode, estimate: current.estimate, monthlyCNY: current.monthlyCNY }
+          const current = overrides[provider] || {}
+          const next = {
+            mode: current.mode === undefined ? null : current.mode,
+            estimate: current.estimate === true,
+            monthlyCNY: current.monthlyCNY === undefined ? null : current.monthlyCNY,
+            planType: current.planType === undefined ? null : current.planType,
+            subscribedAt: current.subscribedAt === undefined ? null : current.subscribedAt,
+            promoNote: current.promoNote === undefined ? null : current.promoNote,
+            termMonths: current.termMonths === undefined ? null : current.termMonths,
+            paidTotal: current.paidTotal === undefined ? null : current.paidTotal,
+            paidCurrency: current.paidCurrency === undefined ? null : current.paidCurrency,
+            basePrice: current.basePrice === undefined ? null : current.basePrice,
+            baseCurrency: current.baseCurrency === undefined ? null : current.baseCurrency,
+            quotaPools: current.quotaPools === undefined ? null : current.quotaPools,
+            planTier: current.planTier === undefined ? null : current.planTier,
+            autoRenew: current.autoRenew === undefined ? null : current.autoRenew,
+            accountPlan: current.accountPlan === undefined ? null : current.accountPlan,
+            accountSyncedAt: current.accountSyncedAt === undefined ? null : current.accountSyncedAt,
+            gifts: current.gifts === undefined ? null : current.gifts,
+            accountEntries: current.accountEntries === undefined ? null : current.accountEntries,
+          }
           if (touchMode) next.mode = mode
           if (estimate !== undefined) next.estimate = estimate
           if (monthlyCNY !== undefined) {
             next.monthlyCNY =
               monthlyCNY === null ? null : typeof monthlyCNY === 'number' ? monthlyCNY : Number(monthlyCNY)
           }
-          // 三个字段都空了就把这条删掉，别留一个空壳
-          if (next.mode === null && next.estimate === false && next.monthlyCNY === null) delete overrides[provider]
-          else overrides[provider] = next
+          if (planType !== undefined) next.planType = planType === null ? null : planType
+          if (subscribedAt !== undefined) {
+            next.subscribedAt = subscribedAt === null ? null : String(subscribedAt).trim()
+          }
+          if (promoNote !== undefined) {
+            const t = promoNote === null ? '' : String(promoNote).trim()
+            next.promoNote = t === '' ? null : t.slice(0, 80)
+          }
+          if (termMonths !== undefined) next.termMonths = termMonths === null ? null : Math.floor(Number(termMonths))
+          if (paidTotal !== undefined) {
+            next.paidTotal = paidTotal === null ? null : Number(paidTotal)
+            // 总额清掉时币种也一起清；填了总额没给币种默认人民币
+            if (next.paidTotal === null) next.paidCurrency = null
+            else if (paidCurrency !== undefined && paidCurrency !== null) next.paidCurrency = paidCurrency
+            else if (next.paidCurrency === null) next.paidCurrency = 'CNY'
+          } else if (paidCurrency !== undefined && paidCurrency !== null && next.paidTotal !== null) {
+            next.paidCurrency = paidCurrency
+          }
+          if (basePrice !== undefined) {
+            next.basePrice = basePrice === null ? null : Number(basePrice)
+            if (next.basePrice === null) next.baseCurrency = null
+            else if (baseCurrency !== undefined && baseCurrency !== null) next.baseCurrency = baseCurrency
+            else if (next.baseCurrency === null) next.baseCurrency = 'USD'
+          } else if (baseCurrency !== undefined && baseCurrency !== null && next.basePrice !== null) {
+            next.baseCurrency = baseCurrency
+          }
+          if (quotaPools !== undefined) {
+            next.quotaPools =
+              quotaPools === null
+                ? null
+                : quotaPools
+                    .map((row) => ({ model: String(row.model).trim().slice(0, 80), quota: Number(row.quota) }))
+                    .slice(0, 40)
+            if (Array.isArray(next.quotaPools) && next.quotaPools.length === 0) next.quotaPools = null
+          }
+          if (planTier !== undefined) next.planTier = planTier === null ? null : String(planTier)
+          if (autoRenew !== undefined) next.autoRenew = autoRenew
+          if (accountPlan !== undefined) {
+            // 归一在 normalizeBillingEntry 里做（load 时），这里先原样收，落盘前过一遍
+            next.accountPlan = accountPlan === null ? null : accountPlan
+          }
+          if (accountSyncedAt !== undefined) {
+            next.accountSyncedAt = accountSyncedAt === null ? null : Number(accountSyncedAt)
+          }
+          if (gifts !== undefined) {
+            next.gifts =
+              gifts === null
+                ? null
+                : gifts.map((row) => ({
+                    kind: row.kind,
+                    amount: Number(row.amount),
+                    unit: row.unit === undefined || row.unit === null ? (row.kind === 'credit' ? 'CNY' : 'raw') : row.unit,
+                    note: typeof row.note === 'string' && row.note.trim() !== '' ? row.note.trim().slice(0, 80) : null,
+                    at: typeof row.at === 'number' && row.at > 0 ? row.at : Date.now(),
+                  }))
+            if (Array.isArray(next.gifts) && next.gifts.length === 0) next.gifts = null
+          }
+          if (accountEntries !== undefined) {
+            // 整表替换；每个账户的记录在落盘前的 normalizeBillingEntry 里递归归一
+            next.accountEntries = accountEntries
+          }
+          // 落盘前归一：accountPlan / accountEntries 里的脏字段在这一步被裁掉；全空就整条删掉
+          const normalized = normalizeBillingEntry(next)
+          if (normalized === null) delete overrides[provider]
+          else overrides[provider] = normalized
           saveBillingOverrides(overrides)
           sendJson(res, 200, {
             ok: true,
